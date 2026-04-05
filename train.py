@@ -266,15 +266,17 @@ if __name__ == "__main__":
 
     if args.checkpoint and os.path.exists(args.checkpoint):
         ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-        missing, unexpected = model.load_state_dict(
-            ckpt["model_state_dict"], strict=False
-        )
-        if missing:
-            print(
-                f"  Warning: randomly initialized layers (alphabet change): {missing}"
-            )
-        if unexpected:
-            print(f"  Warning: unexpected keys in checkpoint: {unexpected}")
+        state_dict = ckpt["model_state_dict"]
+        model_state = model.state_dict()
+        filtered = {
+            k: v
+            for k, v in state_dict.items()
+            if k in model_state and v.shape == model_state[k].shape
+        }
+        skipped = set(state_dict.keys()) - set(filtered.keys())
+        if skipped:
+            print(f"  Warning: skipped layers (shape mismatch): {skipped}")
+        model.load_state_dict(filtered, strict=False)
         start_epoch = ckpt.get("epoch", 0) + 1
         optimizer_state = None
         scheduler_state = None
