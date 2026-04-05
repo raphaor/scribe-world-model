@@ -64,14 +64,16 @@ def evaluate_cer(model, loader, device, idx_to_char, max_samples=None):
     model.eval()
     all_preds = []
     all_gts = []
+    use_amp = device.type == "cuda"
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(loader):
             img_seqs, targets, input_lengths, target_lengths = batch
-            img_seqs = img_seqs.to(device)
+            img_seqs = img_seqs.to(device, non_blocking=True)
             input_lengths_cpu = input_lengths.clone()
 
-            _, z_seq, ctc_logits = model(img_seqs)
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                _, z_seq, ctc_logits = model(img_seqs)
 
             decoded = ctc_greedy_decode(
                 ctc_logits.cpu(), input_lengths_cpu, idx_to_char
@@ -110,17 +112,17 @@ if __name__ == "__main__":
     from model import HWMv2
     from data_alto import AltoLineDataset, build_alphabet, collate_alto_fn
     from functools import partial
-    from torch.utils.data import DataLoader, random_split
+    from torch.utils.data import DataLoader
 
     parser = argparse.ArgumentParser(description="Evaluate HWM-v2 CER")
     parser.add_argument("--model", default="hwm_v2.pt", help="Model checkpoint")
     parser.add_argument("--alto-dirs", nargs="+", default=config.ALTO_DIRS)
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=32)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    ckpt = torch.load(args.model, map_location=device)
+    ckpt = torch.load(args.model, map_location=device, weights_only=False)
     saved_config = ckpt.get("config", {})
 
     char_to_idx, idx_to_char = build_alphabet(args.alto_dirs)
@@ -142,7 +144,12 @@ if __name__ == "__main__":
         args.alto_dirs, img_height=saved_config.get("img_height", config.IMG_HEIGHT_V2)
     )
     collate = partial(collate_alto_fn, char_to_idx=char_to_idx)
-    loader = DataLoader(dataset, batch_size=args.batch_size, collate_fn=collate)
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        collate_fn=collate,
+        pin_memory=device.type == "cuda",
+    )
 
     cer = evaluate_cer(model, loader, device, idx_to_char)
     print(f"\nCER: {cer:.1%}")
