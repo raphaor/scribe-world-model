@@ -104,6 +104,7 @@ def evaluate_cer(model, loader, device, idx_to_char, max_samples=None):
         print(f"  [{mark}] GT:   {_safe_print(gt)}")
         print(f"        PRED: {_safe_print(pred)}")
 
+    torch.cuda.empty_cache()
     return cer
 
 

@@ -8,6 +8,7 @@ Supports:
 
 import sys
 import os
+import gc
 import argparse
 import time
 from collections import defaultdict
@@ -85,6 +86,7 @@ def train_epoch(model, loader, optimizer, device, epoch, mode="full", scaler=Non
         for k, v in losses.items():
             totals[k] += v
         num_batches += 1
+        del loss, losses
 
         running = {k: v / num_batches for k, v in totals.items()}
         _progress_bar(epoch, batch_idx, total_batches, running, time.time() - t0)
@@ -161,6 +163,10 @@ def train(
 
             cer = evaluate_cer(model, val_loader, device, idx_to_char, max_samples=10)
             print(f"  Val CER (10 samples): {cer:.1%}")
+
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     print(f"Training complete. Best loss: {best_loss:.4f}. Model saved to {save_path}")
 

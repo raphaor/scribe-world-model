@@ -133,15 +133,15 @@ class HybridLoss(nn.Module):
         sigreg = self.sigreg(z_all)
 
         total = pred + self.lambda_sigreg * sigreg
-        losses = {"pred": pred.item(), "sigreg": sigreg.item()}
+        losses = {"pred": pred.detach().item(), "sigreg": sigreg.detach().item()}
 
         if ctc_logits is not None and targets is not None:
             ctc_input = ctc_logits.permute(1, 0, 2)
             ctc = self.ctc_loss(ctc_input, targets, input_lengths, target_lengths)
             total = total + self.lambda_ctc * ctc
-            losses["ctc"] = ctc.item()
+            losses["ctc"] = ctc.detach().item()
 
-        losses["total"] = total.item()
+        losses["total"] = total.detach().item()
         return total, losses
 
 
