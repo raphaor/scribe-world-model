@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config
 from model import HWMv2, HWMv3
-from data_alto import AltoLineDataset, build_alphabet, collate_alto_fn
+from data_alto import AltoLineDataset, collate_alto_fn
 
 
 def _progress_bar(epoch, batch_idx, total_batches, losses, elapsed, bar_width=30):
@@ -194,15 +194,16 @@ if __name__ == "__main__":
     scaler_state = None
 
     if args.data == "alto":
-        char_to_idx, idx_to_char = build_alphabet(args.alto_dirs)
-        num_classes = len(char_to_idx) + 1
-
         v3 = args.model_version == "v3"
         img_h = config.IMG_HEIGHT_V3 if v3 else config.IMG_HEIGHT_V2
-        ws = config.WINDOW_SIZE_V3 if v3 else config.WINDOW_SIZE
-        stride = config.STRIDE_V3 if v3 else config.STRIDE
 
         dataset = AltoLineDataset(args.alto_dirs, img_height=img_h, augment=True)
+        char_to_idx, idx_to_char = dataset.get_alphabet()
+        print(f"Alphabet: {len(char_to_idx)} characters")
+        num_classes = len(char_to_idx) + 1
+
+        ws = config.WINDOW_SIZE_V3 if v3 else config.WINDOW_SIZE
+        stride = config.STRIDE_V3 if v3 else config.STRIDE
 
         train_size = int(0.8 * len(dataset))
         val_size = len(dataset) - train_size
