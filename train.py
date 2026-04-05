@@ -156,11 +156,11 @@ def train(
                 save_path,
             )
 
-        if val_loader and model.ctc_head and idx_to_char and epoch % 5 == 0:
+        if val_loader and model.ctc_head and idx_to_char:
             from recognize import evaluate_cer
 
-            cer = evaluate_cer(model, val_loader, device, idx_to_char)
-            print(f"  Val CER: {cer:.1%}")
+            cer = evaluate_cer(model, val_loader, device, idx_to_char, max_samples=10)
+            print(f"  Val CER (10 samples): {cer:.1%}")
 
     print(f"Training complete. Best loss: {best_loss:.4f}. Model saved to {save_path}")
 
