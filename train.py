@@ -3,12 +3,12 @@ Multi-task training for HWM-v2.
 Supports:
   - Supervised: prediction + SIGReg + CTC (with ALTO data)
   - Self-supervised: prediction + SIGReg only (adapt mode)
+  - Resume from checkpoint (optimizer, scheduler, epoch state restored)
 """
 
 import sys
 import os
 import argparse
-import json
 from collections import defaultdict
 from functools import partial
 
@@ -83,14 +83,28 @@ def train(
     mode="full",
     save_path="hwm_v2.pt",
     idx_to_char=None,
+    start_epoch=1,
+    optimizer_state=None,
+    scheduler_state=None,
+    scaler_state=None,
 ):
     use_amp = device.type == "cuda"
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp) if use_amp else None
-
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, num_epochs)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=num_epochs, eta_min=1e-6
+    )
 
-    for epoch in range(1, num_epochs + 1):
+    if optimizer_state is not None:
+        optimizer.load_state_dict(optimizer_state)
+    if scheduler_state is not None:
+        scheduler.load_state_dict(scheduler_state)
+    if scaler_state is not None and use_amp:
+        scaler.load_state_dict(scaler_state)
+
+    best_loss = float("inf")
+
+    for epoch in range(start_epoch, num_epochs + 1):
         losses = train_epoch(
             model, train_loader, optimizer, device, epoch, mode=mode, scaler=scaler
         )
@@ -99,27 +113,36 @@ def train(
         loss_str = " | ".join(f"{k}={v:.4f}" for k, v in losses.items())
         print(f"Epoch {epoch}/{num_epochs} - {loss_str}")
 
-        if val_loader and model.ctc_head and idx_to_char:
+        current_loss = losses.get("total", float("inf"))
+        if current_loss < best_loss:
+            best_loss = current_loss
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "scaler_state_dict": scaler.state_dict(),
+                    "epoch": epoch,
+                    "loss": current_loss,
+                    "config": {
+                        "img_height": model.img_height,
+                        "window_size": model.window_size,
+                        "embedding_dim": model.embedding_dim,
+                        "num_classes": model.ctc_head.proj.out_features
+                        if model.ctc_head
+                        else None,
+                    },
+                },
+                save_path,
+            )
+
+        if val_loader and model.ctc_head and idx_to_char and epoch % 5 == 0:
             from recognize import evaluate_cer
 
             cer = evaluate_cer(model, val_loader, device, idx_to_char)
             print(f"  Val CER: {cer:.1%}")
 
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "config": {
-                "img_height": model.img_height,
-                "window_size": model.window_size,
-                "embedding_dim": model.embedding_dim,
-                "num_classes": model.ctc_head.proj.out_features
-                if model.ctc_head
-                else None,
-            },
-        },
-        save_path,
-    )
-    print(f"Model saved to {save_path}")
+    print(f"Training complete. Best loss: {best_loss:.4f}. Model saved to {save_path}")
 
 
 if __name__ == "__main__":
@@ -144,9 +167,10 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    char_to_idx = None
-    idx_to_char = None
-    num_classes = None
+    start_epoch = 1
+    optimizer_state = None
+    scheduler_state = None
+    scaler_state = None
 
     if args.data == "alto":
         char_to_idx, idx_to_char = build_alphabet(args.alto_dirs)
@@ -155,7 +179,11 @@ if __name__ == "__main__":
 
         train_size = int(0.8 * len(dataset))
         val_size = len(dataset) - train_size
-        train_ds, val_ds = random_split(dataset, [train_size, val_size])
+        train_ds, val_ds = random_split(
+            dataset,
+            [train_size, val_size],
+            generator=torch.Generator().manual_seed(42),
+        )
 
         collate = partial(collate_alto_fn, char_to_idx=char_to_idx)
         pin_mem = device.type == "cuda"
@@ -193,9 +221,16 @@ if __name__ == "__main__":
     print(f"Model params: {model.count_parameters():,}")
 
     if args.checkpoint and os.path.exists(args.checkpoint):
-        ckpt = torch.load(args.checkpoint, map_location=device, weights_only=True)
+        ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
-        print(f"Loaded checkpoint: {args.checkpoint}")
+        start_epoch = ckpt.get("epoch", 0) + 1
+        optimizer_state = ckpt.get("optimizer_state_dict")
+        scheduler_state = ckpt.get("scheduler_state_dict")
+        scaler_state = ckpt.get("scaler_state_dict")
+        prev_loss = ckpt.get("loss", "N/A")
+        print(
+            f"Resuming from {args.checkpoint} (epoch {start_epoch - 1}, loss {prev_loss})"
+        )
 
     train(
         model,
@@ -206,4 +241,8 @@ if __name__ == "__main__":
         mode=args.mode,
         device=device,
         idx_to_char=idx_to_char,
+        start_epoch=start_epoch,
+        optimizer_state=optimizer_state,
+        scheduler_state=scheduler_state,
+        scaler_state=scaler_state,
     )

@@ -101,6 +101,47 @@ class Conv2DEncoder(nn.Module):
         return self.fc(x)
 
 
+class Conv2DEncoderV2(nn.Module):
+    """
+    Deeper Conv2D encoder with skip connections.
+    Input: (B, H, W) where H=48, W=window_size
+    Output: (B, embedding_dim)
+    """
+
+    def __init__(self, img_height=48, window_size=32, embedding_dim=128):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((4, 1)),
+        )
+        self.fc = nn.Linear(256 * 4, embedding_dim)
+
+    def forward(self, x):
+        if x.dim() == 2:
+            raise ValueError("Conv2DEncoderV2 requires (B, H, W) input")
+        x = x.unsqueeze(1)
+        x = self.conv(x)
+        x = x.view(x.size(0), -1)
+        return self.fc(x)
+
+
 def test_encoder():
     """Test encoder on Pi"""
     print("Testing CNNEncoder...")

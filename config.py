@@ -45,6 +45,17 @@ ALTO_DIRS = [
     "D:/OCR_genealogie/Alto/saint_chamassy_dordogne_alto_set_train",
 ]
 
+# --- HWM-v3 ---
+
+WINDOW_SIZE_V3 = 32
+STRIDE_V3 = 4
+IMG_HEIGHT_V3 = 48
+EMBEDDING_DIM_V3 = 128
+NUM_LAYERS_V3 = 4
+NUM_HEADS_V3 = 4
+FF_DIM_V3 = 384
+LAMBDA_CTC_V3 = 2.0
+
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
