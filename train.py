@@ -266,11 +266,19 @@ if __name__ == "__main__":
 
     if args.checkpoint and os.path.exists(args.checkpoint):
         ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model_state_dict"])
+        missing, unexpected = model.load_state_dict(
+            ckpt["model_state_dict"], strict=False
+        )
+        if missing:
+            print(
+                f"  Warning: randomly initialized layers (alphabet change): {missing}"
+            )
+        if unexpected:
+            print(f"  Warning: unexpected keys in checkpoint: {unexpected}")
         start_epoch = ckpt.get("epoch", 0) + 1
-        optimizer_state = ckpt.get("optimizer_state_dict")
-        scheduler_state = ckpt.get("scheduler_state_dict")
-        scaler_state = ckpt.get("scaler_state_dict")
+        optimizer_state = None
+        scheduler_state = None
+        scaler_state = None
         prev_loss = ckpt.get("loss", "N/A")
         print(
             f"Resuming from {args.checkpoint} (epoch {start_epoch - 1}, loss {prev_loss})"
