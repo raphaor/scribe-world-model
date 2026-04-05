@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+.env
+
+# Models (too large for git)
+*.pt
+*.tar
+*.pth
+
+# Data
+data/synthetic/*.png
+data/synthetic/*.jpg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Keep README and docs
+!README.md
+!FINAL_REPORT.md
+!TRANSFER_README.md
+!DEVELOPMENT_LOG.md
+!SUMMARY.md
