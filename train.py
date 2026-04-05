@@ -9,6 +9,7 @@ Supports:
 import sys
 import os
 import argparse
+import time
 from collections import defaultdict
 from functools import partial
 
@@ -19,8 +20,21 @@ from torch.utils.data import DataLoader, random_split
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config
-from model import HWMv2
+from model import HWMv2, HWMv3
 from data_alto import AltoLineDataset, build_alphabet, collate_alto_fn
+
+
+def _progress_bar(epoch, batch_idx, total_batches, losses, elapsed, bar_width=30):
+    pct = (batch_idx + 1) / total_batches
+    filled = int(bar_width * pct)
+    bar = "\u2588" * filled + "\u2591" * (bar_width - filled)
+    loss_str = " | ".join(f"{k}={v:.4f}" for k, v in losses.items())
+    eta = elapsed / pct - elapsed if pct > 0 else 0
+    sys.stdout.write(
+        f"\r  Epoch {epoch} [{bar}] {batch_idx + 1}/{total_batches} "
+        f"({elapsed:.0f}s elapsed, ~{eta:.0f}s left) - {loss_str}"
+    )
+    sys.stdout.flush()
 
 
 def train_epoch(model, loader, optimizer, device, epoch, mode="full", scaler=None):
@@ -28,6 +42,8 @@ def train_epoch(model, loader, optimizer, device, epoch, mode="full", scaler=Non
     totals = defaultdict(float)
     num_batches = 0
     use_amp = scaler is not None
+    total_batches = len(loader)
+    t0 = time.time()
 
     for batch_idx, batch in enumerate(loader):
         if mode == "full":
@@ -70,6 +86,10 @@ def train_epoch(model, loader, optimizer, device, epoch, mode="full", scaler=Non
             totals[k] += v
         num_batches += 1
 
+        running = {k: v / num_batches for k, v in totals.items()}
+        _progress_bar(epoch, batch_idx, total_batches, running, time.time() - t0)
+
+    sys.stdout.write("\n")
     return {k: v / num_batches for k, v in totals.items()} if num_batches > 0 else {}
 
 
@@ -146,8 +166,9 @@ def train(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train HWM-v2")
+    parser = argparse.ArgumentParser(description="Train HWM")
     parser.add_argument("--mode", choices=["full", "adapt"], default="full")
+    parser.add_argument("--model-version", choices=["v2", "v3"], default="v3")
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -175,7 +196,13 @@ if __name__ == "__main__":
     if args.data == "alto":
         char_to_idx, idx_to_char = build_alphabet(args.alto_dirs)
         num_classes = len(char_to_idx) + 1
-        dataset = AltoLineDataset(args.alto_dirs, img_height=config.IMG_HEIGHT_V2)
+
+        v3 = args.model_version == "v3"
+        img_h = config.IMG_HEIGHT_V3 if v3 else config.IMG_HEIGHT_V2
+        ws = config.WINDOW_SIZE_V3 if v3 else config.WINDOW_SIZE
+        stride = config.STRIDE_V3 if v3 else config.STRIDE
+
+        dataset = AltoLineDataset(args.alto_dirs, img_height=img_h, augment=True)
 
         train_size = int(0.8 * len(dataset))
         val_size = len(dataset) - train_size
@@ -185,7 +212,9 @@ if __name__ == "__main__":
             generator=torch.Generator().manual_seed(42),
         )
 
-        collate = partial(collate_alto_fn, char_to_idx=char_to_idx)
+        collate = partial(
+            collate_alto_fn, window_size=ws, stride=stride, char_to_idx=char_to_idx
+        )
         pin_mem = device.type == "cuda"
         train_loader = DataLoader(
             train_ds,
@@ -205,18 +234,33 @@ if __name__ == "__main__":
             persistent_workers=args.num_workers > 0,
         )
     else:
-        raise ValueError("Only 'alto' data mode is supported in v2")
+        raise ValueError("Only 'alto' data mode is supported")
 
-    model = HWMv2(
-        img_height=config.IMG_HEIGHT_V2,
-        window_size=config.WINDOW_SIZE,
-        embedding_dim=config.EMBEDDING_DIM_V2,
-        num_layers=config.NUM_LAYERS,
-        num_heads=config.NUM_HEADS,
-        ff_dim=config.FF_DIM_V2,
-        dropout=config.DROPOUT,
-        num_classes=num_classes if args.mode == "full" else None,
-    ).to(device)
+    if v3:
+        model = HWMv3(
+            img_height=config.IMG_HEIGHT_V3,
+            window_size=config.WINDOW_SIZE_V3,
+            embedding_dim=config.EMBEDDING_DIM_V3,
+            num_layers=config.NUM_LAYERS_V3,
+            num_heads=config.NUM_HEADS_V3,
+            ff_dim=config.FF_DIM_V3,
+            dropout=config.DROPOUT,
+            num_classes=num_classes if args.mode == "full" else None,
+            lambda_ctc=config.LAMBDA_CTC_V3,
+        ).to(device)
+        save_path = "hwm_v3.pt"
+    else:
+        model = HWMv2(
+            img_height=config.IMG_HEIGHT_V2,
+            window_size=config.WINDOW_SIZE,
+            embedding_dim=config.EMBEDDING_DIM_V2,
+            num_layers=config.NUM_LAYERS,
+            num_heads=config.NUM_HEADS,
+            ff_dim=config.FF_DIM_V2,
+            dropout=config.DROPOUT,
+            num_classes=num_classes if args.mode == "full" else None,
+        ).to(device)
+        save_path = "hwm_v2.pt"
 
     print(f"Model params: {model.count_parameters():,}")
 
@@ -240,6 +284,7 @@ if __name__ == "__main__":
         lr=args.lr,
         mode=args.mode,
         device=device,
+        save_path=save_path,
         idx_to_char=idx_to_char,
         start_epoch=start_epoch,
         optimizer_state=optimizer_state,

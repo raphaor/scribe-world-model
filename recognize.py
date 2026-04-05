@@ -3,7 +3,13 @@ CTC Recognition Evaluation for HWM-v2
 Greedy CTC decoding and Character Error Rate (CER) evaluation.
 """
 
+import sys
 import torch
+
+
+def _safe_print(s):
+    enc = sys.stdout.encoding or "utf-8"
+    return s.encode(enc, errors="replace").decode(enc)
 
 
 def ctc_greedy_decode(log_probs, lengths, idx_to_char):
@@ -95,8 +101,8 @@ def evaluate_cer(model, loader, device, idx_to_char, max_samples=None):
     print("\nExamples (first 10):")
     for pred, gt in zip(all_preds[:10], all_gts[:10]):
         mark = "OK" if pred == gt else "ERR"
-        print(f"  [{mark}] GT:   {gt}")
-        print(f"        PRED: {pred}")
+        print(f"  [{mark}] GT:   {_safe_print(gt)}")
+        print(f"        PRED: {_safe_print(pred)}")
 
     return cer
 

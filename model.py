@@ -6,7 +6,7 @@ Complete architecture combining encoder and predictor
 import torch
 import torch.nn as nn
 
-from encoder import CNNEncoder, Conv2DEncoder
+from encoder import CNNEncoder, Conv2DEncoder, Conv2DEncoderV2
 from predictor import TransformerPredictor
 from loss import HWMLoss, HybridLoss
 from ctc_head import CTCHead
@@ -207,6 +207,71 @@ class HWMv2(nn.Module):
         z_pred, z_seq, ctc_logits = self.forward(img_columns)
         z_target = z_seq[:, -1, :]
 
+        return self.criterion(
+            z_pred, z_target, z_seq, ctc_logits, targets, input_lengths, target_lengths
+        )
+
+    def adapt(self, img_columns):
+        z_pred, z_seq, _ = self.forward(img_columns)
+        z_target = z_seq[:, -1, :]
+        return self.criterion(z_pred, z_target, z_seq)
+
+    def count_parameters(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+class HWMv3(nn.Module):
+    """
+    Handwriting World Model v3
+    Deeper encoder, wider window, larger transformer.
+    """
+
+    def __init__(
+        self,
+        img_height=48,
+        window_size=32,
+        embedding_dim=128,
+        num_layers=4,
+        num_heads=4,
+        ff_dim=384,
+        dropout=0.1,
+        num_classes=None,
+        lambda_sigreg=0.1,
+        lambda_ctc=2.0,
+    ):
+        super().__init__()
+        self.img_height = img_height
+        self.window_size = window_size
+        self.embedding_dim = embedding_dim
+
+        self.encoder = Conv2DEncoderV2(img_height, window_size, embedding_dim)
+        self.predictor = TransformerPredictor(
+            embedding_dim, num_layers, num_heads, ff_dim, dropout
+        )
+        self.ctc_head = CTCHead(embedding_dim, num_classes) if num_classes else None
+        self.criterion = HybridLoss(lambda_sigreg, lambda_ctc)
+
+    def encode_sequence(self, img_columns):
+        B, T = img_columns.shape[:2]
+        img_flat = img_columns.view(B * T, img_columns.shape[2], img_columns.shape[3])
+        z_flat = self.encoder(img_flat)
+        z_seq = z_flat.view(B, T, -1)
+        return z_seq
+
+    def forward(self, img_columns):
+        z_seq = self.encode_sequence(img_columns)
+        z_history = z_seq[:, :-1, :]
+        z_pred = self.predictor(z_history)
+        ctc_logits = None
+        if self.ctc_head is not None:
+            ctc_logits = self.ctc_head(z_seq)
+        return z_pred, z_seq, ctc_logits
+
+    def compute_loss(
+        self, img_columns, targets=None, input_lengths=None, target_lengths=None
+    ):
+        z_pred, z_seq, ctc_logits = self.forward(img_columns)
+        z_target = z_seq[:, -1, :]
         return self.criterion(
             z_pred, z_target, z_seq, ctc_logits, targets, input_lengths, target_lengths
         )

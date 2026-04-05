@@ -3,7 +3,12 @@ Data loader for ALTO XML + JPG page images.
 Uses kraken's parsers for XML and line extraction.
 """
 
-from PIL import Image
+import warnings
+
+warnings.filterwarnings("ignore", message="divide by zero", category=RuntimeWarning)
+warnings.filterwarnings("ignore", message="invalid value", category=RuntimeWarning)
+
+from PIL import Image, ImageEnhance
 from kraken.lib.xml import XMLPage
 from kraken.lib.segmentation import extract_polygons
 import torch
@@ -11,11 +16,14 @@ from torch.utils.data import Dataset
 import os
 import glob
 import numpy as np
+import random
 
 
 class AltoLineDataset(Dataset):
-    def __init__(self, alto_dirs, img_height=48, max_width=2000):
+    def __init__(self, alto_dirs, img_height=48, max_width=2000, augment=False):
         self.samples = []
+        self.img_height = img_height
+        self.augment = augment
 
         for alto_dir in alto_dirs:
             xml_files = sorted(glob.glob(os.path.join(alto_dir, "*.xml")))
@@ -50,7 +58,7 @@ class AltoLineDataset(Dataset):
                         continue
 
                     w, h = line_img.size
-                    if h == 0:
+                    if w == 0 or h == 0:
                         continue
                     new_w = int(w * img_height / h)
                     if new_w > max_width or new_w < 10:
@@ -67,8 +75,25 @@ class AltoLineDataset(Dataset):
 
     def __getitem__(self, idx):
         arr, text = self.samples[idx]
+        if self.augment:
+            arr = self._augment(arr)
         img = torch.from_numpy(arr) / 255.0
         return img, text
+
+    @staticmethod
+    def _augment(arr):
+        img = Image.fromarray(arr.astype(np.uint8), mode="L")
+        if random.random() < 0.5:
+            angle = random.uniform(-3, 3)
+            img = img.rotate(angle, fillcolor=255, expand=False)
+        if random.random() < 0.5:
+            factor = random.uniform(0.85, 1.15)
+            img = ImageEnhance.Contrast(img).enhance(factor)
+        arr = np.array(img, dtype=np.float32)
+        if random.random() < 0.5:
+            noise = np.random.normal(0, 0.02 * 255, arr.shape).astype(np.float32)
+            arr = np.clip(arr + noise, 0, 255)
+        return arr
 
 
 def collate_alto_fn(batch, window_size=10, stride=5, char_to_idx=None):
