@@ -4,31 +4,47 @@ Pi-friendly hyperparameters for lightweight world model
 """
 
 # Architecture
-EMBEDDING_DIM = 64          # Latent dimension (vs 192 in LeWM)
-NUM_LAYERS = 2              # Transformer layers
-NUM_HEADS = 2               # Attention heads
-FF_DIM = 128                # Feed-forward dimension
+EMBEDDING_DIM = 64
+NUM_LAYERS = 2
+NUM_HEADS = 2
+FF_DIM = 128
 DROPOUT = 0.1
 
 # Input processing
-WINDOW_SIZE = 10            # Columns per "frame" (sliding window)
-STRIDE = 5                  # Stride for sliding window
-IMG_HEIGHT = 32             # Standardized line height
+WINDOW_SIZE = 10
+STRIDE = 5
+IMG_HEIGHT = 32
 
 # Training
-BATCH_SIZE = 4              # Small for Pi memory
-SEQ_LEN = 50                # Short sequences for testing
+BATCH_SIZE = 4
+SEQ_LEN = 50
 LEARNING_RATE = 1e-3
-SIGREG_LAMBDA = 0.1         # Regularization strength
-MAX_PARAMS = 1_000_000      # Hard limit for Pi
+SIGREG_LAMBDA = 0.1
+MAX_PARAMS = 1_000_000
 
 # Data
-NUM_SYNTHETIC_LINES = 100   # Small dataset for PoC
-ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"  # Limited alphabet
+NUM_SYNTHETIC_LINES = 100
+ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 # Logging
-LOG_INTERVAL = 5            # Steps between logs
+LOG_INTERVAL = 5
+
+# --- HWM-v2 additions ---
+
+CTC_BLANK = 0
+LAMBDA_CTC = 1.0
+
+ENCODER_TYPE = "conv2d"
+IMG_HEIGHT_V2 = 48
+EMBEDDING_DIM_V2 = 96
+FF_DIM_V2 = 192
+
+ALTO_DIRS = [
+    "D:/OCR_genealogie/Alto/bars_dordogne_alto",
+    "D:/OCR_genealogie/Alto/saint_chamassy_dordogne_alto_set_1",
+    "D:/OCR_genealogie/Alto/saint_chamassy_dordogne_alto_set_train",
+]
+
 
 def count_parameters(model):
-    """Count model parameters"""
     return sum(p.numel() for p in model.parameters() if p.requires_grad)

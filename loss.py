@@ -12,14 +12,14 @@ class SIGRegLoss(nn.Module):
     """
     SIGReg: Simple Isometric Gaussian Regularization
     Forces embeddings to follow isotropic Gaussian distribution
-    
+
     From LeWorldModel paper - prevents collapse without EMA/stop-gradient
     """
-    
+
     def __init__(self, lambda_reg=0.1):
         super().__init__()
         self.lambda_reg = lambda_reg
-    
+
     def forward(self, z):
         """
         Args:
@@ -31,27 +31,27 @@ class SIGRegLoss(nn.Module):
         if z.dim() == 3:
             B, T, D = z.shape
             z = z.reshape(B * T, D)
-        
+
         # Standardize embeddings (zero mean, unit variance per dimension)
         z_centered = z - z.mean(dim=0)
         z_std = z_centered / (z_centered.std(dim=0) + 1e-8)
-        
+
         # SIGReg loss:
         # 1. Penalize off-diagonal covariance (decorrelation)
         # 2. Penalize deviation from unit variance
-        
+
         # Covariance matrix
         cov = (z_std.T @ z_std) / z_std.size(0)
-        
+
         # Off-diagonal penalty (want identity matrix)
         off_diag = cov - torch.eye(cov.size(0), device=z.device)
-        off_diag_loss = (off_diag ** 2).sum() / cov.size(0)
-        
+        off_diag_loss = (off_diag**2).sum() / cov.size(0)
+
         # Variance penalty (want unit variance)
         var_loss = ((z_std.var(dim=0) - 1) ** 2).mean()
-        
+
         loss = self.lambda_reg * (off_diag_loss + var_loss)
-        
+
         return loss
 
 
@@ -60,21 +60,21 @@ class HWMLoss(nn.Module):
     Combined loss for HWM training
     L = L_pred + λ * L_SIGReg
     """
-    
-    def __init__(self, lambda_sigreg=0.1, pred_loss_type='mse'):
+
+    def __init__(self, lambda_sigreg=0.1, pred_loss_type="mse"):
         super().__init__()
         self.lambda_sigreg = lambda_sigreg
         self.pred_loss_type = pred_loss_type
-        
+
         self.sigreg = SIGRegLoss(lambda_reg=1.0)
-        
-        if pred_loss_type == 'mse':
+
+        if pred_loss_type == "mse":
             self.pred_loss = nn.MSELoss()
-        elif pred_loss_type == 'l1':
+        elif pred_loss_type == "l1":
             self.pred_loss = nn.L1Loss()
         else:
             raise ValueError(f"Unknown loss type: {pred_loss_type}")
-    
+
     def forward(self, z_pred, z_target, z_all=None):
         """
         Args:
@@ -86,50 +86,91 @@ class HWMLoss(nn.Module):
         """
         # Prediction loss
         pred_loss = self.pred_loss(z_pred, z_target)
-        
+
         # SIGReg regularization
         if z_all is not None:
             sigreg_loss = self.sigreg(z_all)
         else:
             # Use pred + target
             sigreg_loss = self.sigreg(torch.stack([z_pred, z_target], dim=1))
-        
+
         # Total
         total_loss = pred_loss + self.lambda_sigreg * sigreg_loss
-        
+
         return total_loss, {
-            'total': total_loss.item(),
-            'pred': pred_loss.item(),
-            'sigreg': sigreg_loss.item()
+            "total": total_loss.item(),
+            "pred": pred_loss.item(),
+            "sigreg": sigreg_loss.item(),
         }
+
+
+class HybridLoss(nn.Module):
+    """
+    Combined loss: prediction + SIGReg + CTC
+
+    L = L_pred + lambda_sigreg * L_sigreg + lambda_ctc * L_ctc
+    """
+
+    def __init__(self, lambda_sigreg=0.1, lambda_ctc=1.0):
+        super().__init__()
+        self.pred_loss = nn.MSELoss()
+        self.sigreg = SIGRegLoss(lambda_reg=1.0)
+        self.ctc_loss = nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
+        self.lambda_sigreg = lambda_sigreg
+        self.lambda_ctc = lambda_ctc
+
+    def forward(
+        self,
+        z_pred,
+        z_target,
+        z_all,
+        ctc_logits=None,
+        targets=None,
+        input_lengths=None,
+        target_lengths=None,
+    ):
+        pred = self.pred_loss(z_pred, z_target)
+        sigreg = self.sigreg(z_all)
+
+        total = pred + self.lambda_sigreg * sigreg
+        losses = {"pred": pred.item(), "sigreg": sigreg.item()}
+
+        if ctc_logits is not None and targets is not None:
+            ctc_input = ctc_logits.permute(1, 0, 2)
+            ctc = self.ctc_loss(ctc_input, targets, input_lengths, target_lengths)
+            total = total + self.lambda_ctc * ctc
+            losses["ctc"] = ctc.item()
+
+        losses["total"] = total.item()
+        return total, losses
 
 
 def test_loss():
     """Test loss functions"""
     print("\nTesting Loss Functions...")
-    
+
     batch_size = 4
     seq_len = 10
     embed_dim = 64
-    
+
     # Test SIGReg
     sigreg = SIGRegLoss(lambda_reg=0.1)
     z = torch.randn(batch_size, seq_len, embed_dim)
     loss = sigreg(z)
     print(f"SIGReg loss (random z): {loss.item():.4f}")
-    
+
     # Test HWM loss
     criterion = HWMLoss(lambda_sigreg=0.1)
     z_pred = torch.randn(batch_size, embed_dim)
     z_target = torch.randn(batch_size, embed_dim)
     z_all = torch.randn(batch_size, seq_len, embed_dim)
-    
+
     total_loss, losses_dict = criterion(z_pred, z_target, z_all)
     print(f"Total loss: {losses_dict['total']:.4f}")
     print(f"  Pred: {losses_dict['pred']:.4f}")
     print(f"  SIGReg: {losses_dict['sigreg']:.4f}")
     print(f"✓ Loss functions working!")
-    
+
     return criterion
 
 
