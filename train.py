@@ -86,7 +86,13 @@ def train_epoch(model, loader, optimizer, device, epoch, mode="full", scaler=Non
         for k, v in losses.items():
             totals[k] += v
         num_batches += 1
-        del loss, losses
+        del loss, losses, img_seqs
+        if mode == "full":
+            del targets, input_lengths, target_lengths
+
+        # Periodic GPU memory cleanup to avoid fragmentation
+        if batch_idx % 50 == 0 and device.type == "cuda":
+            torch.cuda.empty_cache()
 
         running = {k: v / num_batches for k, v in totals.items()}
         _progress_bar(epoch, batch_idx, total_batches, running, time.time() - t0)

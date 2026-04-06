@@ -172,7 +172,7 @@ class AltoLineDataset(Dataset):
         return arr
 
 
-def collate_alto_fn(batch, window_size=10, stride=5, char_to_idx=None):
+def collate_alto_fn(batch, window_size=10, stride=5, char_to_idx=None, max_seq_len=512):
     from generate_data import extract_columns
 
     img_seqs = []
@@ -182,6 +182,9 @@ def collate_alto_fn(batch, window_size=10, stride=5, char_to_idx=None):
 
     for img, text in batch:
         cols = extract_columns(img, window_size=window_size, stride=stride)
+        # Truncate overly long sequences to cap memory usage
+        if cols.shape[0] > max_seq_len:
+            cols = cols[:max_seq_len]
         img_seqs.append(cols)
         input_lengths.append(cols.shape[0])
 

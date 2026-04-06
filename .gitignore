@@ -17,6 +17,7 @@ env/
 # Data
 data/synthetic/*.png
 data/synthetic/*.jpg
+.cache_alto/*.pkl
 
 # IDE
 .vscode/
@@ -37,4 +38,4 @@ Thumbs.db
 !TRANSFER_README.md
 !DEVELOPMENT_LOG.md
 !SUMMARY.md
-.cache_alto/dataset_f1dcb4513ddb39ae4dfd5135c6b7355e.pkl
+

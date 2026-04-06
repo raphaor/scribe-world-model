@@ -185,9 +185,9 @@ class HWMv2(nn.Module):
 
     def encode_sequence(self, img_columns):
         B, T = img_columns.shape[:2]
-        img_flat = img_columns.view(B * T, img_columns.shape[2], img_columns.shape[3])
-        z_flat = self.encoder(img_flat)
-        z_seq = z_flat.view(B, T, -1)
+        z_seq = self.encoder(
+            img_columns.reshape(B * T, img_columns.shape[2], img_columns.shape[3])
+        ).view(B, T, -1)
         return z_seq
 
     def forward(self, img_columns):
@@ -205,7 +205,7 @@ class HWMv2(nn.Module):
         self, img_columns, targets=None, input_lengths=None, target_lengths=None
     ):
         z_pred, z_seq, ctc_logits = self.forward(img_columns)
-        z_target = z_seq[:, -1, :]
+        z_target = z_seq[:, -1, :].detach()
 
         return self.criterion(
             z_pred, z_target, z_seq, ctc_logits, targets, input_lengths, target_lengths
@@ -213,7 +213,7 @@ class HWMv2(nn.Module):
 
     def adapt(self, img_columns):
         z_pred, z_seq, _ = self.forward(img_columns)
-        z_target = z_seq[:, -1, :]
+        z_target = z_seq[:, -1, :].detach()
         return self.criterion(z_pred, z_target, z_seq)
 
     def count_parameters(self):
@@ -253,9 +253,9 @@ class HWMv3(nn.Module):
 
     def encode_sequence(self, img_columns):
         B, T = img_columns.shape[:2]
-        img_flat = img_columns.view(B * T, img_columns.shape[2], img_columns.shape[3])
-        z_flat = self.encoder(img_flat)
-        z_seq = z_flat.view(B, T, -1)
+        z_seq = self.encoder(
+            img_columns.reshape(B * T, img_columns.shape[2], img_columns.shape[3])
+        ).view(B, T, -1)
         return z_seq
 
     def forward(self, img_columns):
@@ -271,14 +271,14 @@ class HWMv3(nn.Module):
         self, img_columns, targets=None, input_lengths=None, target_lengths=None
     ):
         z_pred, z_seq, ctc_logits = self.forward(img_columns)
-        z_target = z_seq[:, -1, :]
+        z_target = z_seq[:, -1, :].detach()
         return self.criterion(
             z_pred, z_target, z_seq, ctc_logits, targets, input_lengths, target_lengths
         )
 
     def adapt(self, img_columns):
         z_pred, z_seq, _ = self.forward(img_columns)
-        z_target = z_seq[:, -1, :]
+        z_target = z_seq[:, -1, :].detach()
         return self.criterion(z_pred, z_target, z_seq)
 
     def count_parameters(self):
