@@ -328,6 +328,12 @@ if __name__ == "__main__":
         )
 
         # --- Build adapt_loader for mixed mode ---
+        # NOTE: when --unannotated-dirs is not provided, the same ALTO dirs
+        # are used for both supervised and self-supervised steps. Each image
+        # is then seen twice per epoch (once with CTC, once without). This is
+        # acceptable (different objectives, random augmentation) but for a
+        # true semi-supervised benefit, provide separate unannotated scans
+        # via --unannotated-dirs.
         adapt_loader = None
         if args.mode == "mixed":
             unannotated_dirs = args.unannotated_dirs or args.alto_dirs

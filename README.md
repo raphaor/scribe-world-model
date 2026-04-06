@@ -41,13 +41,15 @@ Three training modes control how losses are combined:
 
 ### `mixed` (default)
 
-Alternates supervised and self-supervised batches each training step. The encoder learns both to predict future frames (structure of handwriting) and to recognize characters. This is the recommended mode when you have some annotated data and want robust embeddings.
+Alternates supervised and self-supervised batches each training step. The encoder learns both to predict future frames (structure of handwriting) and to recognize characters.
+
+When `--unannotated-dirs` is not provided, the annotated ALTO data is used for both steps: each image is seen twice per epoch (once with CTC loss, once without). This is acceptable since the two steps have different training objectives and augmentation is random, but it does not provide a true semi-supervised benefit. For that, provide separate unannotated scans via `--unannotated-dirs`.
 
 ```bash
-# Uses annotated ALTO data for both supervised and self-supervised steps
+# Without extra data: annotated images serve both steps
 python train.py
 
-# With additional unannotated scans for the self-supervised steps
+# With separate unannotated scans (recommended for best results)
 python train.py --unannotated-dirs D:/scans/lot1 D:/scans/lot2
 ```
 
