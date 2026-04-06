@@ -86,20 +86,15 @@ class HWMv1(nn.Module):
 
     def forward(self, img_columns):
         """
-        Forward pass: encode columns and predict next embedding
+        Forward pass: encode columns and predict next embeddings (dense)
         Args:
             img_columns: (B, T, H, W) where T >= 2
         Returns:
-            z_pred: (B, D) predicted next embedding
+            z_pred: (B, T-1, D) predicted next embedding at each position
             z_seq: (B, T, D) all embeddings
         """
-        # Encode all columns
-        z_seq = self.encode_sequence(img_columns)  # (B, T, D)
-
-        # Predict next from history (use all but last)
-        z_history = z_seq[:, :-1, :]  # (B, T-1, D)
-        z_pred = self.predictor(z_history)  # (B, D)
-
+        z_seq = self.encode_sequence(img_columns)       # (B, T, D)
+        z_pred = self.predictor(z_seq[:, :-1, :])       # (B, T-1, D)
         return z_pred, z_seq
 
     def compute_loss(self, img_columns):
@@ -110,15 +105,9 @@ class HWMv1(nn.Module):
         Returns:
             total_loss, losses_dict
         """
-        # Forward pass
         z_pred, z_seq = self.forward(img_columns)
-
-        # Target is last embedding
-        z_target = z_seq[:, -1, :]  # (B, D)
-
-        # Compute loss
+        z_target = z_seq[:, 1:, :].detach()             # (B, T-1, D)
         total_loss, losses_dict = self.criterion(z_pred, z_target, z_seq)
-
         return total_loss, losses_dict
 
     def predict_future(self, img_columns, steps=1):
@@ -191,29 +180,23 @@ class HWMv2(nn.Module):
         return z_seq
 
     def forward(self, img_columns):
-        z_seq = self.encode_sequence(img_columns)
-        z_history = z_seq[:, :-1, :]
-        z_pred = self.predictor(z_history)
-
-        ctc_logits = None
-        if self.ctc_head is not None:
-            ctc_logits = self.ctc_head(z_seq)
-
+        z_seq = self.encode_sequence(img_columns)       # (B, T, D)
+        z_pred = self.predictor(z_seq[:, :-1, :])       # (B, T-1, D)
+        ctc_logits = self.ctc_head(z_seq) if self.ctc_head else None
         return z_pred, z_seq, ctc_logits
 
     def compute_loss(
         self, img_columns, targets=None, input_lengths=None, target_lengths=None
     ):
         z_pred, z_seq, ctc_logits = self.forward(img_columns)
-        z_target = z_seq[:, -1, :].detach()
-
+        z_target = z_seq[:, 1:, :].detach()             # (B, T-1, D)
         return self.criterion(
             z_pred, z_target, z_seq, ctc_logits, targets, input_lengths, target_lengths
         )
 
     def adapt(self, img_columns):
         z_pred, z_seq, _ = self.forward(img_columns)
-        z_target = z_seq[:, -1, :].detach()
+        z_target = z_seq[:, 1:, :].detach()             # (B, T-1, D)
         return self.criterion(z_pred, z_target, z_seq)
 
     def count_parameters(self):
@@ -259,26 +242,23 @@ class HWMv3(nn.Module):
         return z_seq
 
     def forward(self, img_columns):
-        z_seq = self.encode_sequence(img_columns)
-        z_history = z_seq[:, :-1, :]
-        z_pred = self.predictor(z_history)
-        ctc_logits = None
-        if self.ctc_head is not None:
-            ctc_logits = self.ctc_head(z_seq)
+        z_seq = self.encode_sequence(img_columns)       # (B, T, D)
+        z_pred = self.predictor(z_seq[:, :-1, :])       # (B, T-1, D)
+        ctc_logits = self.ctc_head(z_seq) if self.ctc_head else None
         return z_pred, z_seq, ctc_logits
 
     def compute_loss(
         self, img_columns, targets=None, input_lengths=None, target_lengths=None
     ):
         z_pred, z_seq, ctc_logits = self.forward(img_columns)
-        z_target = z_seq[:, -1, :].detach()
+        z_target = z_seq[:, 1:, :].detach()             # (B, T-1, D)
         return self.criterion(
             z_pred, z_target, z_seq, ctc_logits, targets, input_lengths, target_lengths
         )
 
     def adapt(self, img_columns):
         z_pred, z_seq, _ = self.forward(img_columns)
-        z_target = z_seq[:, -1, :].detach()
+        z_target = z_seq[:, 1:, :].detach()             # (B, T-1, D)
         return self.criterion(z_pred, z_target, z_seq)
 
     def count_parameters(self):

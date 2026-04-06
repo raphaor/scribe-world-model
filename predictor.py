@@ -82,15 +82,14 @@ class TransformerPredictor(nn.Module):
         Args:
             z_seq: (B, T, D) sequence of embeddings
         Returns:
-            z_pred: (B, D) predicted next embedding
+            z_pred: (B, T, D) predicted next embedding at each position
         """
         z_seq = self.pos_encoder(z_seq)
 
         causal_mask = self._generate_causal_mask(z_seq.size(1), z_seq.device)
         encoded = self.transformer(z_seq, mask=causal_mask)
 
-        z_last = encoded[:, -1, :]
-        z_pred = self.output_proj(z_last)
+        z_pred = self.output_proj(encoded)  # (B, T, D)
 
         return z_pred
 
@@ -107,12 +106,10 @@ class TransformerPredictor(nn.Module):
         current_seq = z_seq
 
         for _ in range(steps):
-            z_pred = self.forward(current_seq)  # (B, D)
-            predictions.append(z_pred)
-
-            # Append prediction to sequence
-            z_pred = z_pred.unsqueeze(1)  # (B, 1, D)
-            current_seq = torch.cat([current_seq, z_pred], dim=1)
+            z_all = self.forward(current_seq)  # (B, T, D)
+            z_next = z_all[:, -1, :]           # (B, D)
+            predictions.append(z_next)
+            current_seq = torch.cat([current_seq, z_next.unsqueeze(1)], dim=1)
 
         return torch.stack(predictions, dim=1)  # (B, steps, D)
 

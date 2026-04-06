@@ -186,8 +186,10 @@ def train(
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     optimizer = optim.Adam(model.parameters(), lr=lr)
+    # Always create scheduler with last_epoch=-1 so it initializes
+    # initial_lr in the optimizer. Then restore or adjust state after.
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=num_epochs, eta_min=1e-6
+        optimizer, T_max=num_epochs, eta_min=1e-6,
     )
 
     if optimizer_state is not None:
@@ -195,9 +197,11 @@ def train(
     if scheduler_state is not None:
         scheduler.load_state_dict(scheduler_state)
     elif start_epoch > 1:
-        # No saved scheduler state — set last_epoch directly to avoid
-        # triggering the "step() before optimizer.step()" warning.
-        scheduler.last_epoch = start_epoch - 1
+        # No saved scheduler (e.g. mode switch full→adapt): advance the
+        # scheduler to the correct position on the cosine curve so the
+        # LR matches where training left off, not the initial value.
+        for _ in range(start_epoch - 1):
+            scheduler.step()
     if scaler_state is not None and use_amp:
         scaler.load_state_dict(scaler_state)
 
