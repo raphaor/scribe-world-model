@@ -195,9 +195,9 @@ def train(
     if scheduler_state is not None:
         scheduler.load_state_dict(scheduler_state)
     elif start_epoch > 1:
-        # No saved scheduler state — manually advance to match resumed epoch
-        for _ in range(start_epoch - 1):
-            scheduler.step()
+        # No saved scheduler state — set last_epoch directly to avoid
+        # triggering the "step() before optimizer.step()" warning.
+        scheduler.last_epoch = start_epoch - 1
     if scaler_state is not None and use_amp:
         scaler.load_state_dict(scaler_state)
 
@@ -397,13 +397,16 @@ if __name__ == "__main__":
             if k in model_state and v.shape == model_state[k].shape
         }
         skipped = set(state_dict.keys()) - set(filtered.keys())
+        new_keys = set(model_state.keys()) - set(state_dict.keys())
         if skipped:
             print(f"  Warning: skipped layers (shape mismatch): {skipped}")
+        if new_keys:
+            print(f"  Warning: new layers not in checkpoint: {new_keys}")
         model.load_state_dict(filtered, strict=False)
         start_epoch = ckpt.get("epoch", 0) + 1
 
         # Restore optimizer/scheduler only if model architecture matches exactly
-        if not skipped:
+        if not skipped and not new_keys:
             optimizer_state = ckpt.get("optimizer_state_dict")
             scheduler_state = ckpt.get("scheduler_state_dict")
             scaler_state = ckpt.get("scaler_state_dict")

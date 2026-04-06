@@ -94,11 +94,11 @@ class HWMLoss(nn.Module):
         # Prediction loss
         pred_loss = self.pred_loss(z_pred, z_target)
 
-        # SIGReg regularization (detached — regularizer only)
+        # SIGReg regularization — gradients flow back to encoder to prevent collapse
         if z_all is not None:
-            sigreg_loss = self.sigreg(z_all.detach())
+            sigreg_loss = self.sigreg(z_all)
         else:
-            sigreg_loss = self.sigreg(torch.stack([z_pred, z_target], dim=1).detach())
+            sigreg_loss = self.sigreg(torch.stack([z_pred, z_target], dim=1))
 
         # Total
         total_loss = pred_loss + self.lambda_sigreg * sigreg_loss
@@ -136,10 +136,10 @@ class HybridLoss(nn.Module):
         target_lengths=None,
     ):
         pred = self.pred_loss(z_pred, z_target)
-        # Detach z_all for SIGReg: it's a regularizer on the embedding
-        # distribution, not a reconstruction signal — no need to backprop
-        # through the encoder a second time. This halves peak GPU memory.
-        sigreg = self.sigreg(z_all.detach())
+        # SIGReg must backprop through the encoder — it's the anti-collapse
+        # mechanism that replaces EMA in JEPA. Without these gradients,
+        # adapt mode diverges (embeddings drift with no anchor).
+        sigreg = self.sigreg(z_all)
 
         total = pred + self.lambda_sigreg * sigreg
         losses = {"pred": pred.detach().item(), "sigreg": sigreg.detach().item()}
