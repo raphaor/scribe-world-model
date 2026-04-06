@@ -19,6 +19,14 @@ class SIGRegLoss(nn.Module):
     def __init__(self, lambda_reg=0.1):
         super().__init__()
         self.lambda_reg = lambda_reg
+        self._eye_cache = {}
+
+    def _get_eye(self, size, device):
+        """Cache identity matrix to avoid repeated GPU allocations."""
+        key = (size, device)
+        if key not in self._eye_cache:
+            self._eye_cache[key] = torch.eye(size, device=device)
+        return self._eye_cache[key]
 
     def forward(self, z):
         """
@@ -32,20 +40,19 @@ class SIGRegLoss(nn.Module):
             B, T, D = z.shape
             z = z.reshape(B * T, D)
 
+        N = z.size(0)
+
         # Standardize embeddings (zero mean, unit variance per dimension)
-        z_centered = z - z.mean(dim=0)
+        z_mean = z.mean(dim=0)
+        z_centered = z - z_mean
         z_std = z_centered / (z_centered.std(dim=0) + 1e-8)
 
-        # SIGReg loss:
-        # 1. Penalize off-diagonal covariance (decorrelation)
-        # 2. Penalize deviation from unit variance
-
-        # Covariance matrix
-        cov = (z_std.T @ z_std) / z_std.size(0)
+        # Covariance matrix: (D, N) @ (N, D) -> (D, D) — much smaller than (N, N)
+        cov = (z_std.T @ z_std) / N
 
         # Off-diagonal penalty (want identity matrix)
-        off_diag = cov - torch.eye(cov.size(0), device=z.device)
-        off_diag_loss = (off_diag**2).sum() / cov.size(0)
+        eye = self._get_eye(cov.size(0), z.device)
+        off_diag_loss = ((cov - eye) ** 2).sum() / cov.size(0)
 
         # Variance penalty (want unit variance)
         var_loss = ((z_std.var(dim=0) - 1) ** 2).mean()
@@ -87,12 +94,11 @@ class HWMLoss(nn.Module):
         # Prediction loss
         pred_loss = self.pred_loss(z_pred, z_target)
 
-        # SIGReg regularization
+        # SIGReg regularization (detached — regularizer only)
         if z_all is not None:
-            sigreg_loss = self.sigreg(z_all)
+            sigreg_loss = self.sigreg(z_all.detach())
         else:
-            # Use pred + target
-            sigreg_loss = self.sigreg(torch.stack([z_pred, z_target], dim=1))
+            sigreg_loss = self.sigreg(torch.stack([z_pred, z_target], dim=1).detach())
 
         # Total
         total_loss = pred_loss + self.lambda_sigreg * sigreg_loss
@@ -130,7 +136,10 @@ class HybridLoss(nn.Module):
         target_lengths=None,
     ):
         pred = self.pred_loss(z_pred, z_target)
-        sigreg = self.sigreg(z_all)
+        # Detach z_all for SIGReg: it's a regularizer on the embedding
+        # distribution, not a reconstruction signal — no need to backprop
+        # through the encoder a second time. This halves peak GPU memory.
+        sigreg = self.sigreg(z_all.detach())
 
         total = pred + self.lambda_sigreg * sigreg
         losses = {"pred": pred.detach().item(), "sigreg": sigreg.detach().item()}

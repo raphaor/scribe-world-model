@@ -12,7 +12,6 @@ import os
 import gc
 import argparse
 import time
-import itertools
 from collections import defaultdict
 from functools import partial
 
@@ -91,11 +90,14 @@ def train_epoch(
 
     if mode == "mixed" and adapt_loader is not None:
         # Interleave full and adapt batches: full, adapt, full, adapt, ...
-        adapt_iter = itertools.cycle(adapt_loader)
+        # NOTE: do NOT use itertools.cycle here — it caches every batch
+        # in memory, causing progressive memory growth across the epoch.
+        adapt_iter = iter(adapt_loader)
         total_batches = len(loader) * 2
         for batch_idx, full_batch in enumerate(loader):
             # --- supervised step ---
             loss, losses = _step_full(model, full_batch, optimizer, device, use_amp)
+            del full_batch
             if loss is not None:
                 _backward(loss, optimizer, model, scaler, use_amp)
                 for k, v in losses.items():
@@ -103,9 +105,14 @@ def train_epoch(
                 num_batches += 1
                 del loss, losses
 
-            # --- self-supervised step ---
-            adapt_batch = next(adapt_iter)
+            # --- self-supervised step (restart iter if exhausted) ---
+            try:
+                adapt_batch = next(adapt_iter)
+            except StopIteration:
+                adapt_iter = iter(adapt_loader)
+                adapt_batch = next(adapt_iter)
             loss, losses = _step_adapt(model, adapt_batch, optimizer, device, use_amp)
+            del adapt_batch
             if loss is not None:
                 _backward(loss, optimizer, model, scaler, use_amp)
                 for k, v in losses.items():
@@ -113,7 +120,7 @@ def train_epoch(
                 num_batches += 1
                 del loss, losses
 
-            if (batch_idx * 2) % 50 == 0 and device.type == "cuda":
+            if batch_idx % 25 == 0 and device.type == "cuda":
                 torch.cuda.empty_cache()
 
             running = {k: v / max(1, num_batches // 2) for k, v in totals.items()}
@@ -124,6 +131,7 @@ def train_epoch(
         total_batches = len(loader)
         for batch_idx, batch in enumerate(loader):
             loss, losses = step_fn(model, batch, optimizer, device, use_amp)
+            del batch
             if loss is None:
                 continue
 
