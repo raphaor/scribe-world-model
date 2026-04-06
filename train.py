@@ -1,8 +1,9 @@
 """
-Multi-task training for HWM-v2.
+Multi-task training for HWM-v2/v3.
 Supports:
-  - Supervised: prediction + SIGReg + CTC (with ALTO data)
-  - Self-supervised: prediction + SIGReg only (adapt mode)
+  - full: prediction + SIGReg + CTC (with ALTO data)
+  - adapt: prediction + SIGReg only (self-supervised)
+  - mixed (default): alternates full and adapt batches each step
   - Resume from checkpoint (optimizer, scheduler, epoch state restored)
 """
 
@@ -11,6 +12,7 @@ import os
 import gc
 import argparse
 import time
+import itertools
 from collections import defaultdict
 from functools import partial
 
@@ -22,7 +24,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config
 from model import HWMv2, HWMv3
-from data_alto import AltoLineDataset, collate_alto_fn
+from data_alto import (
+    AltoLineDataset,
+    UnannotatedLineDataset,
+    collate_alto_fn,
+    collate_unannotated_fn,
+)
 
 
 def _progress_bar(epoch, batch_idx, total_batches, losses, elapsed, bar_width=30):
@@ -38,73 +45,125 @@ def _progress_bar(epoch, batch_idx, total_batches, losses, elapsed, bar_width=30
     sys.stdout.flush()
 
 
-def train_epoch(model, loader, optimizer, device, epoch, mode="full", scaler=None):
+def _step_full(model, batch, optimizer, device, use_amp):
+    """One supervised training step (prediction + SIGReg + CTC)."""
+    img_seqs, targets, input_lengths, target_lengths = batch
+    img_seqs = img_seqs.to(device, non_blocking=True)
+    targets = targets.to(device, non_blocking=True)
+    input_lengths = input_lengths.to(device, non_blocking=True)
+    target_lengths = target_lengths.to(device, non_blocking=True)
+
+    if img_seqs.shape[1] < 2:
+        return None, None
+
+    optimizer.zero_grad(set_to_none=True)
+    with torch.amp.autocast("cuda", enabled=use_amp):
+        loss, losses = model.compute_loss(
+            img_seqs, targets, input_lengths, target_lengths
+        )
+    del img_seqs, targets, input_lengths, target_lengths
+    return loss, losses
+
+
+def _step_adapt(model, batch, optimizer, device, use_amp):
+    """One self-supervised training step (prediction + SIGReg only)."""
+    img_seqs = batch[0].to(device, non_blocking=True)
+
+    if img_seqs.shape[1] < 2:
+        return None, None
+
+    optimizer.zero_grad(set_to_none=True)
+    with torch.amp.autocast("cuda", enabled=use_amp):
+        loss, losses = model.adapt(img_seqs)
+    del img_seqs
+    return loss, losses
+
+
+def train_epoch(
+    model, loader, optimizer, device, epoch, mode="full", scaler=None,
+    adapt_loader=None,
+):
     model.train()
     totals = defaultdict(float)
     num_batches = 0
     use_amp = scaler is not None
-    total_batches = len(loader)
     t0 = time.time()
 
-    for batch_idx, batch in enumerate(loader):
-        if mode == "full":
-            img_seqs, targets, input_lengths, target_lengths = batch
-            img_seqs = img_seqs.to(device, non_blocking=True)
-            targets = targets.to(device, non_blocking=True)
-            input_lengths = input_lengths.to(device, non_blocking=True)
-            target_lengths = target_lengths.to(device, non_blocking=True)
+    if mode == "mixed" and adapt_loader is not None:
+        # Interleave full and adapt batches: full, adapt, full, adapt, ...
+        adapt_iter = itertools.cycle(adapt_loader)
+        total_batches = len(loader) * 2
+        for batch_idx, full_batch in enumerate(loader):
+            # --- supervised step ---
+            loss, losses = _step_full(model, full_batch, optimizer, device, use_amp)
+            if loss is not None:
+                _backward(loss, optimizer, model, scaler, use_amp)
+                for k, v in losses.items():
+                    totals[k] += v
+                num_batches += 1
+                del loss, losses
 
-            if img_seqs.shape[1] < 2:
+            # --- self-supervised step ---
+            adapt_batch = next(adapt_iter)
+            loss, losses = _step_adapt(model, adapt_batch, optimizer, device, use_amp)
+            if loss is not None:
+                _backward(loss, optimizer, model, scaler, use_amp)
+                for k, v in losses.items():
+                    totals[f"a_{k}"] += v
+                num_batches += 1
+                del loss, losses
+
+            if (batch_idx * 2) % 50 == 0 and device.type == "cuda":
+                torch.cuda.empty_cache()
+
+            running = {k: v / max(1, num_batches // 2) for k, v in totals.items()}
+            _progress_bar(epoch, batch_idx * 2 + 1, total_batches, running, time.time() - t0)
+    else:
+        # Pure full or pure adapt mode
+        step_fn = _step_full if mode == "full" else _step_adapt
+        total_batches = len(loader)
+        for batch_idx, batch in enumerate(loader):
+            loss, losses = step_fn(model, batch, optimizer, device, use_amp)
+            if loss is None:
                 continue
 
-            optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast("cuda", enabled=use_amp):
-                loss, losses = model.compute_loss(
-                    img_seqs, targets, input_lengths, target_lengths
-                )
+            _backward(loss, optimizer, model, scaler, use_amp)
 
-        elif mode == "adapt":
-            img_seqs = batch[0].to(device, non_blocking=True)
-            if img_seqs.shape[1] < 2:
-                continue
+            for k, v in losses.items():
+                totals[k] += v
+            num_batches += 1
+            del loss, losses
 
-            optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast("cuda", enabled=use_amp):
-                loss, losses = model.adapt(img_seqs)
+            if batch_idx % 50 == 0 and device.type == "cuda":
+                torch.cuda.empty_cache()
 
-        if use_amp:
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-
-        for k, v in losses.items():
-            totals[k] += v
-        num_batches += 1
-        del loss, losses, img_seqs
-        if mode == "full":
-            del targets, input_lengths, target_lengths
-
-        # Periodic GPU memory cleanup to avoid fragmentation
-        if batch_idx % 50 == 0 and device.type == "cuda":
-            torch.cuda.empty_cache()
-
-        running = {k: v / num_batches for k, v in totals.items()}
-        _progress_bar(epoch, batch_idx, total_batches, running, time.time() - t0)
+            running = {k: v / num_batches for k, v in totals.items()}
+            _progress_bar(epoch, batch_idx, total_batches, running, time.time() - t0)
 
     sys.stdout.write("\n")
-    return {k: v / num_batches for k, v in totals.items()} if num_batches > 0 else {}
+    divisor = max(1, num_batches // 2) if mode == "mixed" else max(1, num_batches)
+    return {k: v / divisor for k, v in totals.items()}
+
+
+def _backward(loss, optimizer, model, scaler, use_amp):
+    """Backward pass + gradient clipping."""
+    if use_amp:
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
 
 
 def train(
     model,
     train_loader,
     val_loader=None,
+    adapt_loader=None,
     num_epochs=30,
     lr=1e-3,
     device="cpu",
@@ -134,7 +193,8 @@ def train(
 
     for epoch in range(start_epoch, num_epochs + 1):
         losses = train_epoch(
-            model, train_loader, optimizer, device, epoch, mode=mode, scaler=scaler
+            model, train_loader, optimizer, device, epoch,
+            mode=mode, scaler=scaler, adapt_loader=adapt_loader,
         )
         scheduler.step()
 
@@ -179,13 +239,20 @@ def train(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train HWM")
-    parser.add_argument("--mode", choices=["full", "adapt"], default="full")
+    parser.add_argument("--mode", choices=["mixed", "full", "adapt"], default="mixed")
     parser.add_argument("--model-version", choices=["v2", "v3"], default="v3")
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--data", default="alto", choices=["alto", "synthetic"])
     parser.add_argument("--alto-dirs", nargs="+", default=config.ALTO_DIRS)
+    parser.add_argument(
+        "--unannotated-dirs",
+        nargs="+",
+        default=None,
+        help="Extra dirs with ALTO pages used without their text (adapt data). "
+        "In mixed mode, defaults to --alto-dirs if not specified.",
+    )
     parser.add_argument("--checkpoint", default=None, help="Resume from checkpoint")
     parser.add_argument(
         "--num-workers",
@@ -246,8 +313,32 @@ if __name__ == "__main__":
             pin_memory=pin_mem,
             persistent_workers=args.num_workers > 0,
         )
+
+        # --- Build adapt_loader for mixed mode ---
+        adapt_loader = None
+        if args.mode == "mixed":
+            unannotated_dirs = args.unannotated_dirs or args.alto_dirs
+            adapt_ds = UnannotatedLineDataset(
+                unannotated_dirs, img_height=img_h, augment=True
+            )
+            adapt_collate = partial(
+                collate_unannotated_fn, window_size=ws, stride=stride
+            )
+            adapt_loader = DataLoader(
+                adapt_ds,
+                batch_size=args.batch_size,
+                shuffle=True,
+                collate_fn=adapt_collate,
+                num_workers=args.num_workers,
+                pin_memory=pin_mem,
+                persistent_workers=args.num_workers > 0,
+            )
+            print(f"Mixed mode: {len(train_ds)} annotated + {len(adapt_ds)} unannotated lines")
     else:
         raise ValueError("Only 'alto' data mode is supported")
+
+    # CTC head is needed in full and mixed modes
+    need_ctc = args.mode in ("full", "mixed")
 
     if v3:
         model = HWMv3(
@@ -258,7 +349,7 @@ if __name__ == "__main__":
             num_heads=config.NUM_HEADS_V3,
             ff_dim=config.FF_DIM_V3,
             dropout=config.DROPOUT,
-            num_classes=num_classes if args.mode == "full" else None,
+            num_classes=num_classes if need_ctc else None,
             lambda_ctc=config.LAMBDA_CTC_V3,
         ).to(device)
         save_path = "hwm_v3.pt"
@@ -271,7 +362,7 @@ if __name__ == "__main__":
             num_heads=config.NUM_HEADS,
             ff_dim=config.FF_DIM_V2,
             dropout=config.DROPOUT,
-            num_classes=num_classes if args.mode == "full" else None,
+            num_classes=num_classes if need_ctc else None,
         ).to(device)
         save_path = "hwm_v2.pt"
 
@@ -303,6 +394,7 @@ if __name__ == "__main__":
         model,
         train_loader,
         val_loader,
+        adapt_loader=adapt_loader,
         num_epochs=args.epochs,
         lr=args.lr,
         mode=args.mode,

@@ -172,6 +172,89 @@ class AltoLineDataset(Dataset):
         return arr
 
 
+class UnannotatedLineDataset(Dataset):
+    """
+    Dataset for unannotated line images (adapt / self-supervised mode).
+    Loads lines from ALTO pages but discards the text.
+    """
+
+    def __init__(
+        self, dirs, img_height=48, max_width=2000, augment=False, max_workers=4
+    ):
+        self.samples = []
+        self.img_height = img_height
+        self.augment = augment
+
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        key = _cache_key(dirs, img_height, max_width) + "_unannotated"
+        cache_path = os.path.join(CACHE_DIR, f"dataset_{key}.pkl")
+
+        if os.path.exists(cache_path):
+            print(f"Loading cached unannotated dataset from {cache_path} ...")
+            with open(cache_path, "rb") as f:
+                self.samples = pickle.load(f)
+            print(f"Loaded {len(self.samples)} unannotated lines (from cache)")
+            return
+
+        xml_files = []
+        for d in dirs:
+            xml_files.extend(
+                p for p in sorted(glob.glob(os.path.join(d, "*.xml")))
+                if os.path.basename(p) != "METS.xml"
+            )
+
+        tasks = [(xml_path, img_height, max_width) for xml_path in xml_files]
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_parse_page, t): t for t in tasks}
+            done = 0
+            for future in as_completed(futures):
+                done += 1
+                page_samples, _ = future.result()
+                self.samples.extend([arr for arr, _text in page_samples])
+                sys.stdout.write(f"\r  Parsing unannotated pages: {done}/{len(tasks)}")
+                sys.stdout.flush()
+
+        sys.stdout.write("\n")
+        print(f"Loaded {len(self.samples)} unannotated lines from {len(dirs)} dirs")
+
+        with open(cache_path, "wb") as f:
+            pickle.dump(self.samples, f)
+        print(f"Cache saved to {cache_path}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        arr = self.samples[idx]
+        if self.augment:
+            arr = AltoLineDataset._augment(arr)
+        img = torch.from_numpy(arr.copy()) / 255.0
+        return (img,)
+
+
+def collate_unannotated_fn(batch, window_size=10, stride=5, max_seq_len=512):
+    """Collate for unannotated batches — returns only (padded_img_seqs,)."""
+    from generate_data import extract_columns
+
+    img_seqs = []
+    for (img,) in batch:
+        cols = extract_columns(img, window_size=window_size, stride=stride)
+        if cols.shape[0] > max_seq_len:
+            cols = cols[:max_seq_len]
+        img_seqs.append(cols)
+
+    max_len = max(seq.shape[0] for seq in img_seqs)
+    B = len(img_seqs)
+    H = img_seqs[0].shape[1]
+
+    padded = torch.zeros(B, max_len, H, window_size)
+    for i, seq in enumerate(img_seqs):
+        padded[i, : seq.shape[0]] = seq
+
+    return (padded,)
+
+
 def collate_alto_fn(batch, window_size=10, stride=5, char_to_idx=None, max_seq_len=512):
     from generate_data import extract_columns
 

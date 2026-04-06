@@ -1,268 +1,208 @@
-# HWM-v1: Handwriting World Model - Proof of Concept
+# Scribe World Model (HWM)
 
-**Lightweight implementation for Raspberry Pi (ARM64)**
+Handwriting World Model for historical document OCR. A JEPA-inspired architecture (Joint Embedding Predictive Architecture) that learns visual representations of handwriting through next-frame prediction, combined with CTC-based character recognition.
 
-## Overview
-
-HWM-v1 is a "World Model 1D" adapted for handwriting recognition, inspired by LeWorldModel (LeWM). This PoC validates the architecture on a Raspberry Pi with limited resources.
-
-### Architecture
+## Architecture
 
 ```
-Input: Image line (H×W)
-  ↓
-[CNN 1D Encoder] → Embedding z_t ∈ R^64
-  ↓
-[Transformer Predictor] (2 layers, 2 heads)
-  ↓
-Prediction ż_{t+1}
-  ↓
-Loss: MSE(z_{t+1}, ż_{t+1}) + λ × SIGReg(Z)
+Input: Handwriting line image (48 x W pixels, grayscale)
+  |
+  |  sliding windows (stride=4, width=32)
+  v
+[Frame_1] [Frame_2] ... [Frame_T]     T frames of 48x32 pixels
+  |          |              |
+  v          v              v
+[  Conv2D Encoder (shared weights)  ]  Each frame -> z in R^128
+  |          |              |
+  v          v              v
+ z_1        z_2    ...     z_T         Latent embedding sequence
+  |                         |
+  +--- Two heads -----------+
+  |                         |
+  v                         v
+[Transformer Predictor]   [CTC Head]
+(causal, predicts z_{t+1}) (character logits)
+  |                         |
+  v                         v
+L_pred + L_SIGReg          L_CTC
 ```
 
-### Key Features
+### Loss components
 
-- ✅ **CPU-only** training (no GPU required)
-- ✅ **Lightweight**: ~100K-500K parameters (under 1M limit)
-- ✅ **Pi-friendly**: Batch size 2-4, ~6.7GB RAM available
-- ✅ **Self-supervised**: Learns from pixels only (no labels needed)
-- ✅ **SIGReg**: Prevents collapse without EMA/stop-gradient
+| Loss | Formula | Role |
+|------|---------|------|
+| **Prediction** | `MSE(z_pred, z_target)` | Self-supervised: predict next embedding |
+| **SIGReg** | `\|Cov(Z) - I\|^2 + \|Var(Z) - 1\|^2` | Prevent embedding collapse (no EMA needed) |
+| **CTC** | CTC alignment loss | Supervised: character recognition |
 
-## Quick Start
+## Training modes
 
-### 1. Setup
+Three training modes control how losses are combined:
+
+### `mixed` (default)
+
+Alternates supervised and self-supervised batches each training step. The encoder learns both to predict future frames (structure of handwriting) and to recognize characters. This is the recommended mode when you have some annotated data and want robust embeddings.
 
 ```bash
-cd ~/projects/hwm-poc
-python3 -m venv venv
-source venv/bin/activate
+# Uses annotated ALTO data for both supervised and self-supervised steps
+python train.py
+
+# With additional unannotated scans for the self-supervised steps
+python train.py --unannotated-dirs D:/scans/lot1 D:/scans/lot2
+```
+
+### `full`
+
+Pure supervised training. All three losses active (prediction + SIGReg + CTC). Every batch requires ground truth text.
+
+```bash
+python train.py --mode full
+```
+
+### `adapt`
+
+Pure self-supervised. Only prediction + SIGReg losses. No ground truth needed. Use this to adapt the encoder to a new handwriting style before fine-tuning with `full` or `mixed`.
+
+```bash
+python train.py --mode adapt
+```
+
+## Model versions
+
+| | v1 | v2 | v3 (default) |
+|---|---|---|---|
+| Encoder | MLP | Conv2D (3 layers) | Conv2D (5 layers + BatchNorm) |
+| Embedding dim | 64 | 96 | 128 |
+| Transformer | 2 layers, 2 heads | 2 layers, 2 heads | 4 layers, 4 heads |
+| Window size | 10 | 10 | 32 |
+| Stride | 5 | 5 | 4 |
+| CTC head | No | Yes | Yes |
+| Image height | 32 | 48 | 48 |
+
+```bash
+python train.py --model-version v3   # default
+python train.py --model-version v2
+```
+
+## Data
+
+### ALTO XML format
+
+Training data consists of page scans (JPG) paired with ALTO XML segmentation files. Kraken's parsers extract individual text lines from the pages.
+
+```bash
+python train.py --alto-dirs D:/OCR/bars_dordogne D:/OCR/saint_chamassy
+```
+
+Datasets are cached in `.cache_alto/` after first load for faster restarts.
+
+### Data augmentation
+
+Applied on-the-fly during training:
+- Random rotation (+-3 degrees, 50% chance)
+- Random contrast adjustment (0.85-1.15x, 50% chance)
+- Gaussian noise (sigma=5, 50% chance)
+
+## Quick start
+
+### Setup
+
+```bash
+python -m venv venv
+source venv/bin/activate   # or venv\Scripts\activate on Windows
 pip install -r requirements.txt
 ```
 
-### 2. Test Components
+### Train
 
 ```bash
-# Test encoder
-python encoder.py
+# Default: mixed mode, v3, 30 epochs
+python train.py --alto-dirs <path_to_alto_data>
 
-# Test predictor
-python predictor.py
+# With GPU, larger batch
+python train.py --batch-size 32 --lr 1e-3
 
-# Test loss functions
-python loss.py
-
-# Test complete model
-python model.py
-
-# Test data generation
-python generate_data.py
+# Resume from checkpoint
+python train.py --checkpoint hwm_v3.pt
 ```
 
-### 3. Train (Lightweight)
+### Evaluate
 
 ```bash
-# Quick training (2 epochs, 100 synthetic lines)
-python train_light.py --epochs 2 --num-lines 100
-
-# Adjust parameters if needed
-python train_light.py --epochs 3 --batch-size 2 --num-lines 50
+# CER evaluation on ALTO data
+python recognize.py --model hwm_v3.pt --alto-dirs <path_to_alto_data>
 ```
 
-### 4. Test Inference
+### Inference
 
 ```bash
-# Test on new synthetic data
 python inference.py --model hwm_model.pt --num-tests 5
 ```
 
-### 5. Export for Transfer
-
-```bash
-# Export model for powerful machine
-python export_model.py --checkpoint hwm_model.pt --output hwm_for_transfer.tar
-```
-
-## Project Structure
+## CLI reference
 
 ```
-hwm-poc/
-├── config.py           # Hyperparameters
-├── encoder.py          # CNN 1D encoder
-├── predictor.py        # Transformer predictor
-├── loss.py             # Prediction loss + SIGReg
-├── model.py            # Complete HWM-v1 model
-├── generate_data.py    # Synthetic data generator
-├── train_light.py      # Lightweight training script
-├── inference.py        # Inference and testing
-├── export_model.py     # Export for transfer
-├── requirements.txt    # Dependencies
-├── README.md           # This file
-├── data/
-│   └── synthetic/      # Generated images
-└── hwm_model.pt        # Trained model
+python train.py [OPTIONS]
+
+--mode {mixed,full,adapt}     Training mode (default: mixed)
+--model-version {v2,v3}       Model architecture (default: v3)
+--epochs N                    Number of epochs (default: 30)
+--batch-size N                Batch size (default: 32)
+--lr FLOAT                    Learning rate (default: 1e-3)
+--alto-dirs DIR [DIR ...]     Annotated ALTO data directories
+--unannotated-dirs DIR [...]  Extra dirs for self-supervised data (mixed mode)
+--checkpoint PATH             Resume from checkpoint
+--num-workers N               DataLoader workers, 0=main thread (default: 0)
+```
+
+## Project structure
+
+```
+scribe-world-model/
+  config.py          Hyperparameters (v1/v2/v3)
+  encoder.py         CNN encoders (MLP, Conv2D, Conv2DV2)
+  predictor.py       Causal Transformer predictor
+  ctc_head.py        Linear CTC projection head
+  loss.py            Prediction + SIGReg + CTC losses
+  model.py           HWMv1, HWMv2, HWMv3 models
+  data_alto.py       ALTO dataset, unannotated dataset, collate functions
+  generate_data.py   Synthetic data generator + sliding window extraction
+  train.py           Main training script (mixed/full/adapt)
+  train_light.py     Lightweight training (v1, synthetic data)
+  recognize.py       CTC greedy decoding + CER evaluation
+  inference.py       Inference and testing
+  export_model.py    Export model for transfer
+  .cache_alto/       Cached parsed datasets
 ```
 
 ## Configuration (config.py)
 
 ```python
-# Architecture
-EMBEDDING_DIM = 64          # vs 192 in LeWM
-NUM_LAYERS = 2              # Minimal transformer
-NUM_HEADS = 2               # Small attention
-BATCH_SIZE = 4              # Pi memory limit
-SEQ_LEN = 50                # Short sequences
-
-# Loss
-SIGREG_LAMBDA = 0.1         # Regularization strength
-
-# Data
-NUM_SYNTHETIC_LINES = 100   # Small for PoC
-ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+# v3 (default)
+WINDOW_SIZE_V3 = 32
+STRIDE_V3 = 4
+IMG_HEIGHT_V3 = 48
+EMBEDDING_DIM_V3 = 128
+NUM_LAYERS_V3 = 4
+NUM_HEADS_V3 = 4
+FF_DIM_V3 = 384
+LAMBDA_CTC_V3 = 2.0
+DROPOUT = 0.1
 ```
 
-## Validation Criteria
+## GPU memory management
 
-**Success = ✅**
-- [x] Model instantiates without error
-- [x] Forward pass works
-- [x] Loss decreases on 1-2 epochs
-- [x] Predictions are valid (no NaN)
-- [x] Model exportable
+Training includes several optimizations to prevent GPU memory overflow:
+- Explicit tensor cleanup after each training step
+- Periodic `torch.cuda.empty_cache()` every 50 batches
+- Sequence length capping (`max_seq_len=512`) in collate functions
+- `torch.amp` mixed precision (automatic on CUDA)
+- `gc.collect()` + cache clear between epochs
 
-**What we're NOT doing:**
-- ❌ Training a production model
-- ❌ Using large datasets (IAM = 1GB+)
-- ❌ Achieving high accuracy
-- ❌ Running for many epochs
-
-**Goal:** Validate architecture, ensure loss decreases, verify numerical stability.
-
-## Training on Pi
-
-### Expected Performance
-
-- **1 epoch** (~100 lines, batch_size=4): ~30-60 seconds
-- **2 epochs**: ~1-2 minutes
-- **Memory usage**: ~200-500MB (well under 6.7GB limit)
-
-### Monitoring
-
-Training logs show:
-- Total loss
-- Prediction loss (MSE)
-- SIGReg regularization loss
-- Progress per batch
-
-Look for **decreasing total loss** across epochs.
-
-## Transfer to Powerful Machine
-
-### What to Transfer
-
-1. **Model weights**: `hwm_for_transfer.tar`
-2. **Source files**: `model.py`, `encoder.py`, `predictor.py`, `loss.py`
-3. **README**: `TRANSFER_README.md` (auto-generated)
-
-### Recommended Scaling
-
-On a machine with GPU:
-
-```python
-# Increase capacity
-EMBEDDING_DIM = 192      # 3x larger
-NUM_LAYERS = 4-6         # More depth
-NUM_HEADS = 4-8          # More attention
-BATCH_SIZE = 32-128      # Much larger batches
-
-# Use real data
-dataset = IAMHandwritingDatabase()  # ~5800 lines
-
-# Train longer
-num_epochs = 50-100
-```
-
-### Next Steps After Transfer
-
-1. **Scale up model** (more layers, higher dims)
-2. **Use real data** (IAM, RIMES, etc.)
-3. **Train for many epochs** (50-100)
-4. **Evaluate on validation set**
-5. **Compare vs baselines** (Kraken, CRNN)
-6. **Test applications**:
-   - Recognition (linear probe)
-   - Anomaly detection
-   - Style transfer
-
-## Technical Details
-
-### SIGReg Loss
-
-**Simple Isometric Gaussian Regularization**
-
-From LeWorldModel - forces embeddings to follow isotropic Gaussian distribution:
-- Penalizes off-diagonal covariance (decorrelation)
-- Penalizes deviation from unit variance
-- Prevents collapse without EMA or stop-gradient
-
-```python
-L_SIGReg = ||Cov(Z) - I||² + ||Var(Z) - 1||²
-```
-
-### Encoder Architecture
-
-Very lightweight:
-- Input: (H×W) flattened columns
-- 2 linear layers (256 → 128 → 64)
-- ReLU + Dropout
-- Output: z ∈ R^64
-
-### Predictor Architecture
-
-Minimal transformer:
-- Positional encoding
-- 2-layer TransformerEncoder
-- 2 attention heads
-- Output projection to R^64
-
-## Troubleshooting
-
-### Memory Error
-
-```bash
-# Reduce batch size
-python train_light.py --batch-size 2
-
-# Reduce data
-python train_light.py --num-lines 50
-```
-
-### Loss Explodes
-
-```python
-# In config.py, reduce learning rate
-LEARNING_RATE = 5e-4  # from 1e-3
-
-# Or reduce SIGReg weight
-SIGREG_LAMBDA = 0.05  # from 0.1
-```
-
-### NaN Values
-
-Check:
-1. Input data is normalized [0, 1]
-2. Learning rate not too high
-3. Gradient clipping enabled (default: max_norm=1.0)
+If you run out of memory, reduce `--batch-size` or add more `--unannotated-dirs` with shorter lines.
 
 ## References
 
 - **LeWorldModel**: "LeWorldModel: Stable End-to-End Joint-Embedding Predictive Architecture from Pixels" (arxiv:2603.19312)
-- **SIGReg**: From LeWM paper
-- **Kraken**: OCR system for handwriting recognition
-
-## Author
-
-PoC developed on Raspberry Pi 4 (ARM64) - April 2026
-
----
-
-**Status**: ✅ Architecture validated, ready for scaling on powerful hardware
+- **SIGReg**: Simple Isometric Gaussian Regularization (from LeWM)
+- **Kraken**: OCR engine used for ALTO parsing and line extraction
