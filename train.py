@@ -194,12 +194,17 @@ def train(
         optimizer.load_state_dict(optimizer_state)
     if scheduler_state is not None:
         scheduler.load_state_dict(scheduler_state)
+    elif start_epoch > 1:
+        # No saved scheduler state — manually advance to match resumed epoch
+        for _ in range(start_epoch - 1):
+            scheduler.step()
     if scaler_state is not None and use_amp:
         scaler.load_state_dict(scaler_state)
 
     best_loss = float("inf")
 
     for epoch in range(start_epoch, num_epochs + 1):
+        lr_current = optimizer.param_groups[0]["lr"]
         losses = train_epoch(
             model, train_loader, optimizer, device, epoch,
             mode=mode, scaler=scaler, adapt_loader=adapt_loader,
@@ -207,7 +212,7 @@ def train(
         scheduler.step()
 
         loss_str = " | ".join(f"{k}={v:.4f}" for k, v in losses.items())
-        print(f"Epoch {epoch}/{num_epochs} - {loss_str}")
+        print(f"Epoch {epoch}/{num_epochs} (lr={lr_current:.2e}) - {loss_str}")
 
         current_loss = losses.get("total", float("inf"))
         if current_loss < best_loss:
@@ -390,9 +395,17 @@ if __name__ == "__main__":
             print(f"  Warning: skipped layers (shape mismatch): {skipped}")
         model.load_state_dict(filtered, strict=False)
         start_epoch = ckpt.get("epoch", 0) + 1
-        optimizer_state = None
-        scheduler_state = None
-        scaler_state = None
+
+        # Restore optimizer/scheduler only if model architecture matches exactly
+        if not skipped:
+            optimizer_state = ckpt.get("optimizer_state_dict")
+            scheduler_state = ckpt.get("scheduler_state_dict")
+            scaler_state = ckpt.get("scaler_state_dict")
+        else:
+            optimizer_state = None
+            scheduler_state = None
+            scaler_state = None
+
         prev_loss = ckpt.get("loss", "N/A")
         print(
             f"Resuming from {args.checkpoint} (epoch {start_epoch - 1}, loss {prev_loss})"
