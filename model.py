@@ -365,6 +365,7 @@ class HWMv5(nn.Module):
         lambda_sigreg=0.1,
         lambda_ctc=0.5,
         ctc_hidden=256,
+        ctc_num_lstm=1,
     ):
         super().__init__()
         self.img_height = img_height
@@ -375,7 +376,8 @@ class HWMv5(nn.Module):
             embedding_dim, num_layers, num_heads, ff_dim, dropout
         )
         self.ctc_head = (
-            CTCHeadBiLSTM(embedding_dim, num_classes, hidden_dim=ctc_hidden)
+            CTCHeadBiLSTM(embedding_dim, num_classes, hidden_dim=ctc_hidden,
+                          num_lstm_layers=ctc_num_lstm)
             if num_classes else None
         )
         self.criterion = HybridLoss(lambda_sigreg, lambda_ctc)

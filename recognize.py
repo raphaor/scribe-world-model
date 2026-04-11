@@ -152,6 +152,7 @@ if __name__ == "__main__":
             ff_dim=config.FF_DIM_V5,
             num_classes=num_classes,
             ctc_hidden=config.CTC_HIDDEN_V5,
+            ctc_num_lstm=config.CTC_NUM_LSTM_V5,
         ).to(device)
     elif ver == "v4":
         model = HWMv4(

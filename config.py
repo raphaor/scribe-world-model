@@ -40,12 +40,12 @@ EMBEDDING_DIM_V2 = 96
 FF_DIM_V2 = 192
 
 ALTO_DIRS = [
-    # "D:/OCR_genealogie/Alto/bars_dordogne_alto",
-    # "D:/OCR_genealogie/Alto/saint_chamassy_dordogne_alto_set_1",
-    # "D:/OCR_genealogie/Alto/saint_chamassy_dordogne_alto_set_train",
-    "D:/OCR_genealogie/Alto/lectaurep_bronod_notaire_paris_18e",
-    "D:/OCR_genealogie/Alto/lectaurep_mariages_divorces_paris_19e",
-    "D:/OCR_genealogie/Alto/lectaurep_repertoires_notaires_paris_1830-1939",
+    "D:/OCR_genealogie/Alto/bars_dordogne_alto",
+    "D:/OCR_genealogie/Alto/saint_chamassy_dordogne_alto_set_1",
+    ## "D:/OCR_genealogie/Alto/saint_chamassy_dordogne_alto_set_train",
+    # "D:/OCR_genealogie/Alto/lectaurep_bronod_notaire_paris_18e",
+    # "D:/OCR_genealogie/Alto/lectaurep_mariages_divorces_paris_19e",
+    # "D:/OCR_genealogie/Alto/lectaurep_repertoires_notaires_paris_1830-1939",
     # "D:/OCR_genealogie/Alto/timeuscorpus_prudhommes_paris_1858-1878",
 ]
 
@@ -76,12 +76,13 @@ CTC_HIDDEN_V4 = 256
 # --- HWM-v5 ---
 
 IMG_HEIGHT_V5 = 120
-EMBEDDING_DIM_V5 = 256
+EMBEDDING_DIM_V5 = 512
 NUM_LAYERS_V5 = 4
 NUM_HEADS_V5 = 8
-FF_DIM_V5 = 512
-LAMBDA_CTC_V5 = 0.5
-CTC_HIDDEN_V5 = 256
+FF_DIM_V5 = 1024
+LAMBDA_CTC_V5 = 1.0
+CTC_HIDDEN_V5 = 512
+CTC_NUM_LSTM_V5 = 2
 
 
 def count_parameters(model):

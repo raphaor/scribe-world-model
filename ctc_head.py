@@ -30,11 +30,12 @@ class CTCHeadBiLSTM(nn.Module):
     Output: (B, T, num_classes) log-probabilities
     """
 
-    def __init__(self, embedding_dim, num_classes, hidden_dim=256):
+    def __init__(self, embedding_dim, num_classes, hidden_dim=256, num_lstm_layers=1):
         super().__init__()
         self.lstm = nn.LSTM(
-            embedding_dim, hidden_dim, num_layers=1,
+            embedding_dim, hidden_dim, num_layers=num_lstm_layers,
             batch_first=True, bidirectional=True,
+            dropout=0.1 if num_lstm_layers > 1 else 0.0,
         )
         self.proj = nn.Linear(hidden_dim * 2, num_classes)
 

@@ -426,6 +426,7 @@ if __name__ == "__main__":
             num_classes=model_num_classes,
             lambda_ctc=config.LAMBDA_CTC_V5,
             ctc_hidden=config.CTC_HIDDEN_V5,
+            ctc_num_lstm=config.CTC_NUM_LSTM_V5,
         ).to(device)
         save_path = "hwm_v5.pt"
     elif ver == "v4":
