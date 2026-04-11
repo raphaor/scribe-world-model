@@ -22,12 +22,14 @@ from torch.utils.data import DataLoader, random_split
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config
-from model import HWMv2, HWMv3
+from model import HWMv2, HWMv3, HWMv4, HWMv5
 from data_alto import (
     AltoLineDataset,
     UnannotatedLineDataset,
     collate_alto_fn,
     collate_unannotated_fn,
+    collate_alto_v5_fn,
+    collate_unannotated_v5_fn,
 )
 
 
@@ -46,7 +48,7 @@ def _progress_bar(epoch, batch_idx, total_batches, losses, elapsed, bar_width=30
 
 def _step_full(model, batch, optimizer, device, use_amp):
     """One supervised training step (prediction + SIGReg + CTC)."""
-    img_seqs, targets, input_lengths, target_lengths = batch
+    img_seqs, targets, input_lengths, target_lengths, _raw = batch
     img_seqs = img_seqs.to(device, non_blocking=True)
     targets = targets.to(device, non_blocking=True)
     input_lengths = input_lengths.to(device, non_blocking=True)
@@ -178,6 +180,7 @@ def train(
     mode="full",
     save_path="hwm_v2.pt",
     idx_to_char=None,
+    char_to_idx=None,
     start_epoch=1,
     optimizer_state=None,
     scheduler_state=None,
@@ -231,21 +234,33 @@ def train(
                     "loss": current_loss,
                     "config": {
                         "img_height": model.img_height,
-                        "window_size": model.window_size,
+                        "window_size": getattr(model, "window_size", None),
                         "embedding_dim": model.embedding_dim,
                         "num_classes": model.ctc_head.proj.out_features
                         if model.ctc_head
                         else None,
                     },
+                    "char_to_idx": char_to_idx,
                 },
                 save_path,
             )
 
-        if val_loader and model.ctc_head and idx_to_char:
+        if model.ctc_head and idx_to_char:
             from recognize import evaluate_cer
 
-            cer = evaluate_cer(model, val_loader, device, idx_to_char, max_samples=10)
-            print(f"  Val CER (10 samples): {cer:.1%}")
+            cer_samples = min(100, len(train_loader.dataset) // 10)
+            train_cer = evaluate_cer(
+                model, train_loader, device, idx_to_char,
+                max_samples=cer_samples, verbose=False,
+            )
+            if val_loader:
+                val_cer = evaluate_cer(
+                    model, val_loader, device, idx_to_char,
+                    max_samples=cer_samples, verbose=True,
+                )
+                print(f"  Train CER: {train_cer:.1%} | Val CER: {val_cer:.1%} ({cer_samples} samples)")
+            else:
+                print(f"  Train CER: {train_cer:.1%} ({cer_samples} samples)")
 
         gc.collect()
         if device.type == "cuda":
@@ -257,7 +272,7 @@ def train(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train HWM")
     parser.add_argument("--mode", choices=["mixed", "full", "adapt"], default="mixed")
-    parser.add_argument("--model-version", choices=["v2", "v3"], default="v3")
+    parser.add_argument("--model-version", choices=["v2", "v3", "v4", "v5"], default="v5")
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -290,16 +305,28 @@ if __name__ == "__main__":
     scaler_state = None
 
     if args.data == "alto":
-        v3 = args.model_version == "v3"
-        img_h = config.IMG_HEIGHT_V3 if v3 else config.IMG_HEIGHT_V2
+        ver = args.model_version
+        if ver == "v5":
+            img_h = config.IMG_HEIGHT_V5
+            ws = None
+            stride = None
+        elif ver == "v4":
+            img_h = config.IMG_HEIGHT_V4
+            ws = config.WINDOW_SIZE_V4
+            stride = config.STRIDE_V4
+        elif ver == "v3":
+            img_h = config.IMG_HEIGHT_V3
+            ws = config.WINDOW_SIZE_V3
+            stride = config.STRIDE_V3
+        else:
+            img_h = config.IMG_HEIGHT_V2
+            ws = config.WINDOW_SIZE
+            stride = config.STRIDE
 
         dataset = AltoLineDataset(args.alto_dirs, img_height=img_h, augment=True)
         char_to_idx, idx_to_char = dataset.get_alphabet()
         print(f"Alphabet: {len(char_to_idx)} characters")
         num_classes = len(char_to_idx) + 1
-
-        ws = config.WINDOW_SIZE_V3 if v3 else config.WINDOW_SIZE
-        stride = config.STRIDE_V3 if v3 else config.STRIDE
 
         train_size = int(0.8 * len(dataset))
         val_size = len(dataset) - train_size
@@ -309,9 +336,12 @@ if __name__ == "__main__":
             generator=torch.Generator().manual_seed(42),
         )
 
-        collate = partial(
-            collate_alto_fn, window_size=ws, stride=stride, char_to_idx=char_to_idx
-        )
+        if ver == "v5":
+            collate = partial(collate_alto_v5_fn, char_to_idx=char_to_idx)
+        else:
+            collate = partial(
+                collate_alto_fn, window_size=ws, stride=stride, char_to_idx=char_to_idx
+            )
         pin_mem = device.type == "cuda"
         train_loader = DataLoader(
             train_ds,
@@ -344,9 +374,12 @@ if __name__ == "__main__":
             adapt_ds = UnannotatedLineDataset(
                 unannotated_dirs, img_height=img_h, augment=True
             )
-            adapt_collate = partial(
-                collate_unannotated_fn, window_size=ws, stride=stride
-            )
+            if ver == "v5":
+                adapt_collate = collate_unannotated_v5_fn
+            else:
+                adapt_collate = partial(
+                    collate_unannotated_fn, window_size=ws, stride=stride
+                )
             adapt_loader = DataLoader(
                 adapt_ds,
                 batch_size=args.batch_size,
@@ -360,10 +393,56 @@ if __name__ == "__main__":
     else:
         raise ValueError("Only 'alto' data mode is supported")
 
-    # CTC head is needed in full and mixed modes
+    # CTC head is needed in full and mixed modes, or if checkpoint had one
     need_ctc = args.mode in ("full", "mixed")
+    ckpt = None
+    ckpt_ctc_classes = None
 
-    if v3:
+    if args.checkpoint and os.path.exists(args.checkpoint):
+        ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+        ckpt_ctc_classes = ckpt.get("config", {}).get("num_classes")
+        # Restore char_to_idx from checkpoint if available
+        ckpt_char_to_idx = ckpt.get("char_to_idx")
+        if ckpt_char_to_idx:
+            char_to_idx = ckpt_char_to_idx
+            idx_to_char = {v: k for k, v in char_to_idx.items()}
+
+    # Preserve CTC head from checkpoint even in adapt mode
+    if need_ctc:
+        model_num_classes = num_classes
+    elif ckpt_ctc_classes:
+        model_num_classes = ckpt_ctc_classes
+    else:
+        model_num_classes = None
+
+    if ver == "v5":
+        model = HWMv5(
+            img_height=config.IMG_HEIGHT_V5,
+            embedding_dim=config.EMBEDDING_DIM_V5,
+            num_layers=config.NUM_LAYERS_V5,
+            num_heads=config.NUM_HEADS_V5,
+            ff_dim=config.FF_DIM_V5,
+            dropout=config.DROPOUT,
+            num_classes=model_num_classes,
+            lambda_ctc=config.LAMBDA_CTC_V5,
+            ctc_hidden=config.CTC_HIDDEN_V5,
+        ).to(device)
+        save_path = "hwm_v5.pt"
+    elif ver == "v4":
+        model = HWMv4(
+            img_height=config.IMG_HEIGHT_V4,
+            window_size=config.WINDOW_SIZE_V4,
+            embedding_dim=config.EMBEDDING_DIM_V4,
+            num_layers=config.NUM_LAYERS_V4,
+            num_heads=config.NUM_HEADS_V4,
+            ff_dim=config.FF_DIM_V4,
+            dropout=config.DROPOUT,
+            num_classes=model_num_classes,
+            lambda_ctc=config.LAMBDA_CTC_V4,
+            ctc_hidden=config.CTC_HIDDEN_V4,
+        ).to(device)
+        save_path = "hwm_v4.pt"
+    elif ver == "v3":
         model = HWMv3(
             img_height=config.IMG_HEIGHT_V3,
             window_size=config.WINDOW_SIZE_V3,
@@ -372,7 +451,7 @@ if __name__ == "__main__":
             num_heads=config.NUM_HEADS_V3,
             ff_dim=config.FF_DIM_V3,
             dropout=config.DROPOUT,
-            num_classes=num_classes if need_ctc else None,
+            num_classes=model_num_classes,
             lambda_ctc=config.LAMBDA_CTC_V3,
         ).to(device)
         save_path = "hwm_v3.pt"
@@ -385,14 +464,13 @@ if __name__ == "__main__":
             num_heads=config.NUM_HEADS,
             ff_dim=config.FF_DIM_V2,
             dropout=config.DROPOUT,
-            num_classes=num_classes if need_ctc else None,
+            num_classes=model_num_classes,
         ).to(device)
         save_path = "hwm_v2.pt"
 
     print(f"Model params: {model.count_parameters():,}")
 
-    if args.checkpoint and os.path.exists(args.checkpoint):
-        ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    if ckpt is not None:
         state_dict = ckpt["model_state_dict"]
         model_state = model.state_dict()
         filtered = {
@@ -435,6 +513,7 @@ if __name__ == "__main__":
         device=device,
         save_path=save_path,
         idx_to_char=idx_to_char,
+        char_to_idx=char_to_idx,
         start_epoch=start_epoch,
         optimizer_state=optimizer_state,
         scheduler_state=scheduler_state,

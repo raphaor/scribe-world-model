@@ -132,6 +132,7 @@ class Conv2DEncoderV2(nn.Module):
             nn.AdaptiveAvgPool2d((4, 1)),
         )
         self.fc = nn.Linear(256 * 4, embedding_dim)
+        self.norm = nn.LayerNorm(embedding_dim)
 
     def forward(self, x):
         if x.dim() == 2:
@@ -139,7 +140,104 @@ class Conv2DEncoderV2(nn.Module):
         x = x.unsqueeze(1)
         x = self.conv(x)
         x = x.view(x.size(0), -1)
-        return self.fc(x)
+        return self.norm(self.fc(x))
+
+
+class Conv2DEncoderV3(nn.Module):
+    """
+    Wider encoder with preserved horizontal resolution.
+    Input: (B, H, W) where H=48, W=window_size
+    Output: (B, embedding_dim)
+    """
+
+    def __init__(self, img_height=48, window_size=32, embedding_dim=256):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            nn.Conv2d(256, 512, kernel_size=3, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((4, 2)),
+        )
+        self.fc = nn.Linear(512 * 4 * 2, embedding_dim)
+        self.norm = nn.LayerNorm(embedding_dim)
+
+    def forward(self, x):
+        if x.dim() == 2:
+            raise ValueError("Conv2DEncoderV3 requires (B, H, W) input")
+        x = x.unsqueeze(1)
+        x = self.conv(x)
+        x = x.view(x.size(0), -1)
+        return self.norm(self.fc(x))
+
+
+class KrakenEncoder(nn.Module):
+    """
+    Kraken-style convolutional encoder for full line images.
+    Rectangular kernels (3x13, 3x9) capture horizontal structure.
+
+    Input: (B, H, W) where H=120, W=variable (full line)
+    Output: (B, T, D) where T=W/8, D=embedding_dim
+    """
+
+    def __init__(self, img_height=120, embedding_dim=256):
+        super().__init__()
+        self.img_height = img_height
+
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=(3, 13), padding=(1, 6)),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.MaxPool2d(2, 2),
+
+            nn.Conv2d(32, 32, kernel_size=(3, 13), padding=(1, 6)),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.MaxPool2d(2, 2),
+
+            nn.Conv2d(32, 64, kernel_size=(3, 9), padding=(1, 4)),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.MaxPool2d(2, 2),
+
+            nn.Conv2d(64, 64, kernel_size=(3, 9), padding=(1, 4)),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+        )
+
+        # H after 3 MaxPool(2,2): img_height / 8
+        h_out = img_height // 8
+        self.feature_dim = 64 * h_out
+        self.proj = nn.Linear(self.feature_dim, embedding_dim)
+        self.norm = nn.LayerNorm(embedding_dim)
+
+    def forward(self, x):
+        """
+        Args:
+            x: (B, H, W) grayscale line image
+        Returns:
+            z_seq: (B, T, D) embedding sequence, T = W/8
+        """
+        x = x.unsqueeze(1)                    # (B, 1, H, W)
+        x = self.conv(x)                      # (B, 64, H/8, W/8)
+        B, C, H, T = x.shape
+        x = x.permute(0, 3, 1, 2)            # (B, T, C, H)
+        x = x.reshape(B, T, C * H)           # (B, T, 960)
+        return self.norm(self.proj(x))         # (B, T, D)
 
 
 def test_encoder():

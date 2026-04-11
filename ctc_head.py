@@ -19,3 +19,25 @@ class CTCHead(nn.Module):
 
     def forward(self, z_seq):
         return self.proj(z_seq).log_softmax(dim=-1)
+
+
+class CTCHeadBiLSTM(nn.Module):
+    """
+    CTC head with BiLSTM context layer.
+    Each frame sees its neighbors before making a character decision.
+
+    Input: (B, T, D) embedding sequence
+    Output: (B, T, num_classes) log-probabilities
+    """
+
+    def __init__(self, embedding_dim, num_classes, hidden_dim=256):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            embedding_dim, hidden_dim, num_layers=1,
+            batch_first=True, bidirectional=True,
+        )
+        self.proj = nn.Linear(hidden_dim * 2, num_classes)
+
+    def forward(self, z_seq):
+        ctx, _ = self.lstm(z_seq)  # (B, T, hidden*2)
+        return self.proj(ctx).log_softmax(dim=-1)

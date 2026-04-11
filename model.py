@@ -6,10 +6,10 @@ Complete architecture combining encoder and predictor
 import torch
 import torch.nn as nn
 
-from encoder import CNNEncoder, Conv2DEncoder, Conv2DEncoderV2
+from encoder import CNNEncoder, Conv2DEncoder, Conv2DEncoderV2, Conv2DEncoderV3, KrakenEncoder
 from predictor import TransformerPredictor
 from loss import HWMLoss, HybridLoss
-from ctc_head import CTCHead
+from ctc_head import CTCHead, CTCHeadBiLSTM
 import config
 
 
@@ -277,6 +277,139 @@ def create_model():
         dropout=config.DROPOUT,
     )
     return model
+
+
+class HWMv4(nn.Module):
+    """
+    Handwriting World Model v4
+    Wider encoder (preserved horizontal resolution), larger transformer,
+    BiLSTM CTC head for inter-frame context.
+    """
+
+    def __init__(
+        self,
+        img_height=48,
+        window_size=32,
+        embedding_dim=256,
+        num_layers=4,
+        num_heads=8,
+        ff_dim=512,
+        dropout=0.1,
+        num_classes=None,
+        lambda_sigreg=0.1,
+        lambda_ctc=2.0,
+        ctc_hidden=256,
+    ):
+        super().__init__()
+        self.img_height = img_height
+        self.window_size = window_size
+        self.embedding_dim = embedding_dim
+
+        self.encoder = Conv2DEncoderV3(img_height, window_size, embedding_dim)
+        self.predictor = TransformerPredictor(
+            embedding_dim, num_layers, num_heads, ff_dim, dropout
+        )
+        self.ctc_head = (
+            CTCHeadBiLSTM(embedding_dim, num_classes, hidden_dim=ctc_hidden)
+            if num_classes else None
+        )
+        self.criterion = HybridLoss(lambda_sigreg, lambda_ctc)
+
+    def encode_sequence(self, img_columns):
+        B, T = img_columns.shape[:2]
+        z_seq = self.encoder(
+            img_columns.reshape(B * T, img_columns.shape[2], img_columns.shape[3])
+        ).view(B, T, -1)
+        return z_seq
+
+    def forward(self, img_columns):
+        z_seq = self.encode_sequence(img_columns)       # (B, T, D)
+        z_pred = self.predictor(z_seq[:, :-1, :])       # (B, T-1, D)
+        ctc_logits = self.ctc_head(z_seq) if self.ctc_head else None
+        return z_pred, z_seq, ctc_logits
+
+    def compute_loss(
+        self, img_columns, targets=None, input_lengths=None, target_lengths=None
+    ):
+        z_pred, z_seq, ctc_logits = self.forward(img_columns)
+        z_target = z_seq[:, 1:, :].detach()             # (B, T-1, D)
+        return self.criterion(
+            z_pred, z_target, z_seq, ctc_logits, targets, input_lengths, target_lengths
+        )
+
+    def adapt(self, img_columns):
+        z_pred, z_seq, _ = self.forward(img_columns)
+        z_target = z_seq[:, 1:, :].detach()             # (B, T-1, D)
+        return self.criterion(z_pred, z_target, z_seq)
+
+    def count_parameters(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+class HWMv5(nn.Module):
+    """
+    Handwriting World Model v5
+    Kraken-style conv encoder on full line images + world model.
+    No frame extraction — conv layers produce the embedding sequence directly.
+    """
+
+    def __init__(
+        self,
+        img_height=120,
+        embedding_dim=256,
+        num_layers=4,
+        num_heads=8,
+        ff_dim=512,
+        dropout=0.1,
+        num_classes=None,
+        lambda_sigreg=0.1,
+        lambda_ctc=0.5,
+        ctc_hidden=256,
+    ):
+        super().__init__()
+        self.img_height = img_height
+        self.embedding_dim = embedding_dim
+
+        self.encoder = KrakenEncoder(img_height, embedding_dim)
+        self.predictor = TransformerPredictor(
+            embedding_dim, num_layers, num_heads, ff_dim, dropout
+        )
+        self.ctc_head = (
+            CTCHeadBiLSTM(embedding_dim, num_classes, hidden_dim=ctc_hidden)
+            if num_classes else None
+        )
+        self.criterion = HybridLoss(lambda_sigreg, lambda_ctc)
+
+    def forward(self, img):
+        """
+        Args:
+            img: (B, H, W) full line image
+        Returns:
+            z_pred: (B, T-1, D)
+            z_seq: (B, T, D)
+            ctc_logits: (B, T, C) or None
+        """
+        z_seq = self.encoder(img)                        # (B, T, D)
+        z_pred = self.predictor(z_seq[:, :-1, :])        # (B, T-1, D)
+        ctc_logits = self.ctc_head(z_seq) if self.ctc_head else None
+        return z_pred, z_seq, ctc_logits
+
+    def compute_loss(
+        self, img, targets=None, input_lengths=None, target_lengths=None
+    ):
+        z_pred, z_seq, ctc_logits = self.forward(img)
+        z_target = z_seq[:, 1:, :].detach()
+        return self.criterion(
+            z_pred, z_target, z_seq, ctc_logits, targets, input_lengths, target_lengths
+        )
+
+    def adapt(self, img):
+        z_pred, z_seq, _ = self.forward(img)
+        z_target = z_seq[:, 1:, :].detach()
+        return self.criterion(z_pred, z_target, z_seq)
+
+    def count_parameters(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
 def test_model():

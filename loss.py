@@ -51,8 +51,9 @@ class SIGRegLoss(nn.Module):
         cov = (z_std.T @ z_std) / N
 
         # Off-diagonal penalty (want identity matrix)
+        # Use mean over all D*D entries so the loss scale is independent of D
         eye = self._get_eye(cov.size(0), z.device)
-        off_diag_loss = ((cov - eye) ** 2).sum() / cov.size(0)
+        off_diag_loss = ((cov - eye) ** 2).mean()
 
         # Variance penalty (want unit variance)
         var_loss = ((z_std.var(dim=0) - 1) ** 2).mean()

@@ -262,6 +262,7 @@ def collate_alto_fn(batch, window_size=10, stride=5, char_to_idx=None, max_seq_l
     all_targets = []
     input_lengths = []
     target_lengths = []
+    raw_texts = []
 
     for img, text in batch:
         cols = extract_columns(img, window_size=window_size, stride=stride)
@@ -274,6 +275,7 @@ def collate_alto_fn(batch, window_size=10, stride=5, char_to_idx=None, max_seq_l
         encoded = [char_to_idx[c] for c in text if c in char_to_idx]
         all_targets.extend(encoded)
         target_lengths.append(len(encoded))
+        raw_texts.append(text)
 
     max_len = max(seq.shape[0] for seq in img_seqs)
     B = len(img_seqs)
@@ -287,7 +289,57 @@ def collate_alto_fn(batch, window_size=10, stride=5, char_to_idx=None, max_seq_l
     input_lengths = torch.tensor(input_lengths, dtype=torch.long)
     target_lengths = torch.tensor(target_lengths, dtype=torch.long)
 
-    return padded, targets, input_lengths, target_lengths
+    return padded, targets, input_lengths, target_lengths, raw_texts
+
+
+def collate_alto_v5_fn(batch, char_to_idx=None):
+    """Collate for v5: full line images padded in width, no frame extraction."""
+    imgs = []
+    all_targets = []
+    input_lengths = []
+    target_lengths = []
+    raw_texts = []
+
+    for img, text in batch:
+        imgs.append(img)
+        # Conv reduces width by factor 8 (3 MaxPool(2,2))
+        input_lengths.append(img.shape[1] // 8)
+
+        encoded = [char_to_idx[c] for c in text if c in char_to_idx]
+        all_targets.extend(encoded)
+        target_lengths.append(len(encoded))
+        raw_texts.append(text)
+
+    B = len(imgs)
+    H = imgs[0].shape[0]
+    W_max = max(img.shape[1] for img in imgs)
+
+    padded = torch.zeros(B, H, W_max)
+    for i, img in enumerate(imgs):
+        padded[i, :, :img.shape[1]] = img
+
+    targets = torch.tensor(all_targets, dtype=torch.long)
+    input_lengths = torch.tensor(input_lengths, dtype=torch.long)
+    target_lengths = torch.tensor(target_lengths, dtype=torch.long)
+
+    return padded, targets, input_lengths, target_lengths, raw_texts
+
+
+def collate_unannotated_v5_fn(batch):
+    """Collate for v5 unannotated: full line images padded in width."""
+    imgs = []
+    for (img,) in batch:
+        imgs.append(img)
+
+    B = len(imgs)
+    H = imgs[0].shape[0]
+    W_max = max(img.shape[1] for img in imgs)
+
+    padded = torch.zeros(B, H, W_max)
+    for i, img in enumerate(imgs):
+        padded[i, :, :img.shape[1]] = img
+
+    return (padded,)
 
 
 def build_alphabet(alto_dirs):

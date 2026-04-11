@@ -65,7 +65,7 @@ def compute_cer(predictions, ground_truths):
     return total_dist / max(total_len, 1)
 
 
-def evaluate_cer(model, loader, device, idx_to_char, max_samples=None):
+def evaluate_cer(model, loader, device, idx_to_char, max_samples=None, verbose=True):
     """Run full CTC evaluation on a DataLoader."""
     model.eval()
     all_preds = []
@@ -74,7 +74,7 @@ def evaluate_cer(model, loader, device, idx_to_char, max_samples=None):
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(loader):
-            img_seqs, targets, input_lengths, target_lengths = batch
+            img_seqs, targets, input_lengths, target_lengths, raw_texts = batch
             img_seqs = img_seqs.to(device, non_blocking=True)
             input_lengths_cpu = input_lengths.clone()
 
@@ -85,24 +85,19 @@ def evaluate_cer(model, loader, device, idx_to_char, max_samples=None):
                 ctc_logits.cpu(), input_lengths_cpu, idx_to_char
             )
             all_preds.extend(decoded)
-
-            offset = 0
-            for tlen in target_lengths:
-                gt_indices = targets[offset : offset + tlen].tolist()
-                gt_text = "".join(idx_to_char.get(i, "?") for i in gt_indices)
-                all_gts.append(gt_text)
-                offset += tlen
+            all_gts.extend(raw_texts)
 
             if max_samples and len(all_preds) >= max_samples:
                 break
 
     cer = compute_cer(all_preds, all_gts)
 
-    print("\nExamples (first 10):")
-    for pred, gt in zip(all_preds[:10], all_gts[:10]):
-        mark = "OK" if pred == gt else "ERR"
-        print(f"  [{mark}] GT:   {_safe_print(gt)}")
-        print(f"        PRED: {_safe_print(pred)}")
+    if verbose:
+        print("\nExamples (first 10):")
+        for pred, gt in zip(all_preds[:10], all_gts[:10]):
+            mark = "OK" if pred == gt else "ERR"
+            print(f"  [{mark}] GT:   {_safe_print(gt)}")
+            print(f"        PRED: {_safe_print(pred)}")
 
     torch.cuda.empty_cache()
     return cer
@@ -116,15 +111,18 @@ if __name__ == "__main__":
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
     import config
-    from model import HWMv2
-    from data_alto import AltoLineDataset, build_alphabet, collate_alto_fn
+    from model import HWMv2, HWMv3, HWMv4, HWMv5
+    from data_alto import AltoLineDataset, build_alphabet, collate_alto_fn, collate_alto_v5_fn
     from functools import partial
-    from torch.utils.data import DataLoader
+    from torch.utils.data import DataLoader, random_split
 
-    parser = argparse.ArgumentParser(description="Evaluate HWM-v2 CER")
-    parser.add_argument("--model", default="hwm_v2.pt", help="Model checkpoint")
+    parser = argparse.ArgumentParser(description="Evaluate HWM CER")
+    parser.add_argument("--model", default="hwm_v4.pt", help="Model checkpoint")
+    parser.add_argument("--model-version", choices=["v2", "v3", "v4", "v5"], default="v5")
     parser.add_argument("--alto-dirs", nargs="+", default=config.ALTO_DIRS)
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--split", choices=["all", "val", "train"], default="val",
+                        help="Which split to evaluate (default: val)")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -132,27 +130,99 @@ if __name__ == "__main__":
     ckpt = torch.load(args.model, map_location=device, weights_only=False)
     saved_config = ckpt.get("config", {})
 
-    char_to_idx, idx_to_char = build_alphabet(args.alto_dirs)
-    num_classes = len(char_to_idx) + 1
+    # Use alphabet from checkpoint if available, else build from data
+    ckpt_char_to_idx = ckpt.get("char_to_idx")
+    if ckpt_char_to_idx:
+        char_to_idx = ckpt_char_to_idx
+        idx_to_char = {v: k for k, v in char_to_idx.items()}
+        print(f"Alphabet from checkpoint: {len(char_to_idx)} characters")
+    else:
+        char_to_idx, idx_to_char = build_alphabet(args.alto_dirs)
+        print(f"Alphabet from data: {len(char_to_idx)} characters")
+    ckpt_num_classes = saved_config.get("num_classes")
+    num_classes = ckpt_num_classes if ckpt_num_classes else len(char_to_idx) + 1
 
-    model = HWMv2(
-        img_height=saved_config.get("img_height", config.IMG_HEIGHT_V2),
-        window_size=saved_config.get("window_size", config.WINDOW_SIZE),
-        embedding_dim=saved_config.get("embedding_dim", config.EMBEDDING_DIM_V2),
-        num_layers=config.NUM_LAYERS,
-        num_heads=config.NUM_HEADS,
-        ff_dim=saved_config.get("ff_dim", config.FF_DIM_V2),
-        num_classes=num_classes,
-    ).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    ver = args.model_version
+    if ver == "v5":
+        model = HWMv5(
+            img_height=saved_config.get("img_height", config.IMG_HEIGHT_V5),
+            embedding_dim=saved_config.get("embedding_dim", config.EMBEDDING_DIM_V5),
+            num_layers=config.NUM_LAYERS_V5,
+            num_heads=config.NUM_HEADS_V5,
+            ff_dim=config.FF_DIM_V5,
+            num_classes=num_classes,
+            ctc_hidden=config.CTC_HIDDEN_V5,
+        ).to(device)
+    elif ver == "v4":
+        model = HWMv4(
+            img_height=saved_config.get("img_height", config.IMG_HEIGHT_V4),
+            window_size=saved_config.get("window_size", config.WINDOW_SIZE_V4),
+            embedding_dim=saved_config.get("embedding_dim", config.EMBEDDING_DIM_V4),
+            num_layers=config.NUM_LAYERS_V4,
+            num_heads=config.NUM_HEADS_V4,
+            ff_dim=config.FF_DIM_V4,
+            num_classes=num_classes,
+            ctc_hidden=config.CTC_HIDDEN_V4,
+        ).to(device)
+        ws = config.WINDOW_SIZE_V4
+        stride = config.STRIDE_V4
+    elif ver == "v3":
+        model = HWMv3(
+            img_height=saved_config.get("img_height", config.IMG_HEIGHT_V3),
+            window_size=saved_config.get("window_size", config.WINDOW_SIZE_V3),
+            embedding_dim=saved_config.get("embedding_dim", config.EMBEDDING_DIM_V3),
+            num_layers=config.NUM_LAYERS_V3,
+            num_heads=config.NUM_HEADS_V3,
+            ff_dim=config.FF_DIM_V3,
+            num_classes=num_classes,
+        ).to(device)
+        ws = config.WINDOW_SIZE_V3
+        stride = config.STRIDE_V3
+    else:
+        model = HWMv2(
+            img_height=saved_config.get("img_height", config.IMG_HEIGHT_V2),
+            window_size=saved_config.get("window_size", config.WINDOW_SIZE),
+            embedding_dim=saved_config.get("embedding_dim", config.EMBEDDING_DIM_V2),
+            num_layers=config.NUM_LAYERS,
+            num_heads=config.NUM_HEADS,
+            ff_dim=saved_config.get("ff_dim", config.FF_DIM_V2),
+            num_classes=num_classes,
+        ).to(device)
+        ws = config.WINDOW_SIZE
+        stride = config.STRIDE
+
+    result = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    if result.missing_keys:
+        print(f"  Warning: missing keys: {result.missing_keys}")
+    if result.unexpected_keys:
+        print(f"  Warning: unexpected keys: {result.unexpected_keys}")
     model.eval()
+    print(f"Model {ver}: {model.count_parameters():,} params")
 
-    dataset = AltoLineDataset(
-        args.alto_dirs, img_height=saved_config.get("img_height", config.IMG_HEIGHT_V2)
-    )
-    collate = partial(collate_alto_fn, char_to_idx=char_to_idx)
+    img_h = saved_config.get("img_height", config.IMG_HEIGHT_V5 if ver == "v5" else config.IMG_HEIGHT_V4)
+    dataset = AltoLineDataset(args.alto_dirs, img_height=img_h)
+
+    # Same split as train.py (seed=42, 80/20)
+    if args.split != "all":
+        train_size = int(0.8 * len(dataset))
+        val_size = len(dataset) - train_size
+        train_ds, val_ds = random_split(
+            dataset,
+            [train_size, val_size],
+            generator=torch.Generator().manual_seed(42),
+        )
+        eval_ds = val_ds if args.split == "val" else train_ds
+        print(f"Evaluating on {args.split} split: {len(eval_ds)} lines")
+    else:
+        eval_ds = dataset
+        print(f"Evaluating on all data: {len(eval_ds)} lines")
+
+    if ver == "v5":
+        collate = partial(collate_alto_v5_fn, char_to_idx=char_to_idx)
+    else:
+        collate = partial(collate_alto_fn, window_size=ws, stride=stride, char_to_idx=char_to_idx)
     loader = DataLoader(
-        dataset,
+        eval_ds,
         batch_size=args.batch_size,
         collate_fn=collate,
         pin_memory=device.type == "cuda",
