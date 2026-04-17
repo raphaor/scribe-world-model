@@ -543,6 +543,9 @@ if __name__ == "__main__":
             lambda_ctc=config.LAMBDA_CTC_V5,
             ctc_hidden=config.CTC_HIDDEN_V5,
             ctc_num_lstm=config.CTC_NUM_LSTM_V5,
+            jepa_num_targets=config.JEPA_NUM_TARGETS_V5,
+            jepa_min_size=config.JEPA_MIN_SIZE_V5,
+            jepa_max_size=config.JEPA_MAX_SIZE_V5,
         ).to(device)
         save_path = "hwm_v5.pt"
     elif ver == "v4":

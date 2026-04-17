@@ -10,6 +10,7 @@ from encoder import CNNEncoder, Conv2DEncoder, Conv2DEncoderV2, Conv2DEncoderV3,
 from predictor import TransformerPredictor
 from loss import HWMLoss, HybridLoss
 from ctc_head import CTCHead, CTCHeadBiLSTM
+from jepa import sample_jepa_mask
 import config
 
 
@@ -366,49 +367,94 @@ class HWMv5(nn.Module):
         lambda_ctc=0.5,
         ctc_hidden=256,
         ctc_num_lstm=1,
+        jepa_num_targets=4,
+        jepa_min_size=4,
+        jepa_max_size=10,
     ):
         super().__init__()
         self.img_height = img_height
         self.embedding_dim = embedding_dim
+        self.jepa_num_targets = jepa_num_targets
+        self.jepa_min_size = jepa_min_size
+        self.jepa_max_size = jepa_max_size
 
         self.encoder = KrakenEncoder(img_height, embedding_dim)
+        # Non-causal predictor: bidirectional attention over the latent
+        # sequence, used to reconstruct masked target blocks from context.
         self.predictor = TransformerPredictor(
-            embedding_dim, num_layers, num_heads, ff_dim, dropout
+            embedding_dim, num_layers, num_heads, ff_dim, dropout, causal=False,
         )
         self.ctc_head = (
             CTCHeadBiLSTM(embedding_dim, num_classes, hidden_dim=ctc_hidden,
                           num_lstm_layers=ctc_num_lstm)
             if num_classes else None
         )
+        # Learnable [MASK] token swapped in at target positions.
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, embedding_dim))
+        nn.init.trunc_normal_(self.mask_token, std=0.02)
+
         self.criterion = HybridLoss(lambda_sigreg, lambda_ctc)
 
     def forward(self, img):
         """
-        Args:
-            img: (B, H, W) full line image
+        Inference-time forward: encoder + CTC head only. The predictor is
+        only used during training (JEPA pretext task), so we skip it here
+        to save compute during eval / recognize.
         Returns:
-            z_pred: (B, T-1, D)
-            z_seq: (B, T, D)
-            ctc_logits: (B, T, C) or None
+            (None, z_seq, ctc_logits) — tuple kept for call-site compat.
         """
         z_seq = self.encoder(img)                        # (B, T, D)
-        z_pred = self.predictor(z_seq[:, :-1, :])        # (B, T-1, D)
-        ctc_logits = self.ctc_head(z_seq) if self.ctc_head else None
-        return z_pred, z_seq, ctc_logits
+        ctc_logits = self.ctc_head(z_seq) if self.ctc_head is not None else None
+        return None, z_seq, ctc_logits
+
+    def _jepa_predict(self, z_seq, input_lengths=None):
+        """
+        I-JEPA style: mask several blocks of frames with a learnable
+        [MASK] token, run the non-causal predictor on the resulting
+        context, and return (pred@targets, stopgrad_z@targets). The
+        encoder receives gradients only via the context positions; the
+        target side is detached.
+        """
+        B, T, D = z_seq.shape
+        mask = sample_jepa_mask(
+            B, T,
+            num_targets=self.jepa_num_targets,
+            min_size=self.jepa_min_size,
+            max_size=self.jepa_max_size,
+            valid_lengths=input_lengths,
+            device=z_seq.device,
+        )
+        mask_tok = self.mask_token.expand(B, T, D)
+        z_ctx = torch.where(mask.unsqueeze(-1), mask_tok, z_seq)
+        z_pred_full = self.predictor(z_ctx)               # (B, T, D), non-causal
+
+        if mask.any():
+            z_pred_t = z_pred_full[mask]                  # (N, D)
+            z_tgt_t = z_seq.detach()[mask]                # (N, D)
+        else:
+            # Degenerate case (sequence shorter than min block size):
+            # no targets sampled. Use the first position so the loss is
+            # well-defined; gradient magnitude is tiny.
+            z_pred_t = z_pred_full[:, 0, :]
+            z_tgt_t = z_seq.detach()[:, 0, :]
+
+        return z_pred_t, z_tgt_t
 
     def compute_loss(
         self, img, targets=None, input_lengths=None, target_lengths=None
     ):
-        z_pred, z_seq, ctc_logits = self.forward(img)
-        z_target = z_seq[:, 1:, :].detach()
+        z_seq = self.encoder(img)
+        z_pred_t, z_tgt_t = self._jepa_predict(z_seq, input_lengths)
+        ctc_logits = self.ctc_head(z_seq) if self.ctc_head is not None else None
         return self.criterion(
-            z_pred, z_target, z_seq, ctc_logits, targets, input_lengths, target_lengths
+            z_pred_t, z_tgt_t, z_seq,
+            ctc_logits, targets, input_lengths, target_lengths,
         )
 
     def adapt(self, img):
-        z_pred, z_seq, _ = self.forward(img)
-        z_target = z_seq[:, 1:, :].detach()
-        return self.criterion(z_pred, z_target, z_seq)
+        z_seq = self.encoder(img)
+        z_pred_t, z_tgt_t = self._jepa_predict(z_seq)
+        return self.criterion(z_pred_t, z_tgt_t, z_seq)
 
     def count_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)

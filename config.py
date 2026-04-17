@@ -84,6 +84,15 @@ LAMBDA_CTC_V5 = 1.0
 CTC_HIDDEN_V5 = 512
 CTC_NUM_LSTM_V5 = 1
 
+# I-JEPA block masking for v5.
+# With T = W/8 frames (~100-200 for a typical line), 4 blocks of 4-10
+# frames mask roughly 10-25% of the sequence — enough to force the
+# predictor to reconstruct spans from bidirectional context without
+# starving the context side of signal.
+JEPA_NUM_TARGETS_V5 = 4
+JEPA_MIN_SIZE_V5 = 4
+JEPA_MAX_SIZE_V5 = 10
+
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)

@@ -48,10 +48,12 @@ class TransformerPredictor(nn.Module):
         ff_dim=128,
         dropout=0.1,
         max_seq_len=5000,
+        causal=True,
     ):
         super().__init__()
 
         self.embedding_dim = embedding_dim
+        self.causal = causal
 
         # Positional encoding
         self.pos_encoder = PositionalEncoding(
@@ -82,12 +84,18 @@ class TransformerPredictor(nn.Module):
         Args:
             z_seq: (B, T, D) sequence of embeddings
         Returns:
-            z_pred: (B, T, D) predicted next embedding at each position
+            z_pred: (B, T, D) predicted embedding at each position.
+            In causal mode: predicts the next step given the past.
+            In non-causal (JEPA) mode: bidirectional attention over the
+            whole sequence — used to fill in masked positions.
         """
         z_seq = self.pos_encoder(z_seq)
 
-        causal_mask = self._generate_causal_mask(z_seq.size(1), z_seq.device)
-        encoded = self.transformer(z_seq, mask=causal_mask)
+        if self.causal:
+            causal_mask = self._generate_causal_mask(z_seq.size(1), z_seq.device)
+            encoded = self.transformer(z_seq, mask=causal_mask)
+        else:
+            encoded = self.transformer(z_seq)
 
         z_pred = self.output_proj(encoded)  # (B, T, D)
 
