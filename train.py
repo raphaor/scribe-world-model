@@ -1,10 +1,22 @@
 """
-Multi-task training for HWM-v2/v3.
+Multi-task training for HWM-v2/v3/v4/v5.
 Supports:
   - full: prediction + SIGReg + CTC (with ALTO data)
   - adapt: prediction + SIGReg only (self-supervised)
   - mixed (default): alternates full and adapt batches each step
   - Resume from checkpoint (optimizer, scheduler, epoch state restored)
+
+Curriculum / fine-tuning (pretrain adapt → fine-tune full):
+  - Param groups: encoder/predictor get a lower LR than the CTC head
+    (see --encoder-lr-mult). Standard fine-tuning recipe: the head is fresh
+    and needs a stronger push than the pretrained trunk.
+  - Linear warmup (--warmup-epochs) avoids wrecking pretrained features when
+    CTC gradients first start flowing.
+  - Optional encoder freeze (--freeze-encoder-epochs) lets the head stabilize
+    on top of frozen features before unfreezing the trunk (ULMFiT style).
+  - Phase switch (different --mode than the checkpoint) auto-resets the
+    epoch counter, optimizer and scheduler, so the LR budget of the new
+    phase is not squashed by the previous phase's cosine decay.
 """
 
 import sys
@@ -169,6 +181,49 @@ def _backward(loss, optimizer, model, scaler, use_amp):
         optimizer.step()
 
 
+def _set_encoder_frozen(model, frozen):
+    """Freeze/unfreeze encoder + predictor trunk (CTC head stays trainable)."""
+    for p in model.encoder.parameters():
+        p.requires_grad_(not frozen)
+    for p in model.predictor.parameters():
+        p.requires_grad_(not frozen)
+
+
+def _build_param_groups(model, lr, encoder_lr_mult):
+    """
+    Discriminative LR: the trunk (encoder + predictor) is typically
+    pretrained and moves at a fraction of the base LR. The CTC head is
+    fresh after a phase switch and uses the full LR.
+    """
+    trunk_params = (
+        list(model.encoder.parameters()) + list(model.predictor.parameters())
+    )
+    groups = [{"params": trunk_params, "lr": lr * encoder_lr_mult, "name": "trunk"}]
+    if model.ctc_head is not None:
+        groups.append(
+            {"params": list(model.ctc_head.parameters()), "lr": lr, "name": "head"}
+        )
+    return groups
+
+
+def _build_scheduler(optimizer, remaining_epochs, warmup_epochs):
+    """Linear warmup (if any) followed by cosine decay over remaining epochs."""
+    if warmup_epochs > 0 and remaining_epochs > warmup_epochs:
+        warmup = optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.1, end_factor=1.0,
+            total_iters=warmup_epochs,
+        )
+        cosine = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=remaining_epochs - warmup_epochs, eta_min=1e-6,
+        )
+        return optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs],
+        )
+    return optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(1, remaining_epochs), eta_min=1e-6,
+    )
+
+
 def train(
     model,
     train_loader,
@@ -185,33 +240,66 @@ def train(
     optimizer_state=None,
     scheduler_state=None,
     scaler_state=None,
+    encoder_lr_mult=0.1,
+    warmup_epochs=0,
+    freeze_encoder_epochs=0,
 ):
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    # Always create scheduler with last_epoch=-1 so it initializes
-    # initial_lr in the optimizer. Then restore or adjust state after.
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=num_epochs, eta_min=1e-6,
-    )
 
+    param_groups = _build_param_groups(model, lr, encoder_lr_mult)
+    optimizer = optim.AdamW(param_groups, weight_decay=1e-4)
+
+    # T_max covers only the epochs of this invocation. On a phase switch
+    # the caller resets start_epoch to 1 so the new phase gets a full
+    # LR budget instead of inheriting the previous phase's cosine decay.
+    remaining_epochs = max(1, num_epochs - start_epoch + 1)
+    # Warmup only makes sense when we're not resuming mid-schedule.
+    effective_warmup = warmup_epochs if scheduler_state is None else 0
+    scheduler = _build_scheduler(optimizer, remaining_epochs, effective_warmup)
+
+    # Resuming an old checkpoint (pre param-groups) would mismatch the new
+    # optimizer structure; fall back to a fresh state rather than crashing.
     if optimizer_state is not None:
-        optimizer.load_state_dict(optimizer_state)
+        try:
+            optimizer.load_state_dict(optimizer_state)
+        except (ValueError, KeyError) as e:
+            print(f"  Could not restore optimizer state ({e}); using fresh optimizer.")
+            optimizer_state = None
+            scheduler_state = None
     if scheduler_state is not None:
-        scheduler.load_state_dict(scheduler_state)
-    elif start_epoch > 1:
-        # No saved scheduler (e.g. mode switch full→adapt): advance the
-        # scheduler to the correct position on the cosine curve so the
-        # LR matches where training left off, not the initial value.
-        for _ in range(start_epoch - 1):
-            scheduler.step()
+        try:
+            scheduler.load_state_dict(scheduler_state)
+        except (ValueError, KeyError) as e:
+            print(f"  Could not restore scheduler state ({e}); using fresh scheduler.")
     if scaler_state is not None and use_amp:
-        scaler.load_state_dict(scaler_state)
+        try:
+            scaler.load_state_dict(scaler_state)
+        except (ValueError, KeyError):
+            pass
+
+    group_summary = ", ".join(
+        f"{g.get('name', i)}={g['lr']:.2e}"
+        for i, g in enumerate(optimizer.param_groups)
+    )
+    print(
+        f"Optimizer: AdamW, {len(optimizer.param_groups)} group(s) [{group_summary}], "
+        f"warmup={effective_warmup}ep, cosine over {remaining_epochs}ep"
+    )
+    if freeze_encoder_epochs > 0:
+        print(f"  Encoder+predictor frozen for {freeze_encoder_epochs} epoch(s).")
 
     best_loss = float("inf")
 
     for epoch in range(start_epoch, num_epochs + 1):
-        lr_current = optimizer.param_groups[0]["lr"]
+        if freeze_encoder_epochs > 0:
+            frozen = (epoch - start_epoch) < freeze_encoder_epochs
+            _set_encoder_frozen(model, frozen)
+
+        lr_str = " ".join(
+            f"{g.get('name', i)}={g['lr']:.2e}"
+            for i, g in enumerate(optimizer.param_groups)
+        )
         losses = train_epoch(
             model, train_loader, optimizer, device, epoch,
             mode=mode, scaler=scaler, adapt_loader=adapt_loader,
@@ -219,7 +307,7 @@ def train(
         scheduler.step()
 
         loss_str = " | ".join(f"{k}={v:.4f}" for k, v in losses.items())
-        print(f"Epoch {epoch}/{num_epochs} (lr={lr_current:.2e}) - {loss_str}")
+        print(f"Epoch {epoch}/{num_epochs} (lr {lr_str}) - {loss_str}")
 
         current_loss = losses.get("total", float("inf"))
         if current_loss < best_loss:
@@ -232,6 +320,7 @@ def train(
                     "scaler_state_dict": scaler.state_dict(),
                     "epoch": epoch,
                     "loss": current_loss,
+                    "mode": mode,
                     "config": {
                         "img_height": model.img_height,
                         "window_size": getattr(model, "window_size", None),
@@ -291,6 +380,33 @@ if __name__ == "__main__":
         type=int,
         default=0,
         help="DataLoader num_workers (0=main thread)",
+    )
+    parser.add_argument(
+        "--encoder-lr-mult",
+        type=float,
+        default=0.1,
+        help="LR multiplier for the encoder+predictor trunk vs the CTC head "
+        "(default 0.1). Use 1.0 to disable discriminative LR.",
+    )
+    parser.add_argument(
+        "--warmup-epochs",
+        type=int,
+        default=0,
+        help="Linear LR warmup epochs at the start of this training run. "
+        "Auto-enabled to 2 on phase switch unless explicitly set.",
+    )
+    parser.add_argument(
+        "--freeze-encoder-epochs",
+        type=int,
+        default=0,
+        help="Freeze encoder+predictor for the first N epochs so the CTC "
+        "head can stabilize on top of frozen features (ULMFiT style).",
+    )
+    parser.add_argument(
+        "--phase-restart",
+        action="store_true",
+        help="Force phase-switch behavior: reset epoch counter, optimizer, "
+        "scheduler even when the mode matches the checkpoint.",
     )
     args = parser.parse_args()
 
@@ -503,6 +619,29 @@ if __name__ == "__main__":
             f"Resuming from {args.checkpoint} (epoch {start_epoch - 1}, loss {prev_loss})"
         )
 
+        # Phase switch: if the training mode changed (e.g. adapt → full for
+        # curriculum fine-tuning), the previous optimizer/scheduler state is
+        # no longer meaningful — Adam moments were tuned for different loss
+        # scales and the cosine LR has already decayed. Start fresh.
+        ckpt_mode = ckpt.get("mode")
+        phase_switch = args.phase_restart or (
+            ckpt_mode is not None and ckpt_mode != args.mode
+        )
+        if phase_switch:
+            label = f"{ckpt_mode} -> {args.mode}" if ckpt_mode else "explicit"
+            print(
+                f"Phase switch ({label}): resetting epoch counter, optimizer, scheduler."
+            )
+            start_epoch = 1
+            optimizer_state = None
+            scheduler_state = None
+            scaler_state = None
+            if args.warmup_epochs == 0:
+                args.warmup_epochs = 2
+                print(
+                    "  Auto-enabling 2-epoch linear warmup (override with --warmup-epochs)."
+                )
+
     train(
         model,
         train_loader,
@@ -519,4 +658,7 @@ if __name__ == "__main__":
         optimizer_state=optimizer_state,
         scheduler_state=scheduler_state,
         scaler_state=scaler_state,
+        encoder_lr_mult=args.encoder_lr_mult,
+        warmup_epochs=args.warmup_epochs,
+        freeze_encoder_epochs=args.freeze_encoder_epochs,
     )
