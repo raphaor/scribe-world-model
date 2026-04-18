@@ -85,13 +85,22 @@ CTC_HIDDEN_V5 = 512
 CTC_NUM_LSTM_V5 = 1
 
 # I-JEPA block masking for v5.
-# With T = W/8 frames (~100-200 for a typical line), 4 blocks of 4-10
-# frames mask roughly 10-25% of the sequence — enough to force the
-# predictor to reconstruct spans from bidirectional context without
-# starving the context side of signal.
+# With T = W/8 frames (~100-200 for a typical line), 6 blocks of 12-30
+# frames mask roughly 25-40% of the sequence — large enough that
+# receptive-field overlap cannot leak target content into the context.
 JEPA_NUM_TARGETS_V5 = 6
 JEPA_MIN_SIZE_V5 = 12
 JEPA_MAX_SIZE_V5 = 30
+
+# Apply LayerNorm to predictor output AND stop-grad target before MSE.
+# Standard wav2vec2 / I-JEPA trick: prevents the encoder from trivialising
+# the loss by collapsing local variance (SIGReg only constrains the global
+# distribution, not per-position variance).
+TARGET_NORM_V5 = True
+
+# Weight on the JEPA prediction loss. Set to 0 to disable the world-model
+# branch entirely — useful for the CTC-only baseline ablation.
+LAMBDA_PRED_V5 = 1.0
 
 
 def count_parameters(model):
