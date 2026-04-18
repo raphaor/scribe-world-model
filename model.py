@@ -373,6 +373,8 @@ class HWMv5(nn.Module):
         jepa_max_size=10,
         use_jepa=True,
         target_norm=False,
+        pred_loss_type="infonce",
+        infonce_temp=0.1,
     ):
         super().__init__()
         self.img_height = img_height
@@ -383,6 +385,7 @@ class HWMv5(nn.Module):
         self.use_jepa = use_jepa
         self.target_norm = target_norm
         self.lambda_pred = lambda_pred
+        self.pred_loss_type = pred_loss_type
 
         self.encoder = KrakenEncoder(img_height, embedding_dim)
         # Non-causal predictor: bidirectional attention over the latent
@@ -404,6 +407,8 @@ class HWMv5(nn.Module):
             lambda_ctc=lambda_ctc,
             lambda_pred=lambda_pred,
             target_norm=target_norm,
+            pred_loss_type=pred_loss_type,
+            infonce_temp=infonce_temp,
         )
 
     def forward(self, img):

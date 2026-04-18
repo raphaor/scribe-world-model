@@ -76,13 +76,27 @@ CTC_HIDDEN_V4 = 256
 # --- HWM-v5 ---
 
 IMG_HEIGHT_V5 = 120
-EMBEDDING_DIM_V5 = 960
+# Dropped from 960 to 384 after VICReg+MSE runs showed pred stuck at
+# the MSE trivial minimum (predictor outputs the mean). With 960 dim,
+# information is spread too thin — each dim looks like noise to the
+# predictor. 384 concentrates content per dim and aligns with the
+# wav2vec2 / I-JEPA literature scale. FF_DIM follows 2x.
+EMBEDDING_DIM_V5 = 384
 NUM_LAYERS_V5 = 4
 NUM_HEADS_V5 = 8
-FF_DIM_V5 = 1920
+FF_DIM_V5 = 768
 LAMBDA_CTC_V5 = 1.0
 CTC_HIDDEN_V5 = 512
 CTC_NUM_LSTM_V5 = 1
+
+# "mse" (legacy next-frame regression) vs "infonce" (contrastive). MSE
+# has a trivial minimum pred*=E[target|context] that collapses to the
+# mean whenever targets look noise-like — observed as pred=Var(target).
+# InfoNCE: positive = aligned target, negatives = all other targets in
+# the batch. Predicting the mean gives chance-level contrastive loss,
+# so the trivial minimum disappears.
+PRED_LOSS_V5 = "infonce"
+INFONCE_TEMP_V5 = 0.1
 
 # I-JEPA block masking for v5.
 # With T = W/8 frames (~100-200 for a typical line), 6 blocks of 12-30

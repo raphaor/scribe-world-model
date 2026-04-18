@@ -107,6 +107,37 @@ class VICRegLoss(nn.Module):
         return total, var_loss.detach(), cov_loss.detach()
 
 
+class InfoNCELoss(nn.Module):
+    """
+    Contrastive (InfoNCE) prediction loss for JEPA.
+
+    Replaces MSE regression, which has a trivial solution:
+    ``pred* = E[target | context]`` collapses to the mean whenever
+    targets are VICReg-constrained noise-like — observed as
+    ``pred = Var(target) ≈ 1`` in our runs.
+
+    For each of the N masked positions in the batch, the positive is
+    its aligned (stop-grad) target and the negatives are every other
+    target in the batch. Predicting the mean gives *chance*-level
+    contrastive loss, so the trivial minimum disappears.
+    """
+
+    def __init__(self, temperature=0.1):
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self, pred, target):
+        # pred, target: (N, D). target should already be stop-grad.
+        pred = F.normalize(pred, dim=-1)
+        target = F.normalize(target, dim=-1)
+        logits = pred @ target.T / self.temperature  # (N, N), row i vs all targets
+        labels = torch.arange(pred.size(0), device=pred.device)
+        loss = F.cross_entropy(logits, labels)
+        with torch.no_grad():
+            top1 = (logits.argmax(dim=-1) == labels).float().mean()
+        return loss, top1
+
+
 class HWMLoss(nn.Module):
     """
     Combined loss for HWM training
@@ -165,11 +196,14 @@ class HybridLoss(nn.Module):
     with config / checkpoints — it now scales the VICReg regulariser.)
 
     Knobs:
-      - lambda_pred: scales the JEPA prediction MSE. Set to 0 to disable
+      - lambda_pred: scales the JEPA prediction loss. Set to 0 to disable
         the self-supervised branch entirely (baseline = CTC-only).
-      - target_norm: LayerNorm predictions and targets before MSE. Off
-        by default — empirically it co-operated with SIGReg to hide
-        scale collapse. VICReg works on raw z and doesn't need it.
+      - pred_loss_type: "mse" (legacy, next-frame regression used by
+        v2-v4) or "infonce" (contrastive, used by v5). MSE has a
+        trivial minimum ``pred* = E[target|context]`` that collapses to
+        the mean when targets look noise-like; InfoNCE removes it.
+      - target_norm: LayerNorm pred + target before MSE. Ignored when
+        pred_loss_type=="infonce" (InfoNCE L2-normalises internally).
     """
 
     def __init__(
@@ -178,9 +212,17 @@ class HybridLoss(nn.Module):
         lambda_ctc=1.0,
         lambda_pred=1.0,
         target_norm=False,
+        pred_loss_type="mse",
+        infonce_temp=0.1,
     ):
         super().__init__()
-        self.pred_loss = nn.MSELoss()
+        self.pred_loss_type = pred_loss_type
+        if pred_loss_type == "mse":
+            self.pred_loss = nn.MSELoss()
+        elif pred_loss_type == "infonce":
+            self.pred_loss = InfoNCELoss(temperature=infonce_temp)
+        else:
+            raise ValueError(f"Unknown pred_loss_type: {pred_loss_type}")
         # VICReg replaces SIGReg: variance hinge on RAW std fights
         # scale collapse, covariance term handles decorrelation.
         self.reg = VICRegLoss()
@@ -200,12 +242,16 @@ class HybridLoss(nn.Module):
         input_lengths=None,
         target_lengths=None,
     ):
+        pred_top1 = None
         if self.lambda_pred > 0 and z_pred is not None:
-            if self.target_norm:
-                D = z_pred.shape[-1]
-                z_pred = F.layer_norm(z_pred, (D,))
-                z_target = F.layer_norm(z_target, (D,))
-            pred = self.pred_loss(z_pred, z_target)
+            if self.pred_loss_type == "infonce":
+                pred, pred_top1 = self.pred_loss(z_pred, z_target)
+            else:
+                if self.target_norm:
+                    D = z_pred.shape[-1]
+                    z_pred = F.layer_norm(z_pred, (D,))
+                    z_target = F.layer_norm(z_target, (D,))
+                pred = self.pred_loss(z_pred, z_target)
         else:
             pred = torch.zeros((), device=z_all.device)
         # VICReg must backprop through the encoder — it's the anti-collapse
@@ -219,6 +265,8 @@ class HybridLoss(nn.Module):
             "var": var.item(),
             "cov": cov.item(),
         }
+        if pred_top1 is not None:
+            losses["acc"] = pred_top1.item()
 
         # Collapse diagnostic: SIGReg only constrains the global distribution
         # over (B*T, D). If intra_var << global_var, frames within a single

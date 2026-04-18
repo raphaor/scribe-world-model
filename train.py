@@ -431,6 +431,14 @@ if __name__ == "__main__":
         "config.LAMBDA_PRED_V5 for v5. Set to 0 with --no-jepa for the "
         "CTC-only baseline.",
     )
+    parser.add_argument(
+        "--pred-loss",
+        choices=["mse", "infonce"],
+        default=None,
+        help="Prediction loss type for v5. 'mse' (legacy regression) "
+        "vs 'infonce' (contrastive, default). MSE has a trivial-mean "
+        "minimum that breaks self-supervised training.",
+    )
     args = parser.parse_args()
 
     if torch.cuda.is_available():
@@ -560,6 +568,7 @@ if __name__ == "__main__":
             if args.target_norm is not None
             else config.TARGET_NORM_V5
         )
+        pred_loss_type = args.pred_loss or config.PRED_LOSS_V5
         if args.no_jepa:
             lambda_pred = 0.0
             use_jepa = False
@@ -572,9 +581,10 @@ if __name__ == "__main__":
             use_jepa = lambda_pred > 0
         print(
             f"v5 JEPA config: use_jepa={use_jepa} lambda_pred={lambda_pred} "
-            f"target_norm={target_norm} "
+            f"pred_loss={pred_loss_type} target_norm={target_norm} "
             f"num_targets={config.JEPA_NUM_TARGETS_V5} "
-            f"size=[{config.JEPA_MIN_SIZE_V5},{config.JEPA_MAX_SIZE_V5}]"
+            f"size=[{config.JEPA_MIN_SIZE_V5},{config.JEPA_MAX_SIZE_V5}] "
+            f"embed_dim={config.EMBEDDING_DIM_V5}"
         )
         model = HWMv5(
             img_height=config.IMG_HEIGHT_V5,
@@ -593,6 +603,8 @@ if __name__ == "__main__":
             jepa_max_size=config.JEPA_MAX_SIZE_V5,
             use_jepa=use_jepa,
             target_norm=target_norm,
+            pred_loss_type=pred_loss_type,
+            infonce_temp=config.INFONCE_TEMP_V5,
         ).to(device)
         save_path = "hwm_v5.pt"
     elif ver == "v4":
