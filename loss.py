@@ -63,6 +63,50 @@ class SIGRegLoss(nn.Module):
         return loss
 
 
+class VICRegLoss(nn.Module):
+    """
+    VICReg: Variance-Invariance-Covariance Regularization (Bardes+ 2022).
+
+    Drop-in replacement for SIGReg. Key difference: operates on RAW z
+    (not standardised), so it penalises both decorrelation AND scale
+    collapse — SIGReg's ``/ std`` normalisation made both invisible,
+    letting the encoder shrink magnitude to trivialise MSE.
+
+    The invariance / prediction term lives outside this module (it's
+    the JEPA MSE in our case).
+
+    Returns (total, var_loss, cov_loss) so the caller can log the
+    breakdown — useful to see which branch is actually firing.
+    """
+
+    def __init__(self, lambda_var=25.0, lambda_cov=1.0, gamma=1.0, eps=1e-4):
+        super().__init__()
+        self.lambda_var = lambda_var
+        self.lambda_cov = lambda_cov
+        self.gamma = gamma
+        self.eps = eps
+
+    def forward(self, z):
+        if z.dim() == 3:
+            B, T, D = z.shape
+            z = z.reshape(B * T, D)
+        N, D = z.shape
+
+        # Variance hinge on RAW std: forces std(z_d) >= gamma for every
+        # dim. This is the anti-scale-collapse guard SIGReg lacks.
+        std = torch.sqrt(z.var(dim=0) + self.eps)
+        var_loss = torch.mean(F.relu(self.gamma - std))
+
+        # Covariance: off-diagonal of raw (un-standardised) covariance,
+        # L2-summed and normalised by D (standard VICReg scaling).
+        z_c = z - z.mean(dim=0)
+        cov = (z_c.T @ z_c) / max(N - 1, 1)
+        cov_loss = (cov.pow(2).sum() - cov.diagonal().pow(2).sum()) / D
+
+        total = self.lambda_var * var_loss + self.lambda_cov * cov_loss
+        return total, var_loss.detach(), cov_loss.detach()
+
+
 class HWMLoss(nn.Module):
     """
     Combined loss for HWM training
@@ -113,17 +157,19 @@ class HWMLoss(nn.Module):
 
 class HybridLoss(nn.Module):
     """
-    Combined loss: prediction + SIGReg + CTC
+    Combined loss: prediction + VICReg + CTC
 
-    L = lambda_pred * L_pred + lambda_sigreg * L_sigreg + lambda_ctc * L_ctc
+    L = lambda_pred * L_pred + lambda_sigreg * L_vicreg + lambda_ctc * L_ctc
+
+    (``lambda_sigreg`` is kept as the external knob name for back-compat
+    with config / checkpoints — it now scales the VICReg regulariser.)
 
     Knobs:
       - lambda_pred: scales the JEPA prediction MSE. Set to 0 to disable
         the self-supervised branch entirely (baseline = CTC-only).
-      - target_norm: LayerNorm predictions and targets before MSE. This
-        is the wav2vec2 / I-JEPA trick: without it, an encoder can
-        trivialise the MSE by emitting low-variance features even when
-        SIGReg only constrains the global (not local) distribution.
+      - target_norm: LayerNorm predictions and targets before MSE. Off
+        by default — empirically it co-operated with SIGReg to hide
+        scale collapse. VICReg works on raw z and doesn't need it.
     """
 
     def __init__(
@@ -135,7 +181,9 @@ class HybridLoss(nn.Module):
     ):
         super().__init__()
         self.pred_loss = nn.MSELoss()
-        self.sigreg = SIGRegLoss(lambda_reg=1.0)
+        # VICReg replaces SIGReg: variance hinge on RAW std fights
+        # scale collapse, covariance term handles decorrelation.
+        self.reg = VICRegLoss()
         self.ctc_loss = nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
         self.lambda_sigreg = lambda_sigreg
         self.lambda_ctc = lambda_ctc
@@ -160,13 +208,17 @@ class HybridLoss(nn.Module):
             pred = self.pred_loss(z_pred, z_target)
         else:
             pred = torch.zeros((), device=z_all.device)
-        # SIGReg must backprop through the encoder — it's the anti-collapse
+        # VICReg must backprop through the encoder — it's the anti-collapse
         # mechanism that replaces EMA in JEPA. Without these gradients,
         # adapt mode diverges (embeddings drift with no anchor).
-        sigreg = self.sigreg(z_all)
+        reg, var, cov = self.reg(z_all)
 
-        total = self.lambda_pred * pred + self.lambda_sigreg * sigreg
-        losses = {"pred": pred.detach().item(), "sigreg": sigreg.detach().item()}
+        total = self.lambda_pred * pred + self.lambda_sigreg * reg
+        losses = {
+            "pred": pred.detach().item(),
+            "var": var.item(),
+            "cov": cov.item(),
+        }
 
         # Collapse diagnostic: SIGReg only constrains the global distribution
         # over (B*T, D). If intra_var << global_var, frames within a single
