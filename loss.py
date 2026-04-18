@@ -168,6 +168,18 @@ class HybridLoss(nn.Module):
         total = self.lambda_pred * pred + self.lambda_sigreg * sigreg
         losses = {"pred": pred.detach().item(), "sigreg": sigreg.detach().item()}
 
+        # Collapse diagnostic: SIGReg only constrains the global distribution
+        # over (B*T, D). If intra_var << global_var, frames within a single
+        # line are near-identical — the predictor then solves the JEPA task
+        # trivially by copying a neighbour, independent of what it learned.
+        with torch.no_grad():
+            if z_all.dim() == 3:
+                D = z_all.shape[-1]
+                intra = z_all.var(dim=1).mean()
+                glob = z_all.reshape(-1, D).var(dim=0).mean()
+                losses["intra_var"] = intra.item()
+                losses["global_var"] = glob.item()
+
         if ctc_logits is not None and targets is not None:
             ctc_input = ctc_logits.permute(1, 0, 2)
             ctc = self.ctc_loss(ctc_input, targets, input_lengths, target_lengths)
