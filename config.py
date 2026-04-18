@@ -93,10 +93,12 @@ JEPA_MIN_SIZE_V5 = 12
 JEPA_MAX_SIZE_V5 = 30
 
 # Apply LayerNorm to predictor output AND stop-grad target before MSE.
-# Standard wav2vec2 / I-JEPA trick: prevents the encoder from trivialising
-# the loss by collapsing local variance (SIGReg only constrains the global
-# distribution, not per-position variance).
-TARGET_NORM_V5 = True
+# Disabled by default: empirically, combining target_norm with SIGReg's
+# scale-invariant regularisation let the encoder emit tiny-magnitude
+# embeddings (scale collapse) while the loss still looked healthy —
+# pred ≈ Var(z), i.e. the predictor just returned the mean. Removing
+# LayerNorm surfaces the collapse in the raw loss.
+TARGET_NORM_V5 = False
 
 # Weight on the JEPA prediction loss. Set to 0 to disable the world-model
 # branch entirely — useful for the CTC-only baseline ablation.
