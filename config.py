@@ -93,6 +93,16 @@ JEPA_NUM_TARGETS_V5 = 4
 JEPA_MIN_SIZE_V5 = 4
 JEPA_MAX_SIZE_V5 = 10
 
+# Apply LayerNorm to predictor output AND stop-grad target before MSE.
+# Standard wav2vec2 / I-JEPA trick: prevents the encoder from trivialising
+# the loss by collapsing local variance (SIGReg only constrains the global
+# distribution, not per-position variance).
+TARGET_NORM_V5 = True
+
+# Weight on the JEPA prediction loss. Set to 0 to disable the world-model
+# branch entirely — useful for the CTC-only baseline ablation.
+LAMBDA_PRED_V5 = 1.0
+
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)

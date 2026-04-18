@@ -408,6 +408,29 @@ if __name__ == "__main__":
         help="Force phase-switch behavior: reset epoch counter, optimizer, "
         "scheduler even when the mode matches the checkpoint.",
     )
+    parser.add_argument(
+        "--no-jepa",
+        action="store_true",
+        help="Disable the JEPA / world-model branch entirely (CTC-only "
+        "baseline). Equivalent to --lambda-pred 0 and skipping the "
+        "predictor at training time. Use this to ablate whether the "
+        "self-supervised pretext task actually helps CTC.",
+    )
+    parser.add_argument(
+        "--target-norm",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="LayerNorm pred + stop-grad target before MSE (wav2vec2 / "
+        "I-JEPA trick). Defaults to config.TARGET_NORM_V5 for v5.",
+    )
+    parser.add_argument(
+        "--lambda-pred",
+        type=float,
+        default=None,
+        help="Override the JEPA prediction-loss weight. Defaults to "
+        "config.LAMBDA_PRED_V5 for v5. Set to 0 with --no-jepa for the "
+        "CTC-only baseline.",
+    )
     args = parser.parse_args()
 
     if torch.cuda.is_available():
@@ -532,6 +555,27 @@ if __name__ == "__main__":
         model_num_classes = None
 
     if ver == "v5":
+        target_norm = (
+            args.target_norm
+            if args.target_norm is not None
+            else config.TARGET_NORM_V5
+        )
+        if args.no_jepa:
+            lambda_pred = 0.0
+            use_jepa = False
+        else:
+            lambda_pred = (
+                args.lambda_pred
+                if args.lambda_pred is not None
+                else config.LAMBDA_PRED_V5
+            )
+            use_jepa = lambda_pred > 0
+        print(
+            f"v5 JEPA config: use_jepa={use_jepa} lambda_pred={lambda_pred} "
+            f"target_norm={target_norm} "
+            f"num_targets={config.JEPA_NUM_TARGETS_V5} "
+            f"size=[{config.JEPA_MIN_SIZE_V5},{config.JEPA_MAX_SIZE_V5}]"
+        )
         model = HWMv5(
             img_height=config.IMG_HEIGHT_V5,
             embedding_dim=config.EMBEDDING_DIM_V5,
@@ -541,11 +585,14 @@ if __name__ == "__main__":
             dropout=config.DROPOUT,
             num_classes=model_num_classes,
             lambda_ctc=config.LAMBDA_CTC_V5,
+            lambda_pred=lambda_pred,
             ctc_hidden=config.CTC_HIDDEN_V5,
             ctc_num_lstm=config.CTC_NUM_LSTM_V5,
             jepa_num_targets=config.JEPA_NUM_TARGETS_V5,
             jepa_min_size=config.JEPA_MIN_SIZE_V5,
             jepa_max_size=config.JEPA_MAX_SIZE_V5,
+            use_jepa=use_jepa,
+            target_norm=target_norm,
         ).to(device)
         save_path = "hwm_v5.pt"
     elif ver == "v4":

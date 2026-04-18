@@ -365,11 +365,14 @@ class HWMv5(nn.Module):
         num_classes=None,
         lambda_sigreg=0.1,
         lambda_ctc=0.5,
+        lambda_pred=1.0,
         ctc_hidden=256,
         ctc_num_lstm=1,
         jepa_num_targets=4,
         jepa_min_size=4,
         jepa_max_size=10,
+        use_jepa=True,
+        target_norm=False,
     ):
         super().__init__()
         self.img_height = img_height
@@ -377,6 +380,9 @@ class HWMv5(nn.Module):
         self.jepa_num_targets = jepa_num_targets
         self.jepa_min_size = jepa_min_size
         self.jepa_max_size = jepa_max_size
+        self.use_jepa = use_jepa
+        self.target_norm = target_norm
+        self.lambda_pred = lambda_pred
 
         self.encoder = KrakenEncoder(img_height, embedding_dim)
         # Non-causal predictor: bidirectional attention over the latent
@@ -393,7 +399,12 @@ class HWMv5(nn.Module):
         self.mask_token = nn.Parameter(torch.zeros(1, 1, embedding_dim))
         nn.init.trunc_normal_(self.mask_token, std=0.02)
 
-        self.criterion = HybridLoss(lambda_sigreg, lambda_ctc)
+        self.criterion = HybridLoss(
+            lambda_sigreg=lambda_sigreg,
+            lambda_ctc=lambda_ctc,
+            lambda_pred=lambda_pred,
+            target_norm=target_norm,
+        )
 
     def forward(self, img):
         """
@@ -444,7 +455,10 @@ class HWMv5(nn.Module):
         self, img, targets=None, input_lengths=None, target_lengths=None
     ):
         z_seq = self.encoder(img)
-        z_pred_t, z_tgt_t = self._jepa_predict(z_seq, input_lengths)
+        if self.use_jepa:
+            z_pred_t, z_tgt_t = self._jepa_predict(z_seq, input_lengths)
+        else:
+            z_pred_t, z_tgt_t = None, None
         ctc_logits = self.ctc_head(z_seq) if self.ctc_head is not None else None
         return self.criterion(
             z_pred_t, z_tgt_t, z_seq,
@@ -453,7 +467,10 @@ class HWMv5(nn.Module):
 
     def adapt(self, img):
         z_seq = self.encoder(img)
-        z_pred_t, z_tgt_t = self._jepa_predict(z_seq)
+        if self.use_jepa:
+            z_pred_t, z_tgt_t = self._jepa_predict(z_seq)
+        else:
+            z_pred_t, z_tgt_t = None, None
         return self.criterion(z_pred_t, z_tgt_t, z_seq)
 
     def count_parameters(self):

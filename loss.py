@@ -115,16 +115,32 @@ class HybridLoss(nn.Module):
     """
     Combined loss: prediction + SIGReg + CTC
 
-    L = L_pred + lambda_sigreg * L_sigreg + lambda_ctc * L_ctc
+    L = lambda_pred * L_pred + lambda_sigreg * L_sigreg + lambda_ctc * L_ctc
+
+    Knobs:
+      - lambda_pred: scales the JEPA prediction MSE. Set to 0 to disable
+        the self-supervised branch entirely (baseline = CTC-only).
+      - target_norm: LayerNorm predictions and targets before MSE. This
+        is the wav2vec2 / I-JEPA trick: without it, an encoder can
+        trivialise the MSE by emitting low-variance features even when
+        SIGReg only constrains the global (not local) distribution.
     """
 
-    def __init__(self, lambda_sigreg=0.1, lambda_ctc=1.0):
+    def __init__(
+        self,
+        lambda_sigreg=0.1,
+        lambda_ctc=1.0,
+        lambda_pred=1.0,
+        target_norm=False,
+    ):
         super().__init__()
         self.pred_loss = nn.MSELoss()
         self.sigreg = SIGRegLoss(lambda_reg=1.0)
         self.ctc_loss = nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
         self.lambda_sigreg = lambda_sigreg
         self.lambda_ctc = lambda_ctc
+        self.lambda_pred = lambda_pred
+        self.target_norm = target_norm
 
     def forward(
         self,
@@ -136,13 +152,20 @@ class HybridLoss(nn.Module):
         input_lengths=None,
         target_lengths=None,
     ):
-        pred = self.pred_loss(z_pred, z_target)
+        if self.lambda_pred > 0 and z_pred is not None:
+            if self.target_norm:
+                D = z_pred.shape[-1]
+                z_pred = F.layer_norm(z_pred, (D,))
+                z_target = F.layer_norm(z_target, (D,))
+            pred = self.pred_loss(z_pred, z_target)
+        else:
+            pred = torch.zeros((), device=z_all.device)
         # SIGReg must backprop through the encoder — it's the anti-collapse
         # mechanism that replaces EMA in JEPA. Without these gradients,
         # adapt mode diverges (embeddings drift with no anchor).
         sigreg = self.sigreg(z_all)
 
-        total = pred + self.lambda_sigreg * sigreg
+        total = self.lambda_pred * pred + self.lambda_sigreg * sigreg
         losses = {"pred": pred.detach().item(), "sigreg": sigreg.detach().item()}
 
         if ctc_logits is not None and targets is not None:
