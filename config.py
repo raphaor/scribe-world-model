@@ -43,10 +43,10 @@ ALTO_DIRS = [
     "D:/OCR_genealogie/Alto/bars_dordogne_alto",
     "D:/OCR_genealogie/Alto/saint_chamassy_dordogne_alto_set_1",
     ## "D:/OCR_genealogie/Alto/saint_chamassy_dordogne_alto_set_train",
-    # "D:/OCR_genealogie/Alto/lectaurep_bronod_notaire_paris_18e",
-    # "D:/OCR_genealogie/Alto/lectaurep_mariages_divorces_paris_19e",
-    # "D:/OCR_genealogie/Alto/lectaurep_repertoires_notaires_paris_1830-1939",
-    # "D:/OCR_genealogie/Alto/timeuscorpus_prudhommes_paris_1858-1878",
+    "D:/OCR_genealogie/Alto/lectaurep_bronod_notaire_paris_18e",
+    "D:/OCR_genealogie/Alto/lectaurep_mariages_divorces_paris_19e",
+    "D:/OCR_genealogie/Alto/lectaurep_repertoires_notaires_paris_1830-1939",
+    "D:/OCR_genealogie/Alto/timeuscorpus_prudhommes_paris_1858-1878",
 ]
 
 # --- HWM-v3 ---
@@ -89,9 +89,9 @@ CTC_NUM_LSTM_V5 = 1
 # frames mask roughly 10-25% of the sequence — enough to force the
 # predictor to reconstruct spans from bidirectional context without
 # starving the context side of signal.
-JEPA_NUM_TARGETS_V5 = 4
-JEPA_MIN_SIZE_V5 = 4
-JEPA_MAX_SIZE_V5 = 10
+JEPA_NUM_TARGETS_V5 = 6
+JEPA_MIN_SIZE_V5 = 12
+JEPA_MAX_SIZE_V5 = 30
 
 
 def count_parameters(model):
