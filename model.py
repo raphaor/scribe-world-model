@@ -482,6 +482,76 @@ class HWMv5(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
+class HWMv6(HWMv5):
+    """
+    Handwriting World Model v6
+
+    v5 + projection head on the JEPA branch (SimCLR / VICReg style).
+
+    The motivation: the v5 encoder is shared between two objectives
+    that pull in different directions.
+      - CTC wants z_seq to be character-discriminative: each frame
+        should uniquely identify the glyph it covers.
+      - JEPA wants z_seq to be mutually predictable: each frame should
+        be easy to infer from its neighbours.
+
+    These goals are not identical. A 2-layer MLP inserted on the JEPA
+    side absorbs the SSL-specific transformation: raw z_seq stays
+    aligned with the CTC objective, and the projector weights learn
+    whatever extra shaping InfoNCE / VICReg want on top. The projector
+    is discarded at inference — nothing changes in the CTC path.
+
+    Concretely:
+        z_seq ─┬─► CTC head                          (unchanged)
+               │
+               └─► _jepa_predict:
+                     predictor(z_seq w/ mask tokens) ─► pred
+                     z_seq.detach()                  ─► target
+                     proj_head(pred), proj_head(target) ─► InfoNCE
+
+    VICReg still operates on raw z_seq (anti-collapse on the encoder,
+    not on the projector).
+    """
+
+    def __init__(self, proj_dim=None, proj_hidden=None, **kwargs):
+        super().__init__(**kwargs)
+        proj_dim = proj_dim or self.embedding_dim
+        proj_hidden = proj_hidden or self.embedding_dim
+        self.proj_head = nn.Sequential(
+            nn.Linear(self.embedding_dim, proj_hidden),
+            nn.GELU(),
+            nn.Linear(proj_hidden, proj_dim),
+        )
+
+    def _jepa_predict(self, z_seq, input_lengths=None):
+        B, T, D = z_seq.shape
+        mask = sample_jepa_mask(
+            B, T,
+            num_targets=self.jepa_num_targets,
+            min_size=self.jepa_min_size,
+            max_size=self.jepa_max_size,
+            valid_lengths=input_lengths,
+            device=z_seq.device,
+        )
+        mask_tok = self.mask_token.expand(B, T, D)
+        z_ctx = torch.where(mask.unsqueeze(-1), mask_tok, z_seq)
+        z_pred_full = self.predictor(z_ctx)
+
+        if mask.any():
+            z_pred_t = z_pred_full[mask]
+            z_tgt_t = z_seq.detach()[mask]
+        else:
+            z_pred_t = z_pred_full[:, 0, :]
+            z_tgt_t = z_seq.detach()[:, 0, :]
+
+        # Route both pred and target through the same projection head
+        # before the loss. JEPA gradients now reach the encoder only
+        # after passing through the projector.
+        p_pred = self.proj_head(z_pred_t)
+        p_tgt = self.proj_head(z_tgt_t)
+        return p_pred, p_tgt
+
+
 def test_model():
     """Test complete model"""
     print("\n" + "=" * 60)

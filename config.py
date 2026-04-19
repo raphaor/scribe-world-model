@@ -119,5 +119,37 @@ TARGET_NORM_V5 = False
 LAMBDA_PRED_V5 = 1.0
 
 
+# --- HWM-v6 ---
+# Same architecture as v5 + a projection head on the JEPA branch
+# (SimCLR/VICReg-style). The single v5 encoder has to serve two goals
+# at once — CTC wants character-discriminative frames, JEPA wants
+# frames that are mutually predictable. A small MLP on the JEPA side
+# absorbs the "SSL-specific compromise" so raw z_seq stays focused on
+# the CTC objective. The CTC path is unchanged at inference; the
+# projection head is only used during training.
+
+IMG_HEIGHT_V6 = IMG_HEIGHT_V5
+EMBEDDING_DIM_V6 = EMBEDDING_DIM_V5
+NUM_LAYERS_V6 = NUM_LAYERS_V5
+NUM_HEADS_V6 = NUM_HEADS_V5
+FF_DIM_V6 = FF_DIM_V5
+LAMBDA_CTC_V6 = LAMBDA_CTC_V5
+LAMBDA_PRED_V6 = LAMBDA_PRED_V5
+CTC_HIDDEN_V6 = CTC_HIDDEN_V5
+CTC_NUM_LSTM_V6 = CTC_NUM_LSTM_V5
+PRED_LOSS_V6 = PRED_LOSS_V5
+INFONCE_TEMP_V6 = INFONCE_TEMP_V5
+JEPA_NUM_TARGETS_V6 = JEPA_NUM_TARGETS_V5
+JEPA_MIN_SIZE_V6 = JEPA_MIN_SIZE_V5
+JEPA_MAX_SIZE_V6 = JEPA_MAX_SIZE_V5
+TARGET_NORM_V6 = TARGET_NORM_V5
+
+# Projection head: 2-layer MLP (Linear -> GELU -> Linear).
+# Output dim defaults to the encoder dim — we do not shrink the SSL
+# representation, just route it through a learned transformation.
+PROJ_DIM_V6 = EMBEDDING_DIM_V5
+PROJ_HIDDEN_V6 = EMBEDDING_DIM_V5
+
+
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
