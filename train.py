@@ -79,15 +79,26 @@ def _step_full(model, batch, optimizer, device, use_amp):
 
 
 def _step_adapt(model, batch, optimizer, device, use_amp):
-    """One self-supervised training step (prediction + SIGReg only)."""
+    """One self-supervised training step (prediction + SIGReg only).
+
+    In pure ``--mode adapt``, the batch comes from the supervised
+    train_loader (collate_alto_v5_fn): ``(padded, targets, input_lengths,
+    target_lengths, raw_texts)``. In mixed mode's adapt branch the batch
+    comes from collate_unannotated_v5_fn: ``(padded, input_lengths)``.
+    Older v2-v4 collate_unannotated_fn returns ``(padded,)`` only. We
+    pick the right index by batch length to pass lengths to the JEPA
+    mask sampler so it stays inside the valid (non-padding) region.
+    """
     img_seqs = batch[0].to(device, non_blocking=True)
-    # v5 collate returns (padded, input_lengths); older v2-v4 collates
-    # return (padded,) only. Pass lengths through when available so the
-    # JEPA mask avoids padding positions — makes Phase 1 InfoNCE acc
-    # comparable to the supervised Phase 2 metric.
-    input_lengths = (
-        batch[1].to(device, non_blocking=True) if len(batch) > 1 else None
-    )
+    if len(batch) >= 3:
+        # Supervised v5 collate: input_lengths is batch[2] (batch[1] is
+        # the flattened targets tensor, which is NOT per-sample lengths).
+        input_lengths = batch[2].to(device, non_blocking=True)
+    elif len(batch) == 2:
+        # Unannotated v5 collate: (padded, input_lengths).
+        input_lengths = batch[1].to(device, non_blocking=True)
+    else:
+        input_lengths = None
 
     if img_seqs.shape[1] < 2:
         return None, None
@@ -98,7 +109,9 @@ def _step_adapt(model, batch, optimizer, device, use_amp):
             loss, losses = model.adapt(img_seqs, input_lengths=input_lengths)
         else:
             loss, losses = model.adapt(img_seqs)
-    del img_seqs, input_lengths
+    del img_seqs
+    if input_lengths is not None:
+        del input_lengths
     return loss, losses
 
 
