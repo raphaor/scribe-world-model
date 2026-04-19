@@ -470,10 +470,10 @@ class HWMv5(nn.Module):
             ctc_logits, targets, input_lengths, target_lengths,
         )
 
-    def adapt(self, img):
+    def adapt(self, img, input_lengths=None):
         z_seq = self.encoder(img)
         if self.use_jepa:
-            z_pred_t, z_tgt_t = self._jepa_predict(z_seq)
+            z_pred_t, z_tgt_t = self._jepa_predict(z_seq, input_lengths)
         else:
             z_pred_t, z_tgt_t = None, None
         return self.criterion(z_pred_t, z_tgt_t, z_seq)

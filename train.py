@@ -81,14 +81,24 @@ def _step_full(model, batch, optimizer, device, use_amp):
 def _step_adapt(model, batch, optimizer, device, use_amp):
     """One self-supervised training step (prediction + SIGReg only)."""
     img_seqs = batch[0].to(device, non_blocking=True)
+    # v5 collate returns (padded, input_lengths); older v2-v4 collates
+    # return (padded,) only. Pass lengths through when available so the
+    # JEPA mask avoids padding positions — makes Phase 1 InfoNCE acc
+    # comparable to the supervised Phase 2 metric.
+    input_lengths = (
+        batch[1].to(device, non_blocking=True) if len(batch) > 1 else None
+    )
 
     if img_seqs.shape[1] < 2:
         return None, None
 
     optimizer.zero_grad(set_to_none=True)
     with torch.amp.autocast("cuda", enabled=use_amp):
-        loss, losses = model.adapt(img_seqs)
-    del img_seqs
+        if input_lengths is not None:
+            loss, losses = model.adapt(img_seqs, input_lengths=input_lengths)
+        else:
+            loss, losses = model.adapt(img_seqs)
+    del img_seqs, input_lengths
     return loss, losses
 
 

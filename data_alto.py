@@ -328,8 +328,11 @@ def collate_alto_v5_fn(batch, char_to_idx=None):
 def collate_unannotated_v5_fn(batch):
     """Collate for v5 unannotated: full line images padded in width."""
     imgs = []
+    input_lengths = []
     for (img,) in batch:
         imgs.append(img)
+        # Match collate_alto_v5_fn: encoder subsamples width by 8.
+        input_lengths.append(img.shape[1] // 8)
 
     B = len(imgs)
     H = imgs[0].shape[0]
@@ -339,7 +342,8 @@ def collate_unannotated_v5_fn(batch):
     for i, img in enumerate(imgs):
         padded[i, :, :img.shape[1]] = img
 
-    return (padded,)
+    input_lengths = torch.tensor(input_lengths, dtype=torch.long)
+    return padded, input_lengths
 
 
 def build_alphabet(alto_dirs):
