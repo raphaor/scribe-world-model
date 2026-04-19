@@ -34,7 +34,7 @@ from torch.utils.data import DataLoader, random_split
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config
-from model import HWMv2, HWMv3, HWMv4, HWMv5, HWMv6, HWMv7
+from model import HWMv2, HWMv3, HWMv4, HWMv5, HWMv6, HWMv7, HWMv8
 from data_alto import (
     AltoLineDataset,
     UnannotatedLineDataset,
@@ -205,22 +205,35 @@ def _backward(loss, optimizer, model, scaler, use_amp):
 
 
 def _set_encoder_frozen(model, frozen):
-    """Freeze/unfreeze encoder + predictor trunk (CTC head stays trainable)."""
+    """Freeze/unfreeze encoder + SSL trunk (CTC head stays trainable).
+
+    v5-v7 expose ``predictor``; v8 exposes ``decoder`` instead (MAE pixel
+    head). Only toggle those that actually exist.
+    """
     for p in model.encoder.parameters():
         p.requires_grad_(not frozen)
-    for p in model.predictor.parameters():
-        p.requires_grad_(not frozen)
+    for name in ("predictor", "decoder", "jepa_predictor", "proj_head"):
+        sub = getattr(model, name, None)
+        if sub is not None:
+            for p in sub.parameters():
+                p.requires_grad_(not frozen)
 
 
 def _build_param_groups(model, lr, encoder_lr_mult):
     """
-    Discriminative LR: the trunk (encoder + predictor) is typically
+    Discriminative LR: the trunk (encoder + SSL modules) is typically
     pretrained and moves at a fraction of the base LR. The CTC head is
     fresh after a phase switch and uses the full LR.
+
+    ``SSL modules`` covers the predictor (v5-v7), the MAE decoder (v8),
+    cross-attn predictor (v7), and the projection head (v6/v7). We
+    collect whichever attributes exist on the model.
     """
-    trunk_params = (
-        list(model.encoder.parameters()) + list(model.predictor.parameters())
-    )
+    trunk_params = list(model.encoder.parameters())
+    for name in ("predictor", "decoder", "jepa_predictor", "proj_head"):
+        sub = getattr(model, name, None)
+        if sub is not None:
+            trunk_params.extend(list(sub.parameters()))
     groups = [{"params": trunk_params, "lr": lr * encoder_lr_mult, "name": "trunk"}]
     if model.ctc_head is not None:
         groups.append(
@@ -385,7 +398,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train HWM")
     parser.add_argument("--mode", choices=["mixed", "full", "adapt"], default="mixed")
     parser.add_argument(
-        "--model-version", choices=["v2", "v3", "v4", "v5", "v6", "v7"], default="v5"
+        "--model-version",
+        choices=["v2", "v3", "v4", "v5", "v6", "v7", "v8"],
+        default="v5",
     )
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -478,8 +493,8 @@ if __name__ == "__main__":
 
     if args.data == "alto":
         ver = args.model_version
-        if ver in ("v5", "v6", "v7"):
-            img_h = config.IMG_HEIGHT_V5
+        if ver in ("v5", "v6", "v7", "v8"):
+            img_h = config.IMG_HEIGHT_V8 if ver == "v8" else config.IMG_HEIGHT_V5
             ws = None
             stride = None
         elif ver == "v4":
@@ -508,7 +523,7 @@ if __name__ == "__main__":
             generator=torch.Generator().manual_seed(42),
         )
 
-        if ver in ("v5", "v6", "v7"):
+        if ver in ("v5", "v6", "v7", "v8"):
             collate = partial(collate_alto_v5_fn, char_to_idx=char_to_idx)
         else:
             collate = partial(
@@ -546,7 +561,7 @@ if __name__ == "__main__":
             adapt_ds = UnannotatedLineDataset(
                 unannotated_dirs, img_height=img_h, augment=True
             )
-            if ver in ("v5", "v6", "v7"):
+            if ver in ("v5", "v6", "v7", "v8"):
                 adapt_collate = collate_unannotated_v5_fn
             else:
                 adapt_collate = partial(
@@ -658,6 +673,54 @@ if __name__ == "__main__":
                 **model_kwargs,
             ).to(device)
             save_path = "hwm_v7.pt"
+    elif ver == "v8":
+        # v8: ViT + MAE. The ``--no-jepa`` flag doubles as "disable the
+        # SSL branch" here — it zeros lambda_mae and skips the decoder.
+        if args.no_jepa:
+            lambda_mae = 0.0
+            use_mae = False
+        else:
+            lambda_mae = (
+                args.lambda_pred
+                if args.lambda_pred is not None
+                else config.LAMBDA_MAE_V8
+            )
+            use_mae = lambda_mae > 0
+        print(
+            f"v8 MAE config: use_mae={use_mae} lambda_mae={lambda_mae} "
+            f"lambda_ctc={config.LAMBDA_CTC_V8} "
+            f"patches={config.PATCH_H_V8}x{config.PATCH_W_V8} "
+            f"embed_dim={config.EMBEDDING_DIM_V8} "
+            f"dec_dim={config.DEC_DIM_V8} dec_layers={config.DEC_LAYERS_V8} "
+            f"mask_blocks={config.MASK_NUM_BLOCKS_V8}"
+        )
+        model = HWMv8(
+            img_height=config.IMG_HEIGHT_V8,
+            patch_h=config.PATCH_H_V8,
+            patch_w=config.PATCH_W_V8,
+            embedding_dim=config.EMBEDDING_DIM_V8,
+            num_layers=config.NUM_LAYERS_V8,
+            num_heads=config.NUM_HEADS_V8,
+            ff_dim=config.FF_DIM_V8,
+            dropout=config.DROPOUT,
+            num_classes=model_num_classes,
+            lambda_mae=lambda_mae,
+            lambda_ctc=config.LAMBDA_CTC_V8,
+            ctc_hidden=config.CTC_HIDDEN_V8,
+            ctc_num_lstm=config.CTC_NUM_LSTM_V8,
+            dec_dim=config.DEC_DIM_V8,
+            dec_layers=config.DEC_LAYERS_V8,
+            dec_heads=config.DEC_HEADS_V8,
+            dec_ff=config.DEC_FF_V8,
+            mask_num_blocks=config.MASK_NUM_BLOCKS_V8,
+            mask_min_h=config.MASK_MIN_H_V8,
+            mask_max_h=config.MASK_MAX_H_V8,
+            mask_min_w=config.MASK_MIN_W_V8,
+            mask_max_w=config.MASK_MAX_W_V8,
+            max_n_h=config.MAX_N_H_V8,
+            use_mae=use_mae,
+        ).to(device)
+        save_path = "hwm_v8.pt"
     elif ver == "v4":
         model = HWMv4(
             img_height=config.IMG_HEIGHT_V4,

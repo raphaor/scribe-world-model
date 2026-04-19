@@ -207,6 +207,113 @@ class JEPACrossAttnPredictor(nn.Module):
         return self.output_proj(out)
 
 
+class MAEDecoder(nn.Module):
+    """
+    Small Masked-AutoEncoder decoder for HWMv8.
+
+    Unlike the v5-v7 JEPA family, v8's target is PIXELS (the raw
+    content of masked patches), not embeddings. That makes the loss
+    structurally collapse-proof: pixels are external, fixed targets
+    that the encoder can never game.
+
+    Flow (official MAE, SimMIM-lite variant — no encoder-side patch
+    drop, because we also need an all-patch encoder pass for CTC):
+
+      1. Encoder produces tokens at every patch position (visible and
+         masked alike); we treat that output as ``visible_tokens`` plus
+         "dummy" tokens at masked positions that we'll replace.
+      2. Build ``decoder_input`` by keeping encoder output at visible
+         positions and substituting a learned ``mask_token`` + decoder
+         positional encoding at masked positions.
+      3. Run a shallow decoder transformer.
+      4. Linear head reconstructs the patch_h * patch_w pixel values
+         from each decoder output token.
+      5. Caller computes MSE between reconstructed and original pixels
+         at masked, non-padding positions.
+    """
+
+    def __init__(
+        self,
+        encoder_dim,
+        decoder_dim=256,
+        num_layers=2,
+        num_heads=8,
+        ff_dim=1024,
+        dropout=0.1,
+        patch_h=15,
+        patch_w=16,
+        max_n_h=400,
+        n_v=8,
+    ):
+        super().__init__()
+        self.decoder_dim = decoder_dim
+        self.patch_h = patch_h
+        self.patch_w = patch_w
+
+        # Bridge from encoder to decoder width. Decoder is usually
+        # thinner than the encoder (MAE: 512 enc -> 256 dec).
+        self.enc_to_dec = nn.Linear(encoder_dim, decoder_dim)
+
+        # Learnable [MASK] token at decoder width.
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_dim))
+        nn.init.trunc_normal_(self.mask_token, std=0.02)
+
+        # Separate positional encoding inside the decoder. Mirrors the
+        # encoder's separable scheme so the decoder knows where each
+        # token sits in the 2D grid.
+        self.row_embed = nn.Parameter(torch.zeros(n_v, decoder_dim))
+        self.col_embed = nn.Parameter(torch.zeros(max_n_h, decoder_dim))
+        nn.init.trunc_normal_(self.row_embed, std=0.02)
+        nn.init.trunc_normal_(self.col_embed, std=0.02)
+
+        decoder_layer = nn.TransformerEncoderLayer(
+            d_model=decoder_dim,
+            nhead=num_heads,
+            dim_feedforward=ff_dim,
+            dropout=dropout,
+            batch_first=True,
+            activation="gelu",
+            norm_first=True,
+        )
+        self.decoder = nn.TransformerEncoder(decoder_layer, num_layers=num_layers)
+        self.norm = nn.LayerNorm(decoder_dim)
+
+        # Reconstruct pixel values for each patch.
+        self.pixel_head = nn.Linear(decoder_dim, patch_h * patch_w)
+
+    def forward(self, enc_tokens, mask_flat, n_v, n_h, key_padding_mask=None):
+        """
+        Args:
+            enc_tokens: (B, N_v*N_h, D_enc) — encoder output at every patch.
+            mask_flat: (B, N_v*N_h) bool — True = masked (target) positions.
+            n_v, n_h: grid shape.
+            key_padding_mask: (B, N_v*N_h) bool — True = padding position
+                to hide from decoder self-attention (we still want it to
+                attend between visible and masked, but not into padding).
+        Returns:
+            pred_pixels: (B, N_v*N_h, patch_h * patch_w) predicted pixels.
+        """
+        B, N, _ = enc_tokens.shape
+        D = self.decoder_dim
+
+        tokens = self.enc_to_dec(enc_tokens)                  # (B, N, D_dec)
+
+        # Substitute mask_token at masked positions.
+        mask_tok = self.mask_token.expand(B, N, D)
+        tokens = torch.where(mask_flat.unsqueeze(-1), mask_tok, tokens)
+
+        # Add decoder positional encoding (separable).
+        pos = (
+            self.row_embed.unsqueeze(1)                       # (N_v, 1, D)
+            + self.col_embed[:n_h].unsqueeze(0)               # (1, N_h, D)
+        ).reshape(n_v * n_h, D)
+        tokens = tokens + pos.unsqueeze(0)
+
+        tokens = self.decoder(tokens, src_key_padding_mask=key_padding_mask)
+        tokens = self.norm(tokens)
+        return self.pixel_head(tokens)
+
+
 def test_predictor():
     """Test predictor on Pi"""
     print("\nTesting TransformerPredictor...")

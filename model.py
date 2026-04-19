@@ -5,12 +5,16 @@ Complete architecture combining encoder and predictor
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from encoder import CNNEncoder, Conv2DEncoder, Conv2DEncoderV2, Conv2DEncoderV3, KrakenEncoder
-from predictor import TransformerPredictor, JEPACrossAttnPredictor
-from loss import HWMLoss, HybridLoss
+from encoder import (
+    CNNEncoder, Conv2DEncoder, Conv2DEncoderV2, Conv2DEncoderV3,
+    KrakenEncoder, ViTEncoder,
+)
+from predictor import TransformerPredictor, JEPACrossAttnPredictor, MAEDecoder
+from loss import HWMLoss, HybridLoss, MAEHybridLoss
 from ctc_head import CTCHead, CTCHeadBiLSTM
-from jepa import sample_jepa_mask
+from jepa import sample_jepa_mask, sample_2d_block_mask
 import config
 
 
@@ -652,6 +656,222 @@ class HWMv7(HWMv6):
         p_pred = self.proj_head(z_pred_t)
         p_tgt = self.proj_head(z_tgt_t)
         return p_pred, p_tgt
+
+
+class HWMv8(nn.Module):
+    """
+    Handwriting World Model v8
+
+    Two structural changes vs v5-v7:
+
+      1. 2D patch encoder (ViT) instead of a 1D Kraken CNN. Handwriting
+         has genuine 2D content (ascenders, descenders, diacritics)
+         that a tall-thin-strip encoder compresses prematurely.
+      2. MAE pretext task: predict the RAW PIXEL values of masked 2D
+         patches via a small decoder. Pixels are external, fixed
+         targets — the scale-collapse and trivial-mean failure modes
+         that plagued v5 (SIGReg/VICReg, MSE-then-InfoNCE migrations)
+         cannot apply.
+
+    Flow:
+
+      Image (B, H, W)
+        → ViTEncoder         (2D patches → self-attention grid)
+        → tokens (B, N_v*N_h, D)
+               │
+               ├─► mean over N_v rows → (B, N_h, D) → CTC head (BiLSTM)
+               │
+               └─► MAE decoder:
+                     sample 2D block mask
+                     mask_token substitution at masked positions
+                     shallow transformer + pixel head
+                     MSE(pred_pixels, true_pixels) at masked & valid
+    """
+
+    def __init__(
+        self,
+        img_height=120,
+        patch_h=15,
+        patch_w=16,
+        embedding_dim=384,
+        num_layers=4,
+        num_heads=8,
+        ff_dim=1536,
+        dropout=0.1,
+        num_classes=None,
+        lambda_mae=1.0,
+        lambda_ctc=1.0,
+        ctc_hidden=256,
+        ctc_num_lstm=1,
+        dec_dim=256,
+        dec_layers=2,
+        dec_heads=8,
+        dec_ff=1024,
+        mask_num_blocks=4,
+        mask_min_h=2,
+        mask_max_h=4,
+        mask_min_w=4,
+        mask_max_w=16,
+        max_n_h=400,
+        use_mae=True,
+    ):
+        super().__init__()
+        self.img_height = img_height
+        self.patch_h = patch_h
+        self.patch_w = patch_w
+        self.embedding_dim = embedding_dim
+        self.n_v = img_height // patch_h
+        self.use_mae = use_mae
+        self.mask_num_blocks = mask_num_blocks
+        self.mask_min_h = mask_min_h
+        self.mask_max_h = mask_max_h
+        self.mask_min_w = mask_min_w
+        self.mask_max_w = mask_max_w
+        self.max_n_h = max_n_h
+
+        self.encoder = ViTEncoder(
+            img_height=img_height,
+            patch_h=patch_h,
+            patch_w=patch_w,
+            embedding_dim=embedding_dim,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            ff_dim=ff_dim,
+            dropout=dropout,
+            max_n_h=max_n_h,
+        )
+        self.decoder = (
+            MAEDecoder(
+                encoder_dim=embedding_dim,
+                decoder_dim=dec_dim,
+                num_layers=dec_layers,
+                num_heads=dec_heads,
+                ff_dim=dec_ff,
+                dropout=dropout,
+                patch_h=patch_h,
+                patch_w=patch_w,
+                max_n_h=max_n_h,
+                n_v=self.n_v,
+            )
+            if use_mae
+            else None
+        )
+        self.ctc_head = (
+            CTCHeadBiLSTM(
+                embedding_dim, num_classes,
+                hidden_dim=ctc_hidden, num_lstm_layers=ctc_num_lstm,
+            )
+            if num_classes
+            else None
+        )
+        self.criterion = MAEHybridLoss(
+            lambda_mae=lambda_mae, lambda_ctc=lambda_ctc
+        )
+
+    def _round_up_width(self, img):
+        """Right-pad image width to a multiple of patch_w."""
+        W = img.shape[-1]
+        pad = (self.patch_w - W % self.patch_w) % self.patch_w
+        if pad > 0:
+            img = F.pad(img, (0, pad))
+        return img
+
+    def _convert_lengths_to_patches(self, input_lengths):
+        """
+        Collate gives input_lengths in Kraken units (W // 8). We need
+        n_h_valid in patch-grid units (W // patch_w). Factor = patch_w // 8.
+        """
+        factor = max(1, self.patch_w // 8)
+        return input_lengths // factor
+
+    def _padding_mask(self, n_h_valid, n_v, n_h, device):
+        """(B, n_v*n_h) True = padding position (column >= n_h_valid[b])."""
+        B = n_h_valid.size(0)
+        ar = torch.arange(n_h, device=device)
+        col_pad = ar[None, :] >= n_h_valid[:, None]     # (B, N_h)
+        pad2d = col_pad.unsqueeze(1).expand(B, n_v, n_h)
+        return pad2d.reshape(B, n_v * n_h)
+
+    def _pool_vertical(self, tokens, n_v, n_h):
+        B, _, D = tokens.shape
+        return tokens.reshape(B, n_v, n_h, D).mean(dim=1)  # (B, N_h, D)
+
+    def forward(self, img):
+        """
+        Inference-time forward: encoder + vertical pool + CTC head.
+        Returned tuple matches the (pred, z_seq, ctc_logits) contract
+        used by the evaluation pipeline.
+        """
+        img = self._round_up_width(img)
+        tokens, (n_v, n_h) = self.encoder(img)
+        z_seq = self._pool_vertical(tokens, n_v, n_h)
+        ctc_logits = self.ctc_head(z_seq) if self.ctc_head is not None else None
+        return None, z_seq, ctc_logits
+
+    def compute_loss(
+        self, img, targets=None, input_lengths=None, target_lengths=None
+    ):
+        img = self._round_up_width(img)
+        B, H, W = img.shape
+        n_v = self.n_v
+        n_h = W // self.patch_w
+
+        n_h_valid = None
+        pad_mask_flat = None
+        if input_lengths is not None:
+            n_h_valid = torch.clamp(
+                self._convert_lengths_to_patches(input_lengths), max=n_h
+            )
+            pad_mask_flat = self._padding_mask(n_h_valid, n_v, n_h, img.device)
+
+        tokens, (n_v_g, n_h_g) = self.encoder(img, src_key_padding_mask=pad_mask_flat)
+
+        z_seq = self._pool_vertical(tokens, n_v_g, n_h_g)
+        ctc_logits = self.ctc_head(z_seq) if self.ctc_head is not None else None
+
+        pred_pixels = None
+        target_pixels = None
+        scored_mask = None
+        if self.use_mae and self.decoder is not None:
+            mask2d = sample_2d_block_mask(
+                B, n_v_g, n_h_g,
+                num_blocks=self.mask_num_blocks,
+                min_h=self.mask_min_h, max_h=self.mask_max_h,
+                min_w=self.mask_min_w, max_w=self.mask_max_w,
+                valid_h_lengths=n_h_valid, device=img.device,
+            )
+            mask_flat = mask2d.reshape(B, n_v_g * n_h_g)
+
+            pred_pixels = self.decoder(
+                enc_tokens=tokens,
+                mask_flat=mask_flat,
+                n_v=n_v_g, n_h=n_h_g,
+                key_padding_mask=pad_mask_flat,
+            )
+            target_pixels = self.encoder.patchify_pixels(img).reshape(
+                B, n_v_g * n_h_g, -1
+            )
+            valid = (
+                ~pad_mask_flat if pad_mask_flat is not None
+                else torch.ones_like(mask_flat)
+            )
+            scored_mask = mask_flat & valid
+
+        return self.criterion(
+            pred_pixels=pred_pixels,
+            target_pixels=target_pixels,
+            valid_mask=scored_mask,
+            ctc_logits=ctc_logits,
+            targets=targets,
+            input_lengths=n_h_valid,
+            target_lengths=target_lengths,
+        )
+
+    def adapt(self, img, input_lengths=None):
+        return self.compute_loss(img, input_lengths=input_lengths)
+
+    def count_parameters(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
 def test_model():

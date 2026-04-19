@@ -290,6 +290,70 @@ class HybridLoss(nn.Module):
         return total, losses
 
 
+class MAEHybridLoss(nn.Module):
+    """
+    HWMv8 loss: pixel-reconstruction MAE + optional CTC.
+
+    Fundamentally different from HybridLoss:
+      - No VICReg / InfoNCE — the MAE target is raw pixels, an
+        external signal the encoder cannot collapse onto. The
+        scale-collapse and trivial-mean failure modes that motivated
+        VICReg and InfoNCE in v5-v7 do not apply.
+      - Reconstruction loss is patch-normalised MSE (each patch
+        target is standardised, as in the MAE paper) so bright/dark
+        regions contribute equally.
+      - Loss averages only over ``valid_mask`` positions (masked AND
+        non-padding), not over the whole tensor.
+    """
+
+    def __init__(self, lambda_mae=1.0, lambda_ctc=1.0, norm_pixel_loss=True):
+        super().__init__()
+        self.lambda_mae = lambda_mae
+        self.lambda_ctc = lambda_ctc
+        self.norm_pixel_loss = norm_pixel_loss
+        self.ctc_loss = nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
+
+    def _patch_norm(self, target_pixels):
+        mean = target_pixels.mean(dim=-1, keepdim=True)
+        var = target_pixels.var(dim=-1, keepdim=True, unbiased=False)
+        return (target_pixels - mean) / torch.sqrt(var + 1e-6)
+
+    def forward(
+        self,
+        pred_pixels,        # (B, N, P) full grid predictions, or None
+        target_pixels,      # (B, N, P) ground-truth pixel patches, or None
+        valid_mask,         # (B, N) bool — positions to score (masked & valid)
+        ctc_logits=None,
+        targets=None,
+        input_lengths=None,
+        target_lengths=None,
+    ):
+        losses = {}
+        if pred_pixels is not None and target_pixels is not None:
+            if self.norm_pixel_loss:
+                target_pixels = self._patch_norm(target_pixels)
+            per_patch = ((pred_pixels - target_pixels) ** 2).mean(dim=-1)
+            denom = valid_mask.sum().clamp(min=1)
+            mae = (per_patch * valid_mask).sum() / denom
+            total = self.lambda_mae * mae
+            losses["mae"] = mae.detach().item()
+        else:
+            device = (
+                ctc_logits.device if ctc_logits is not None
+                else torch.device("cpu")
+            )
+            total = torch.zeros((), device=device)
+
+        if ctc_logits is not None and targets is not None:
+            ctc_input = ctc_logits.permute(1, 0, 2)
+            ctc = self.ctc_loss(ctc_input, targets, input_lengths, target_lengths)
+            total = total + self.lambda_ctc * ctc
+            losses["ctc"] = ctc.detach().item()
+
+        losses["total"] = total.detach().item() if isinstance(total, torch.Tensor) else float(total)
+        return total, losses
+
+
 def test_loss():
     """Test loss functions"""
     print("\nTesting Loss Functions...")

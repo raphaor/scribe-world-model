@@ -182,5 +182,51 @@ PROJ_HIDDEN_V7 = PROJ_HIDDEN_V6
 JEPA_PRED_LAYERS_V7 = 2
 
 
+# --- HWM-v8 ---
+# ViT encoder + MAE pretext. Structural change vs v5-v7: 2D patches
+# over the full line image (instead of 1D vertical strips), and raw
+# pixel reconstruction as the self-supervised target (instead of
+# InfoNCE on stop-grad embeddings). Pixels are external targets, so
+# there is no trivial-mean / scale-collapse failure mode.
+
+IMG_HEIGHT_V8 = 120
+# 15 divides 120 cleanly -> 8 vertical patches.
+PATCH_H_V8 = 15
+# 16 halves CTC horizontal resolution vs Kraken (W/16 vs W/8). Trade-off:
+# smaller patches multiply token count quadratically in attention. 16
+# keeps compute manageable for W up to ~2000.
+PATCH_W_V8 = 16
+
+EMBEDDING_DIM_V8 = 384
+NUM_LAYERS_V8 = 4
+NUM_HEADS_V8 = 8
+FF_DIM_V8 = 1536  # 4x expansion (standard ViT)
+
+# Decoder is smaller than the encoder (official MAE recipe: the decoder
+# exists only during pretraining and can afford to be cheap).
+DEC_DIM_V8 = 256
+DEC_LAYERS_V8 = 2
+DEC_HEADS_V8 = 8
+DEC_FF_V8 = 1024
+
+# 2D block masking. With N_v=8 and N_h typically ~50-100, 4 blocks of
+# (2-4 rows) x (4-16 cols) mask roughly 30-50 % of the grid.
+MASK_NUM_BLOCKS_V8 = 4
+MASK_MIN_H_V8 = 2
+MASK_MAX_H_V8 = 4
+MASK_MIN_W_V8 = 4
+MASK_MAX_W_V8 = 16
+
+# Upper bound on N_h. For patch_w=16 and max line width 2000, N_h<=125.
+# Positional embedding is sized up to MAX_N_H_V8 to allow larger lines.
+MAX_N_H_V8 = 400
+
+LAMBDA_MAE_V8 = 1.0
+LAMBDA_CTC_V8 = 0.5
+
+CTC_HIDDEN_V8 = 256
+CTC_NUM_LSTM_V8 = 1
+
+
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
