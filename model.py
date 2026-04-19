@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 
 from encoder import CNNEncoder, Conv2DEncoder, Conv2DEncoderV2, Conv2DEncoderV3, KrakenEncoder
-from predictor import TransformerPredictor
+from predictor import TransformerPredictor, JEPACrossAttnPredictor
 from loss import HWMLoss, HybridLoss
 from ctc_head import CTCHead, CTCHeadBiLSTM
 from jepa import sample_jepa_mask
@@ -547,6 +547,108 @@ class HWMv6(HWMv5):
         # Route both pred and target through the same projection head
         # before the loss. JEPA gradients now reach the encoder only
         # after passing through the projector.
+        p_pred = self.proj_head(z_pred_t)
+        p_tgt = self.proj_head(z_tgt_t)
+        return p_pred, p_tgt
+
+
+class HWMv7(HWMv6):
+    """
+    Handwriting World Model v7
+
+    v6 + true I-JEPA cross-attention predictor.
+
+    In v5/v6, the predictor did "in-place mask-token filling": target
+    positions in z_seq were replaced by a [MASK] token and the whole
+    sequence went through a bidirectional self-attention transformer.
+    The predictions were read out at target positions. Two problems:
+
+      - Context positions can attend to [MASK] tokens. The context
+        representation is subtly contaminated by the mask pattern.
+      - Self-attention among mask tokens at different target positions
+        lets them share info in ways that aren't a pure "predict from
+        context" operation.
+
+    v7 splits the two roles explicitly:
+
+      context_encoder = self.predictor (reused) run with
+          src_key_padding_mask hiding target + padding positions. Output
+          at context positions is a clean "context-aware" embedding.
+
+      jepa_predictor = new module (cross-attention decoder). Queries =
+          mask_token + positional encoding at every sequence position.
+          K/V = context encoder output. memory_key_padding_mask hides
+          target + padding from cross-attention. Mask tokens self-attend
+          among themselves and cross-attend to context; context never
+          sees the mask tokens.
+
+    Rest (projection head from v6, VICReg on raw z_seq, CTC on raw
+    z_seq) is unchanged.
+    """
+
+    def __init__(self, jepa_pred_layers=None, **kwargs):
+        super().__init__(**kwargs)
+        pred_layers = jepa_pred_layers or config.JEPA_PRED_LAYERS_V7
+        self.jepa_predictor = JEPACrossAttnPredictor(
+            embedding_dim=self.embedding_dim,
+            num_layers=pred_layers,
+            # Reuse the v5/v6 transformer head count and FFN width so
+            # the cross-attn predictor has a similar capacity profile.
+            num_heads=config.NUM_HEADS_V5,
+            ff_dim=config.FF_DIM_V5,
+        )
+
+    def _jepa_predict(self, z_seq, input_lengths=None):
+        B, T, D = z_seq.shape
+        target_mask = sample_jepa_mask(
+            B, T,
+            num_targets=self.jepa_num_targets,
+            min_size=self.jepa_min_size,
+            max_size=self.jepa_max_size,
+            valid_lengths=input_lengths,
+            device=z_seq.device,
+        )
+
+        # Positions to ignore as context: target blocks + padding beyond
+        # input_lengths. We pass this as src_key_padding_mask to the
+        # context encoder and as memory_key_padding_mask to the cross-
+        # attention predictor.
+        ctx_kpm = target_mask
+        if input_lengths is not None:
+            ar = torch.arange(T, device=z_seq.device)
+            pad_mask = ar[None, :] >= input_lengths[:, None]
+            ctx_kpm = target_mask | pad_mask
+
+        # Safety: if a row has all context positions hidden (very short
+        # line fully masked), unmask position 0 so attention softmax
+        # stays defined. This is extremely rare in practice.
+        all_masked = ctx_kpm.all(dim=1)
+        if all_masked.any():
+            ctx_kpm = ctx_kpm.clone()
+            ctx_kpm[all_masked, 0] = False
+
+        # Context encoder: bidirectional self-attention over z_seq with
+        # target+padding positions hidden from attention. Context output
+        # at non-masked positions is used as memory.
+        z_ctx_enc = self.predictor(z_seq, src_key_padding_mask=ctx_kpm)
+
+        # Cross-attention predictor: mask-token queries at every position
+        # attend to z_ctx_enc (with ctx_kpm hiding target+padding keys).
+        pred_full = self.jepa_predictor(
+            context=z_ctx_enc,
+            memory_key_padding_mask=ctx_kpm,
+            mask_token=self.mask_token,
+            seq_len=T,
+        )
+
+        if target_mask.any():
+            z_pred_t = pred_full[target_mask]
+            z_tgt_t = z_seq.detach()[target_mask]
+        else:
+            z_pred_t = pred_full[:, 0, :]
+            z_tgt_t = z_seq.detach()[:, 0, :]
+
+        # v6 projection head kept.
         p_pred = self.proj_head(z_pred_t)
         p_tgt = self.proj_head(z_tgt_t)
         return p_pred, p_tgt

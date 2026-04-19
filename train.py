@@ -34,7 +34,7 @@ from torch.utils.data import DataLoader, random_split
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config
-from model import HWMv2, HWMv3, HWMv4, HWMv5, HWMv6
+from model import HWMv2, HWMv3, HWMv4, HWMv5, HWMv6, HWMv7
 from data_alto import (
     AltoLineDataset,
     UnannotatedLineDataset,
@@ -372,7 +372,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train HWM")
     parser.add_argument("--mode", choices=["mixed", "full", "adapt"], default="mixed")
     parser.add_argument(
-        "--model-version", choices=["v2", "v3", "v4", "v5", "v6"], default="v5"
+        "--model-version", choices=["v2", "v3", "v4", "v5", "v6", "v7"], default="v5"
     )
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -465,7 +465,7 @@ if __name__ == "__main__":
 
     if args.data == "alto":
         ver = args.model_version
-        if ver in ("v5", "v6"):
+        if ver in ("v5", "v6", "v7"):
             img_h = config.IMG_HEIGHT_V5
             ws = None
             stride = None
@@ -495,7 +495,7 @@ if __name__ == "__main__":
             generator=torch.Generator().manual_seed(42),
         )
 
-        if ver in ("v5", "v6"):
+        if ver in ("v5", "v6", "v7"):
             collate = partial(collate_alto_v5_fn, char_to_idx=char_to_idx)
         else:
             collate = partial(
@@ -533,7 +533,7 @@ if __name__ == "__main__":
             adapt_ds = UnannotatedLineDataset(
                 unannotated_dirs, img_height=img_h, augment=True
             )
-            if ver in ("v5", "v6"):
+            if ver in ("v5", "v6", "v7"):
                 adapt_collate = collate_unannotated_v5_fn
             else:
                 adapt_collate = partial(
@@ -574,7 +574,7 @@ if __name__ == "__main__":
     else:
         model_num_classes = None
 
-    if ver in ("v5", "v6"):
+    if ver in ("v5", "v6", "v7"):
         target_norm = (
             args.target_norm
             if args.target_norm is not None
@@ -621,7 +621,7 @@ if __name__ == "__main__":
         if ver == "v5":
             model = HWMv5(**model_kwargs).to(device)
             save_path = "hwm_v5.pt"
-        else:
+        elif ver == "v6":
             print(
                 f"v6 projection head: in={config.EMBEDDING_DIM_V6} "
                 f"hidden={config.PROJ_HIDDEN_V6} out={config.PROJ_DIM_V6}"
@@ -632,6 +632,19 @@ if __name__ == "__main__":
                 **model_kwargs,
             ).to(device)
             save_path = "hwm_v6.pt"
+        else:
+            print(
+                f"v7 projection head: in={config.EMBEDDING_DIM_V7} "
+                f"hidden={config.PROJ_HIDDEN_V7} out={config.PROJ_DIM_V7} | "
+                f"cross-attn predictor: {config.JEPA_PRED_LAYERS_V7} layers"
+            )
+            model = HWMv7(
+                proj_dim=config.PROJ_DIM_V7,
+                proj_hidden=config.PROJ_HIDDEN_V7,
+                jepa_pred_layers=config.JEPA_PRED_LAYERS_V7,
+                **model_kwargs,
+            ).to(device)
+            save_path = "hwm_v7.pt"
     elif ver == "v4":
         model = HWMv4(
             img_height=config.IMG_HEIGHT_V4,

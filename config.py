@@ -151,5 +151,36 @@ PROJ_DIM_V6 = EMBEDDING_DIM_V5
 PROJ_HIDDEN_V6 = EMBEDDING_DIM_V5
 
 
+# --- HWM-v7 ---
+# v6 + true I-JEPA cross-attention predictor (queries = mask_token +
+# pos_enc at every position, K/V = context encoder output; targets
+# never see mask tokens). The existing transformer is reused as the
+# context encoder via src_key_padding_mask hiding target + padding.
+
+IMG_HEIGHT_V7 = IMG_HEIGHT_V5
+EMBEDDING_DIM_V7 = EMBEDDING_DIM_V5
+NUM_LAYERS_V7 = NUM_LAYERS_V5
+NUM_HEADS_V7 = NUM_HEADS_V5
+FF_DIM_V7 = FF_DIM_V5
+LAMBDA_CTC_V7 = LAMBDA_CTC_V5
+LAMBDA_PRED_V7 = LAMBDA_PRED_V5
+CTC_HIDDEN_V7 = CTC_HIDDEN_V5
+CTC_NUM_LSTM_V7 = CTC_NUM_LSTM_V5
+PRED_LOSS_V7 = PRED_LOSS_V5
+INFONCE_TEMP_V7 = INFONCE_TEMP_V5
+JEPA_NUM_TARGETS_V7 = JEPA_NUM_TARGETS_V5
+JEPA_MIN_SIZE_V7 = JEPA_MIN_SIZE_V5
+JEPA_MAX_SIZE_V7 = JEPA_MAX_SIZE_V5
+TARGET_NORM_V7 = TARGET_NORM_V5
+PROJ_DIM_V7 = PROJ_DIM_V6
+PROJ_HIDDEN_V7 = PROJ_HIDDEN_V6
+
+# Cross-attention predictor depth. Kept smaller than the context
+# encoder (NUM_LAYERS_V5 = 4): the bulk of representational work is
+# in the context encoder; the cross-attn block is a lightweight read-
+# out that maps "context + query position" -> "predicted embedding".
+JEPA_PRED_LAYERS_V7 = 2
+
+
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
