@@ -367,6 +367,164 @@ class ViTEncoder(nn.Module):
         return self.norm(tokens), (n_v, n_h)
 
 
+class HybridCNNViTEncoder(nn.Module):
+    """
+    CNN stem + Vision Transformer encoder (HWMv9).
+
+    The pure ViT in v8 projects raw pixels to tokens via a single
+    conv-stride layer. That dumps all low-level feature extraction
+    (edges, strokes, curvature) onto the transformer, which needs a
+    lot of data to learn those biases from scratch. A short CNN stem
+    in front of the patchifier bakes in the standard visual inductive
+    biases (locality, translation equivariance) cheaply, leaving the
+    transformer to focus on long-range reasoning.
+
+    Structure:
+
+        image (B, 1, H, W)
+          ↓ 2 conv+pool blocks (~¼ H, ¼ W)
+        features (B, C_stem, H/4, W/4)
+          ↓ Conv2d kernel=(patch_h, patch_w), stride=(patch_h, patch_w)
+        tokens (B, D, N_v, N_h)
+          ↓ add separable row/col pos-embed
+          ↓ transformer encoder blocks (pre-LN, GELU)
+        output (B, N_v*N_h, D)
+
+    Two entry points:
+
+    - ``patchify(img)`` runs stem + patch-embed and returns raw tokens
+      (no pos-embed, no transformer). Used by HWMv9's masked branch:
+      we substitute [MASK] tokens at masked positions before running
+      the transformer.
+    - ``transformer_pass(tokens, n_v, n_h, key_padding_mask)`` applies
+      pos-embed and the transformer stack. Called twice per step by
+      HWMv9 (clean branch, masked branch).
+    - ``forward(img, key_padding_mask)`` is the convenience full-path
+      (patchify + transformer_pass) used at inference.
+    """
+
+    def __init__(
+        self,
+        img_height=120,
+        stem_channels=64,
+        patch_h=3,
+        patch_w=4,
+        embedding_dim=384,
+        num_layers=4,
+        num_heads=8,
+        ff_dim=1536,
+        dropout=0.1,
+        max_n_h=400,
+    ):
+        super().__init__()
+        assert img_height % 4 == 0, (
+            f"img_height {img_height} must be divisible by 4 (stem pool)."
+        )
+        stem_h = img_height // 4
+        assert stem_h % patch_h == 0, (
+            f"stem_h {stem_h} must be divisible by patch_h {patch_h}"
+        )
+
+        self.img_height = img_height
+        self.stem_channels = stem_channels
+        self.patch_h = patch_h
+        self.patch_w = patch_w
+        self.embedding_dim = embedding_dim
+        self.n_v = stem_h // patch_h
+        # Total vertical stride image→token = 4 (stem) * patch_h.
+        # Total horizontal stride image→token = 4 (stem) * patch_w.
+        self.total_stride_h = 4 * patch_h
+        self.total_stride_w = 4 * patch_w
+
+        # Light 2-block CNN stem. BatchNorm + GELU, 2 x MaxPool2d(2) →
+        # divides both H and W by 4. Params kept small (~50k) so the
+        # transformer still does most of the heavy lifting.
+        self.cnn_stem = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.GELU(),
+            nn.MaxPool2d(2, 2),
+            nn.Conv2d(32, stem_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(stem_channels),
+            nn.GELU(),
+            nn.MaxPool2d(2, 2),
+        )
+
+        # Patch embed on the feature map. Non-overlapping conv.
+        self.patch_embed = nn.Conv2d(
+            in_channels=stem_channels,
+            out_channels=embedding_dim,
+            kernel_size=(patch_h, patch_w),
+            stride=(patch_h, patch_w),
+        )
+
+        # Separable learnable positional encoding (same scheme as ViT-v8).
+        self.row_embed = nn.Parameter(torch.zeros(self.n_v, embedding_dim))
+        self.col_embed = nn.Parameter(torch.zeros(max_n_h, embedding_dim))
+        nn.init.trunc_normal_(self.row_embed, std=0.02)
+        nn.init.trunc_normal_(self.col_embed, std=0.02)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embedding_dim,
+            nhead=num_heads,
+            dim_feedforward=ff_dim,
+            dropout=dropout,
+            batch_first=True,
+            activation="gelu",
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.norm = nn.LayerNorm(embedding_dim)
+
+    def _pos_embed(self, n_v, n_h):
+        pos = (
+            self.row_embed.unsqueeze(1)             # (N_v, 1, D)
+            + self.col_embed[:n_h].unsqueeze(0)     # (1, N_h, D)
+        )
+        return pos.reshape(n_v * n_h, -1)
+
+    def patchify(self, img):
+        """
+        Args:
+            img: (B, H, W) grayscale line image.
+        Returns:
+            tokens: (B, N_v*N_h, D) raw tokens (NO pos-embed, NO transformer).
+            grid:   (N_v, N_h) grid shape.
+        """
+        x = img.unsqueeze(1)                         # (B, 1, H, W)
+        feats = self.cnn_stem(x)                     # (B, C_stem, H/4, W/4)
+        tokens = self.patch_embed(feats)             # (B, D, N_v, N_h)
+        B, D, n_v, n_h = tokens.shape
+        assert n_v == self.n_v, (
+            f"n_v mismatch: expected {self.n_v}, got {n_v}"
+        )
+        assert n_h <= self.col_embed.size(0), (
+            f"n_h={n_h} exceeds max_n_h={self.col_embed.size(0)}. "
+            "Increase MAX_N_H_V9 or tighten max_width."
+        )
+        tokens = tokens.permute(0, 2, 3, 1).contiguous().reshape(B, n_v * n_h, D)
+        return tokens, (n_v, n_h)
+
+    def transformer_pass(self, tokens, n_v, n_h, src_key_padding_mask=None):
+        """
+        Args:
+            tokens: (B, N_v*N_h, D) raw tokens from ``patchify``, possibly
+                with some positions replaced by a learned [MASK] token.
+            n_v, n_h: grid shape.
+            src_key_padding_mask: (B, N_v*N_h) bool, True = ignore.
+        Returns:
+            out: (B, N_v*N_h, D) post-LN transformer output.
+        """
+        pos = self._pos_embed(n_v, n_h)
+        tokens = tokens + pos.unsqueeze(0)
+        out = self.transformer(tokens, src_key_padding_mask=src_key_padding_mask)
+        return self.norm(out)
+
+    def forward(self, img, src_key_padding_mask=None):
+        tokens, (n_v, n_h) = self.patchify(img)
+        return self.transformer_pass(tokens, n_v, n_h, src_key_padding_mask), (n_v, n_h)
+
+
 def test_encoder():
     """Test encoder on Pi"""
     print("Testing CNNEncoder...")

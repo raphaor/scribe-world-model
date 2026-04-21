@@ -34,7 +34,7 @@ from torch.utils.data import DataLoader, random_split
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config
-from model import HWMv2, HWMv3, HWMv4, HWMv5, HWMv6, HWMv7, HWMv8
+from model import HWMv2, HWMv3, HWMv4, HWMv5, HWMv6, HWMv7, HWMv8, HWMv9
 from data_alto import (
     AltoLineDataset,
     UnannotatedLineDataset,
@@ -399,7 +399,7 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=["mixed", "full", "adapt"], default="mixed")
     parser.add_argument(
         "--model-version",
-        choices=["v2", "v3", "v4", "v5", "v6", "v7", "v8"],
+        choices=["v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9"],
         default="v5",
     )
     parser.add_argument("--epochs", type=int, default=30)
@@ -493,8 +493,13 @@ if __name__ == "__main__":
 
     if args.data == "alto":
         ver = args.model_version
-        if ver in ("v5", "v6", "v7", "v8"):
-            img_h = config.IMG_HEIGHT_V8 if ver == "v8" else config.IMG_HEIGHT_V5
+        if ver in ("v5", "v6", "v7", "v8", "v9"):
+            if ver == "v9":
+                img_h = config.IMG_HEIGHT_V9
+            elif ver == "v8":
+                img_h = config.IMG_HEIGHT_V8
+            else:
+                img_h = config.IMG_HEIGHT_V5
             ws = None
             stride = None
         elif ver == "v4":
@@ -523,7 +528,7 @@ if __name__ == "__main__":
             generator=torch.Generator().manual_seed(42),
         )
 
-        if ver in ("v5", "v6", "v7", "v8"):
+        if ver in ("v5", "v6", "v7", "v8", "v9"):
             collate = partial(collate_alto_v5_fn, char_to_idx=char_to_idx)
         else:
             collate = partial(
@@ -561,7 +566,7 @@ if __name__ == "__main__":
             adapt_ds = UnannotatedLineDataset(
                 unannotated_dirs, img_height=img_h, augment=True
             )
-            if ver in ("v5", "v6", "v7", "v8"):
+            if ver in ("v5", "v6", "v7", "v8", "v9"):
                 adapt_collate = collate_unannotated_v5_fn
             else:
                 adapt_collate = partial(
@@ -721,6 +726,51 @@ if __name__ == "__main__":
             use_mae=use_mae,
         ).to(device)
         save_path = "hwm_v8.pt"
+    elif ver == "v9":
+        # v9: hybrid CNN+ViT + MSN (image-masked consistency) + SIGReg
+        # + linear CTC. ``--no-jepa`` zeroes the MSN term (CTC-only baseline).
+        if args.no_jepa:
+            lambda_msn = 0.0
+            use_msn = False
+        else:
+            lambda_msn = (
+                args.lambda_pred
+                if args.lambda_pred is not None
+                else config.LAMBDA_MSN_V9
+            )
+            use_msn = lambda_msn > 0
+        print(
+            f"v9 MSN config: use_msn={use_msn} lambda_msn={lambda_msn} "
+            f"lambda_sigreg={config.LAMBDA_SIGREG_V9} "
+            f"lambda_ctc={config.LAMBDA_CTC_V9} "
+            f"stem_ch={config.STEM_CHANNELS_V9} "
+            f"patch={config.PATCH_H_V9}x{config.PATCH_W_V9} "
+            f"embed_dim={config.EMBEDDING_DIM_V9} "
+            f"mask_blocks={config.MASK_NUM_BLOCKS_V9}"
+        )
+        model = HWMv9(
+            img_height=config.IMG_HEIGHT_V9,
+            stem_channels=config.STEM_CHANNELS_V9,
+            patch_h=config.PATCH_H_V9,
+            patch_w=config.PATCH_W_V9,
+            embedding_dim=config.EMBEDDING_DIM_V9,
+            num_layers=config.NUM_LAYERS_V9,
+            num_heads=config.NUM_HEADS_V9,
+            ff_dim=config.FF_DIM_V9,
+            dropout=config.DROPOUT,
+            num_classes=model_num_classes,
+            lambda_msn=lambda_msn,
+            lambda_sigreg=config.LAMBDA_SIGREG_V9,
+            lambda_ctc=config.LAMBDA_CTC_V9,
+            mask_num_blocks=config.MASK_NUM_BLOCKS_V9,
+            mask_min_h=config.MASK_MIN_H_V9,
+            mask_max_h=config.MASK_MAX_H_V9,
+            mask_min_w=config.MASK_MIN_W_V9,
+            mask_max_w=config.MASK_MAX_W_V9,
+            max_n_h=config.MAX_N_H_V9,
+            use_msn=use_msn,
+        ).to(device)
+        save_path = "hwm_v9.pt"
     elif ver == "v4":
         model = HWMv4(
             img_height=config.IMG_HEIGHT_V4,

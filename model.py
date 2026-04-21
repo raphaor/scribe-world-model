@@ -9,10 +9,10 @@ import torch.nn.functional as F
 
 from encoder import (
     CNNEncoder, Conv2DEncoder, Conv2DEncoderV2, Conv2DEncoderV3,
-    KrakenEncoder, ViTEncoder,
+    KrakenEncoder, ViTEncoder, HybridCNNViTEncoder,
 )
 from predictor import TransformerPredictor, JEPACrossAttnPredictor, MAEDecoder
-from loss import HWMLoss, HybridLoss, MAEHybridLoss
+from loss import HWMLoss, HybridLoss, MAEHybridLoss, MSNLoss
 from ctc_head import CTCHead, CTCHeadBiLSTM
 from jepa import sample_jepa_mask, sample_2d_block_mask
 import config
@@ -861,6 +861,221 @@ class HWMv8(nn.Module):
             pred_pixels=pred_pixels,
             target_pixels=target_pixels,
             valid_mask=scored_mask,
+            ctc_logits=ctc_logits,
+            targets=targets,
+            input_lengths=n_h_valid,
+            target_lengths=target_lengths,
+        )
+
+    def adapt(self, img, input_lengths=None):
+        return self.compute_loss(img, input_lengths=input_lengths)
+
+    def count_parameters(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+class HWMv9(nn.Module):
+    """
+    Handwriting World Model v9 — return to the LeWorldModel recipe,
+    modernised with a hybrid CNN+ViT encoder and image-level masking.
+
+    Motivation vs v5–v8:
+
+      - v5–v7 masked the *embeddings* (``z_seq``) and used contrastive
+        / predictor tricks to avoid scale collapse. v8 masked the
+        *image* and reconstructed raw pixels. v9 keeps the image-level
+         masking (2D blocks) but drops pixel reconstruction:
+        "same representation with and without the mask" is enforced
+        on the encoder output itself, as in MSN / data2vec.
+      - Encoder: hybrid CNN stem + ViT transformer. Pure ViT (v8)
+        needs lots of data to learn low-level features; a CNN stem
+        provides the standard visual inductive biases cheaply.
+      - Regulariser: SIGReg (LeWorldModel paper) instead of VICReg.
+      - CTC head: plain Linear (no BiLSTM). The transformer already
+        mixes context; another sequential head is redundant.
+
+    Flow:
+
+      image ─► CNN stem + patch_embed ─► tokens (B, N_v*N_h, D)
+            ├─► transformer ─► z_clean ─► vertical pool ─► Linear CTC
+            │                    │
+            │                    └────────── SIGReg
+            │
+            └─► sample 2D block mask
+                └─► replace masked tokens with [MASK]
+                    └─► transformer ─► z_masked
+                                         │
+                                         ▼
+                   MSE(z_masked, z_clean.detach()) at masked & valid
+    """
+
+    def __init__(
+        self,
+        img_height=120,
+        stem_channels=64,
+        patch_h=3,
+        patch_w=4,
+        embedding_dim=384,
+        num_layers=4,
+        num_heads=8,
+        ff_dim=1536,
+        dropout=0.1,
+        num_classes=None,
+        lambda_msn=1.0,
+        lambda_sigreg=0.1,
+        lambda_ctc=1.0,
+        mask_num_blocks=4,
+        mask_min_h=2,
+        mask_max_h=4,
+        mask_min_w=4,
+        mask_max_w=16,
+        max_n_h=400,
+        use_msn=True,
+    ):
+        super().__init__()
+        self.img_height = img_height
+        self.patch_h = patch_h
+        self.patch_w = patch_w
+        self.embedding_dim = embedding_dim
+        self.use_msn = use_msn
+        self.mask_num_blocks = mask_num_blocks
+        self.mask_min_h = mask_min_h
+        self.mask_max_h = mask_max_h
+        self.mask_min_w = mask_min_w
+        self.mask_max_w = mask_max_w
+        # Image→token stride (height and width). image_h/total_stride_h = N_v
+        # and image_w/total_stride_w = N_h.
+        self.total_stride_h = 4 * patch_h
+        self.total_stride_w = 4 * patch_w
+        self.n_v = img_height // self.total_stride_h
+
+        self.encoder = HybridCNNViTEncoder(
+            img_height=img_height,
+            stem_channels=stem_channels,
+            patch_h=patch_h,
+            patch_w=patch_w,
+            embedding_dim=embedding_dim,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            ff_dim=ff_dim,
+            dropout=dropout,
+            max_n_h=max_n_h,
+        )
+
+        # Learnable [MASK] token substituted at masked grid positions.
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, embedding_dim))
+        nn.init.trunc_normal_(self.mask_token, std=0.02)
+
+        # Plain linear CTC head — transformer already contextualises.
+        self.ctc_head = (
+            CTCHead(embedding_dim, num_classes) if num_classes else None
+        )
+
+        self.criterion = MSNLoss(
+            lambda_msn=lambda_msn,
+            lambda_sigreg=lambda_sigreg,
+            lambda_ctc=lambda_ctc,
+        )
+
+    def _round_up_width(self, img):
+        W = img.shape[-1]
+        pad = (self.total_stride_w - W % self.total_stride_w) % self.total_stride_w
+        if pad > 0:
+            img = F.pad(img, (0, pad))
+        return img
+
+    def _convert_lengths_to_patches(self, input_lengths):
+        """
+        Collate gives input_lengths in Kraken units (W // 8). v9 encoder
+        downsamples by total_stride_w = 16, so factor = 2.
+        """
+        factor = max(1, self.total_stride_w // 8)
+        return input_lengths // factor
+
+    def _padding_mask(self, n_h_valid, n_v, n_h, device):
+        B = n_h_valid.size(0)
+        ar = torch.arange(n_h, device=device)
+        col_pad = ar[None, :] >= n_h_valid[:, None]          # (B, N_h)
+        pad2d = col_pad.unsqueeze(1).expand(B, n_v, n_h)
+        return pad2d.reshape(B, n_v * n_h)
+
+    def _pool_vertical(self, tokens, n_v, n_h):
+        B, _, D = tokens.shape
+        return tokens.reshape(B, n_v, n_h, D).mean(dim=1)    # (B, N_h, D)
+
+    def forward(self, img):
+        """
+        Inference forward: encoder + vertical pool + CTC head. Returned
+        tuple follows the (pred, z_seq, ctc_logits) contract used by the
+        evaluation pipeline.
+        """
+        img = self._round_up_width(img)
+        tokens, (n_v, n_h) = self.encoder(img)
+        z_seq = self._pool_vertical(tokens, n_v, n_h)
+        ctc_logits = self.ctc_head(z_seq) if self.ctc_head is not None else None
+        return None, z_seq, ctc_logits
+
+    def compute_loss(
+        self, img, targets=None, input_lengths=None, target_lengths=None
+    ):
+        img = self._round_up_width(img)
+        B, H, W = img.shape
+        n_v = self.n_v
+        n_h = W // self.total_stride_w
+
+        n_h_valid = None
+        pad_mask_flat = None
+        if input_lengths is not None:
+            n_h_valid = torch.clamp(
+                self._convert_lengths_to_patches(input_lengths), max=n_h
+            )
+            pad_mask_flat = self._padding_mask(n_h_valid, n_v, n_h, img.device)
+
+        # 1. CNN stem + patch embed (runs once, shared by both branches).
+        tokens_raw, (n_v_g, n_h_g) = self.encoder.patchify(img)
+
+        # 2. Clean branch — pos-embed + transformer. With grad: trains
+        # encoder through CTC and SIGReg.
+        z_clean = self.encoder.transformer_pass(
+            tokens_raw, n_v_g, n_h_g, src_key_padding_mask=pad_mask_flat
+        )
+
+        # 3. Vertical pool → Linear CTC.
+        z_seq = self._pool_vertical(z_clean, n_v_g, n_h_g)
+        ctc_logits = self.ctc_head(z_seq) if self.ctc_head is not None else None
+
+        # 4. Masked branch — substitute [MASK] at masked positions, run
+        # transformer again. MSN loss pulls z_masked toward z_clean.detach()
+        # at masked positions.
+        z_masked = None
+        mask_flat = None
+        valid_flat = None
+        if self.use_msn:
+            mask2d = sample_2d_block_mask(
+                B, n_v_g, n_h_g,
+                num_blocks=self.mask_num_blocks,
+                min_h=self.mask_min_h, max_h=self.mask_max_h,
+                min_w=self.mask_min_w, max_w=self.mask_max_w,
+                valid_h_lengths=n_h_valid, device=img.device,
+            )
+            mask_flat = mask2d.reshape(B, n_v_g * n_h_g)
+            mask_tok = self.mask_token.expand(B, n_v_g * n_h_g, -1)
+            tokens_masked = torch.where(
+                mask_flat.unsqueeze(-1), mask_tok, tokens_raw
+            )
+            z_masked = self.encoder.transformer_pass(
+                tokens_masked, n_v_g, n_h_g, src_key_padding_mask=pad_mask_flat
+            )
+            valid_flat = (
+                ~pad_mask_flat if pad_mask_flat is not None
+                else torch.ones_like(mask_flat)
+            )
+
+        return self.criterion(
+            z_masked=z_masked,
+            z_clean=z_clean,
+            mask_flat=mask_flat,
+            valid_flat=valid_flat,
             ctc_logits=ctc_logits,
             targets=targets,
             input_lengths=n_h_valid,

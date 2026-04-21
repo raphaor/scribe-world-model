@@ -354,6 +354,85 @@ class MAEHybridLoss(nn.Module):
         return total, losses
 
 
+class MSNLoss(nn.Module):
+    """
+    HWMv9 loss: MSN-style masked-image consistency + SIGReg + optional CTC.
+
+    The pretext is "same abstraction with and without the mask":
+
+        image ─┬─► encoder ─► z_clean (gradient flows → CTC + SIGReg)
+               │
+               └─► [mask 2D patches as [MASK] tokens] ─► encoder
+                           ─► z_masked (gradient flows → MSN)
+
+        L_msn = MSE(z_masked, z_clean.detach()) at masked, non-padding positions
+
+    Key design points:
+
+    - The MSN target is ``z_clean.detach()`` — only the masked branch
+      gets gradients from the MSN term. The clean branch still gets
+      gradients from CTC and SIGReg, so the encoder is trained end-to-end.
+    - No EMA teacher, no projection head, no prototype assignments.
+      Just "predict your own clean representation from partial input".
+    - SIGReg (LeWorldModel paper, `SIGRegLoss`) on the raw clean output
+      is the anti-collapse guard. Without it, the trivial solution
+      ``z_masked = z_clean = const`` satisfies MSN perfectly.
+    """
+
+    def __init__(self, lambda_msn=1.0, lambda_sigreg=0.1, lambda_ctc=1.0):
+        super().__init__()
+        self.lambda_msn = lambda_msn
+        self.lambda_sigreg = lambda_sigreg
+        self.lambda_ctc = lambda_ctc
+        self.sigreg = SIGRegLoss(lambda_reg=1.0)
+        self.ctc_loss = nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
+
+    def forward(
+        self,
+        z_masked,            # (B, N, D) student output, or None (CTC-only)
+        z_clean,             # (B, N, D) teacher output (not yet detached)
+        mask_flat,           # (B, N) bool — True = masked (target) position
+        valid_flat,          # (B, N) bool — True = non-padding position
+        ctc_logits=None,
+        targets=None,
+        input_lengths=None,
+        target_lengths=None,
+    ):
+        losses = {}
+        total = None
+
+        if z_masked is not None and z_clean is not None and mask_flat is not None:
+            # MSE at masked, non-padding positions only.
+            scored = mask_flat & valid_flat if valid_flat is not None else mask_flat
+            per_pos = ((z_masked - z_clean.detach()) ** 2).mean(dim=-1)
+            denom = scored.sum().clamp(min=1)
+            msn = (per_pos * scored).sum() / denom
+            losses["msn"] = msn.detach().item()
+
+            # SIGReg on the clean encoder output (trains encoder).
+            reg = self.sigreg(z_clean)
+            losses["sigreg"] = reg.detach().item()
+
+            total = self.lambda_msn * msn + self.lambda_sigreg * reg
+        else:
+            device = (
+                ctc_logits.device if ctc_logits is not None
+                else torch.device("cpu")
+            )
+            total = torch.zeros((), device=device)
+
+        if ctc_logits is not None and targets is not None:
+            ctc_input = ctc_logits.permute(1, 0, 2)
+            ctc = self.ctc_loss(ctc_input, targets, input_lengths, target_lengths)
+            total = total + self.lambda_ctc * ctc
+            losses["ctc"] = ctc.detach().item()
+
+        losses["total"] = (
+            total.detach().item() if isinstance(total, torch.Tensor) else float(total)
+        )
+        return total, losses
+
+
 def test_loss():
     """Test loss functions"""
     print("\nTesting Loss Functions...")

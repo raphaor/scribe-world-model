@@ -228,5 +228,43 @@ CTC_HIDDEN_V8 = 256
 CTC_NUM_LSTM_V8 = 1
 
 
+# --- HWM-v9 ---
+# Return to the LeWorldModel recipe (SIGReg) with image-level masking
+# (MSN / data2vec style) and a hybrid CNN+ViT encoder. The CNN stem
+# halves the representation-learning load that a pure ViT would carry,
+# which matters on small HTR datasets.
+
+IMG_HEIGHT_V9 = 120
+# CNN stem reduces 120 → 30 vertically and W → W/4 horizontally via
+# 2 × MaxPool(2,2). Patch embed on the feature map uses a small
+# non-overlapping patch. Net image→token stride: 12 rows, 16 cols.
+STEM_CHANNELS_V9 = 64
+PATCH_H_V9 = 3
+PATCH_W_V9 = 4
+
+EMBEDDING_DIM_V9 = 384
+NUM_LAYERS_V9 = 4
+NUM_HEADS_V9 = 8
+FF_DIM_V9 = 1536
+
+# Loss weights. lambda_msn is the SSL consistency term; lambda_sigreg
+# is the anti-collapse regulariser (paper default style).
+LAMBDA_MSN_V9 = 1.0
+LAMBDA_SIGREG_V9 = 0.1
+LAMBDA_CTC_V9 = 0.5
+
+# 2D block mask. Grid is N_v=10 rows × (W/16) cols. Blocks of 2-4 rows
+# by 4-16 cols mask ~30-50 % of the valid region.
+MASK_NUM_BLOCKS_V9 = 4
+MASK_MIN_H_V9 = 2
+MASK_MAX_H_V9 = 4
+MASK_MIN_W_V9 = 4
+MASK_MAX_W_V9 = 16
+
+# Upper bound on N_h for positional embedding. For patch stride 16 and
+# max line width ~2000, N_h <= 125; 400 leaves plenty of slack.
+MAX_N_H_V9 = 400
+
+
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
