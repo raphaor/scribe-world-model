@@ -896,17 +896,22 @@ class HWMv9(nn.Module):
 
     Flow:
 
-      image ─► CNN stem + patch_embed ─► tokens (B, N_v*N_h, D)
-            ├─► transformer ─► z_clean ─► vertical pool ─► Linear CTC
-            │                    │
-            │                    └────────── SIGReg
-            │
-            └─► sample 2D block mask
-                └─► replace masked tokens with [MASK]
-                    └─► transformer ─► z_masked
-                                         │
-                                         ▼
-                   MSE(z_masked, z_clean.detach()) at masked & valid
+      image ─┬─► CNN stem + patch_embed ─► transformer ─► z_clean
+             │                                              │
+             │                            ┌─ vertical pool ─┴─► Linear CTC
+             │                            └─ SIGReg
+             │
+             └─► sample 2D block mask + upsample to pixel resolution
+                 ─► replace masked PIXELS with learnable scalar
+                 ─► CNN stem + patch_embed + transformer ─► z_masked
+                                                              │
+                                                              ▼
+                              MSE(z_masked, z_clean.detach()) at masked & valid
+
+    Pixel-space masking (vs token-space) is the key fix: with token-
+    space masking, the CNN stem's receptive field overlap let adjacent
+    unmasked tokens leak masked-region info, collapsing the pretext
+    task in a few hundred batches.
     """
 
     def __init__(
@@ -962,9 +967,15 @@ class HWMv9(nn.Module):
             max_n_h=max_n_h,
         )
 
-        # Learnable [MASK] token substituted at masked grid positions.
-        self.mask_token = nn.Parameter(torch.zeros(1, 1, embedding_dim))
-        nn.init.trunc_normal_(self.mask_token, std=0.02)
+        # Learnable scalar substituted in the input image at masked
+        # positions, BEFORE the CNN stem. Token-level masking (replace
+        # tokens after patch_embed) leaked masked-region info into
+        # adjacent unmasked tokens via the stem's overlapping receptive
+        # field — observed as msn dropping to ~0.02 in a few hundred
+        # batches with sigreg staying low. Pixel-space masking keeps a
+        # tiny RF leak at the boundary of each block but cuts the bulk
+        # of the shortcut.
+        self.mask_pixel = nn.Parameter(torch.zeros(()))
 
         # Plain linear CTC head — transformer already contextualises.
         self.ctc_head = (
@@ -1031,22 +1042,24 @@ class HWMv9(nn.Module):
             )
             pad_mask_flat = self._padding_mask(n_h_valid, n_v, n_h, img.device)
 
-        # 1. CNN stem + patch embed (runs once, shared by both branches).
-        tokens_raw, (n_v_g, n_h_g) = self.encoder.patchify(img)
-
-        # 2. Clean branch — pos-embed + transformer. With grad: trains
-        # encoder through CTC and SIGReg.
+        # 1. Clean branch — full image through CNN stem + patch embed +
+        # pos-embed + transformer. With grad: trains encoder through CTC
+        # and SIGReg.
+        tokens_clean, (n_v_g, n_h_g) = self.encoder.patchify(img)
         z_clean = self.encoder.transformer_pass(
-            tokens_raw, n_v_g, n_h_g, src_key_padding_mask=pad_mask_flat
+            tokens_clean, n_v_g, n_h_g, src_key_padding_mask=pad_mask_flat
         )
 
-        # 3. Vertical pool → Linear CTC.
+        # 2. Vertical pool → Linear CTC.
         z_seq = self._pool_vertical(z_clean, n_v_g, n_h_g)
         ctc_logits = self.ctc_head(z_seq) if self.ctc_head is not None else None
 
-        # 4. Masked branch — substitute [MASK] at masked positions, run
-        # transformer again. MSN loss pulls z_masked toward z_clean.detach()
-        # at masked positions.
+        # 3. Masked branch — sample a 2D block mask on the token grid,
+        # upsample it to pixel resolution, replace masked PIXELS with
+        # a learnable scalar, then re-run the full encoder. The CNN
+        # stem now sees zeroed (or learned-mask-value) pixels in masked
+        # blocks, so adjacent unmasked tokens cannot leak masked-region
+        # info via the receptive field overlap.
         z_masked = None
         mask_flat = None
         valid_flat = None
@@ -1059,10 +1072,18 @@ class HWMv9(nn.Module):
                 valid_h_lengths=n_h_valid, device=img.device,
             )
             mask_flat = mask2d.reshape(B, n_v_g * n_h_g)
-            mask_tok = self.mask_token.expand(B, n_v_g * n_h_g, -1)
-            tokens_masked = torch.where(
-                mask_flat.unsqueeze(-1), mask_tok, tokens_raw
+
+            # Upsample (B, n_v, n_h) bool to (B, H, W) bool by repeating
+            # each grid cell over its corresponding pixel block.
+            pixel_mask = (
+                mask2d.repeat_interleave(self.total_stride_h, dim=1)
+                       .repeat_interleave(self.total_stride_w, dim=2)
             )
+            img_masked = torch.where(
+                pixel_mask, self.mask_pixel.expand_as(img), img
+            )
+
+            tokens_masked, _ = self.encoder.patchify(img_masked)
             z_masked = self.encoder.transformer_pass(
                 tokens_masked, n_v_g, n_h_g, src_key_padding_mask=pad_mask_flat
             )
