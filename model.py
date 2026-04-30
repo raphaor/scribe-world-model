@@ -3,16 +3,22 @@ HWM-v1 Model - Handwriting World Model
 Complete architecture combining encoder and predictor
 """
 
+import contextlib
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from encoder import (
-    CNNEncoder, Conv2DEncoder, Conv2DEncoderV2, Conv2DEncoderV3,
-    KrakenEncoder, ViTEncoder, HybridCNNViTEncoder,
+    CNNEncoder,
+    Conv2DEncoder,
+    Conv2DEncoderV2,
+    Conv2DEncoderV3,
+    KrakenEncoder,
+    ViTEncoder,
+    HybridCNNViTEncoder,
 )
 from predictor import TransformerPredictor, JEPACrossAttnPredictor, MAEDecoder
-from loss import HWMLoss, HybridLoss, MAEHybridLoss, MSNLoss
+from loss import HWMLoss, HybridLoss, MAEHybridLoss, MSNLoss, JEPALoss
 from ctc_head import CTCHead, CTCHeadBiLSTM
 from jepa import sample_jepa_mask, sample_2d_block_mask
 import config
@@ -98,8 +104,8 @@ class HWMv1(nn.Module):
             z_pred: (B, T-1, D) predicted next embedding at each position
             z_seq: (B, T, D) all embeddings
         """
-        z_seq = self.encode_sequence(img_columns)       # (B, T, D)
-        z_pred = self.predictor(z_seq[:, :-1, :])       # (B, T-1, D)
+        z_seq = self.encode_sequence(img_columns)  # (B, T, D)
+        z_pred = self.predictor(z_seq[:, :-1, :])  # (B, T-1, D)
         return z_pred, z_seq
 
     def compute_loss(self, img_columns):
@@ -111,7 +117,7 @@ class HWMv1(nn.Module):
             total_loss, losses_dict
         """
         z_pred, z_seq = self.forward(img_columns)
-        z_target = z_seq[:, 1:, :].detach()             # (B, T-1, D)
+        z_target = z_seq[:, 1:, :].detach()  # (B, T-1, D)
         total_loss, losses_dict = self.criterion(z_pred, z_target, z_seq)
         return total_loss, losses_dict
 
@@ -185,8 +191,8 @@ class HWMv2(nn.Module):
         return z_seq
 
     def forward(self, img_columns):
-        z_seq = self.encode_sequence(img_columns)       # (B, T, D)
-        z_pred = self.predictor(z_seq[:, :-1, :])       # (B, T-1, D)
+        z_seq = self.encode_sequence(img_columns)  # (B, T, D)
+        z_pred = self.predictor(z_seq[:, :-1, :])  # (B, T-1, D)
         ctc_logits = self.ctc_head(z_seq) if self.ctc_head else None
         return z_pred, z_seq, ctc_logits
 
@@ -194,14 +200,14 @@ class HWMv2(nn.Module):
         self, img_columns, targets=None, input_lengths=None, target_lengths=None
     ):
         z_pred, z_seq, ctc_logits = self.forward(img_columns)
-        z_target = z_seq[:, 1:, :].detach()             # (B, T-1, D)
+        z_target = z_seq[:, 1:, :].detach()  # (B, T-1, D)
         return self.criterion(
             z_pred, z_target, z_seq, ctc_logits, targets, input_lengths, target_lengths
         )
 
     def adapt(self, img_columns):
         z_pred, z_seq, _ = self.forward(img_columns)
-        z_target = z_seq[:, 1:, :].detach()             # (B, T-1, D)
+        z_target = z_seq[:, 1:, :].detach()  # (B, T-1, D)
         return self.criterion(z_pred, z_target, z_seq)
 
     def count_parameters(self):
@@ -247,8 +253,8 @@ class HWMv3(nn.Module):
         return z_seq
 
     def forward(self, img_columns):
-        z_seq = self.encode_sequence(img_columns)       # (B, T, D)
-        z_pred = self.predictor(z_seq[:, :-1, :])       # (B, T-1, D)
+        z_seq = self.encode_sequence(img_columns)  # (B, T, D)
+        z_pred = self.predictor(z_seq[:, :-1, :])  # (B, T-1, D)
         ctc_logits = self.ctc_head(z_seq) if self.ctc_head else None
         return z_pred, z_seq, ctc_logits
 
@@ -256,14 +262,14 @@ class HWMv3(nn.Module):
         self, img_columns, targets=None, input_lengths=None, target_lengths=None
     ):
         z_pred, z_seq, ctc_logits = self.forward(img_columns)
-        z_target = z_seq[:, 1:, :].detach()             # (B, T-1, D)
+        z_target = z_seq[:, 1:, :].detach()  # (B, T-1, D)
         return self.criterion(
             z_pred, z_target, z_seq, ctc_logits, targets, input_lengths, target_lengths
         )
 
     def adapt(self, img_columns):
         z_pred, z_seq, _ = self.forward(img_columns)
-        z_target = z_seq[:, 1:, :].detach()             # (B, T-1, D)
+        z_target = z_seq[:, 1:, :].detach()  # (B, T-1, D)
         return self.criterion(z_pred, z_target, z_seq)
 
     def count_parameters(self):
@@ -316,7 +322,8 @@ class HWMv4(nn.Module):
         )
         self.ctc_head = (
             CTCHeadBiLSTM(embedding_dim, num_classes, hidden_dim=ctc_hidden)
-            if num_classes else None
+            if num_classes
+            else None
         )
         self.criterion = HybridLoss(lambda_sigreg, lambda_ctc)
 
@@ -328,8 +335,8 @@ class HWMv4(nn.Module):
         return z_seq
 
     def forward(self, img_columns):
-        z_seq = self.encode_sequence(img_columns)       # (B, T, D)
-        z_pred = self.predictor(z_seq[:, :-1, :])       # (B, T-1, D)
+        z_seq = self.encode_sequence(img_columns)  # (B, T, D)
+        z_pred = self.predictor(z_seq[:, :-1, :])  # (B, T-1, D)
         ctc_logits = self.ctc_head(z_seq) if self.ctc_head else None
         return z_pred, z_seq, ctc_logits
 
@@ -337,14 +344,14 @@ class HWMv4(nn.Module):
         self, img_columns, targets=None, input_lengths=None, target_lengths=None
     ):
         z_pred, z_seq, ctc_logits = self.forward(img_columns)
-        z_target = z_seq[:, 1:, :].detach()             # (B, T-1, D)
+        z_target = z_seq[:, 1:, :].detach()  # (B, T-1, D)
         return self.criterion(
             z_pred, z_target, z_seq, ctc_logits, targets, input_lengths, target_lengths
         )
 
     def adapt(self, img_columns):
         z_pred, z_seq, _ = self.forward(img_columns)
-        z_target = z_seq[:, 1:, :].detach()             # (B, T-1, D)
+        z_target = z_seq[:, 1:, :].detach()  # (B, T-1, D)
         return self.criterion(z_pred, z_target, z_seq)
 
     def count_parameters(self):
@@ -395,12 +402,22 @@ class HWMv5(nn.Module):
         # Non-causal predictor: bidirectional attention over the latent
         # sequence, used to reconstruct masked target blocks from context.
         self.predictor = TransformerPredictor(
-            embedding_dim, num_layers, num_heads, ff_dim, dropout, causal=False,
+            embedding_dim,
+            num_layers,
+            num_heads,
+            ff_dim,
+            dropout,
+            causal=False,
         )
         self.ctc_head = (
-            CTCHeadBiLSTM(embedding_dim, num_classes, hidden_dim=ctc_hidden,
-                          num_lstm_layers=ctc_num_lstm)
-            if num_classes else None
+            CTCHeadBiLSTM(
+                embedding_dim,
+                num_classes,
+                hidden_dim=ctc_hidden,
+                num_lstm_layers=ctc_num_lstm,
+            )
+            if num_classes
+            else None
         )
         # Learnable [MASK] token swapped in at target positions.
         self.mask_token = nn.Parameter(torch.zeros(1, 1, embedding_dim))
@@ -423,7 +440,7 @@ class HWMv5(nn.Module):
         Returns:
             (None, z_seq, ctc_logits) — tuple kept for call-site compat.
         """
-        z_seq = self.encoder(img)                        # (B, T, D)
+        z_seq = self.encoder(img)  # (B, T, D)
         ctc_logits = self.ctc_head(z_seq) if self.ctc_head is not None else None
         return None, z_seq, ctc_logits
 
@@ -437,7 +454,8 @@ class HWMv5(nn.Module):
         """
         B, T, D = z_seq.shape
         mask = sample_jepa_mask(
-            B, T,
+            B,
+            T,
             num_targets=self.jepa_num_targets,
             min_size=self.jepa_min_size,
             max_size=self.jepa_max_size,
@@ -446,11 +464,11 @@ class HWMv5(nn.Module):
         )
         mask_tok = self.mask_token.expand(B, T, D)
         z_ctx = torch.where(mask.unsqueeze(-1), mask_tok, z_seq)
-        z_pred_full = self.predictor(z_ctx)               # (B, T, D), non-causal
+        z_pred_full = self.predictor(z_ctx)  # (B, T, D), non-causal
 
         if mask.any():
-            z_pred_t = z_pred_full[mask]                  # (N, D)
-            z_tgt_t = z_seq.detach()[mask]                # (N, D)
+            z_pred_t = z_pred_full[mask]  # (N, D)
+            z_tgt_t = z_seq.detach()[mask]  # (N, D)
         else:
             # Degenerate case (sequence shorter than min block size):
             # no targets sampled. Use the first position so the loss is
@@ -460,9 +478,7 @@ class HWMv5(nn.Module):
 
         return z_pred_t, z_tgt_t
 
-    def compute_loss(
-        self, img, targets=None, input_lengths=None, target_lengths=None
-    ):
+    def compute_loss(self, img, targets=None, input_lengths=None, target_lengths=None):
         z_seq = self.encoder(img)
         if self.use_jepa:
             z_pred_t, z_tgt_t = self._jepa_predict(z_seq, input_lengths)
@@ -470,8 +486,13 @@ class HWMv5(nn.Module):
             z_pred_t, z_tgt_t = None, None
         ctc_logits = self.ctc_head(z_seq) if self.ctc_head is not None else None
         return self.criterion(
-            z_pred_t, z_tgt_t, z_seq,
-            ctc_logits, targets, input_lengths, target_lengths,
+            z_pred_t,
+            z_tgt_t,
+            z_seq,
+            ctc_logits,
+            targets,
+            input_lengths,
+            target_lengths,
         )
 
     def adapt(self, img, input_lengths=None):
@@ -530,7 +551,8 @@ class HWMv6(HWMv5):
     def _jepa_predict(self, z_seq, input_lengths=None):
         B, T, D = z_seq.shape
         mask = sample_jepa_mask(
-            B, T,
+            B,
+            T,
             num_targets=self.jepa_num_targets,
             min_size=self.jepa_min_size,
             max_size=self.jepa_max_size,
@@ -605,7 +627,8 @@ class HWMv7(HWMv6):
     def _jepa_predict(self, z_seq, input_lengths=None):
         B, T, D = z_seq.shape
         target_mask = sample_jepa_mask(
-            B, T,
+            B,
+            T,
             num_targets=self.jepa_num_targets,
             min_size=self.jepa_min_size,
             max_size=self.jepa_max_size,
@@ -758,15 +781,15 @@ class HWMv8(nn.Module):
         )
         self.ctc_head = (
             CTCHeadBiLSTM(
-                embedding_dim, num_classes,
-                hidden_dim=ctc_hidden, num_lstm_layers=ctc_num_lstm,
+                embedding_dim,
+                num_classes,
+                hidden_dim=ctc_hidden,
+                num_lstm_layers=ctc_num_lstm,
             )
             if num_classes
             else None
         )
-        self.criterion = MAEHybridLoss(
-            lambda_mae=lambda_mae, lambda_ctc=lambda_ctc
-        )
+        self.criterion = MAEHybridLoss(lambda_mae=lambda_mae, lambda_ctc=lambda_ctc)
 
     def _round_up_width(self, img):
         """Right-pad image width to a multiple of patch_w."""
@@ -788,7 +811,7 @@ class HWMv8(nn.Module):
         """(B, n_v*n_h) True = padding position (column >= n_h_valid[b])."""
         B = n_h_valid.size(0)
         ar = torch.arange(n_h, device=device)
-        col_pad = ar[None, :] >= n_h_valid[:, None]     # (B, N_h)
+        col_pad = ar[None, :] >= n_h_valid[:, None]  # (B, N_h)
         pad2d = col_pad.unsqueeze(1).expand(B, n_v, n_h)
         return pad2d.reshape(B, n_v * n_h)
 
@@ -808,9 +831,7 @@ class HWMv8(nn.Module):
         ctc_logits = self.ctc_head(z_seq) if self.ctc_head is not None else None
         return None, z_seq, ctc_logits
 
-    def compute_loss(
-        self, img, targets=None, input_lengths=None, target_lengths=None
-    ):
+    def compute_loss(self, img, targets=None, input_lengths=None, target_lengths=None):
         img = self._round_up_width(img)
         B, H, W = img.shape
         n_v = self.n_v
@@ -834,25 +855,32 @@ class HWMv8(nn.Module):
         scored_mask = None
         if self.use_mae and self.decoder is not None:
             mask2d = sample_2d_block_mask(
-                B, n_v_g, n_h_g,
+                B,
+                n_v_g,
+                n_h_g,
                 num_blocks=self.mask_num_blocks,
-                min_h=self.mask_min_h, max_h=self.mask_max_h,
-                min_w=self.mask_min_w, max_w=self.mask_max_w,
-                valid_h_lengths=n_h_valid, device=img.device,
+                min_h=self.mask_min_h,
+                max_h=self.mask_max_h,
+                min_w=self.mask_min_w,
+                max_w=self.mask_max_w,
+                valid_h_lengths=n_h_valid,
+                device=img.device,
             )
             mask_flat = mask2d.reshape(B, n_v_g * n_h_g)
 
             pred_pixels = self.decoder(
                 enc_tokens=tokens,
                 mask_flat=mask_flat,
-                n_v=n_v_g, n_h=n_h_g,
+                n_v=n_v_g,
+                n_h=n_h_g,
                 key_padding_mask=pad_mask_flat,
             )
             target_pixels = self.encoder.patchify_pixels(img).reshape(
                 B, n_v_g * n_h_g, -1
             )
             valid = (
-                ~pad_mask_flat if pad_mask_flat is not None
+                ~pad_mask_flat
+                if pad_mask_flat is not None
                 else torch.ones_like(mask_flat)
             )
             scored_mask = mask_flat & valid
@@ -978,9 +1006,7 @@ class HWMv9(nn.Module):
         self.mask_pixel = nn.Parameter(torch.zeros(()))
 
         # Plain linear CTC head — transformer already contextualises.
-        self.ctc_head = (
-            CTCHead(embedding_dim, num_classes) if num_classes else None
-        )
+        self.ctc_head = CTCHead(embedding_dim, num_classes) if num_classes else None
 
         self.criterion = MSNLoss(
             lambda_msn=lambda_msn,
@@ -1006,13 +1032,13 @@ class HWMv9(nn.Module):
     def _padding_mask(self, n_h_valid, n_v, n_h, device):
         B = n_h_valid.size(0)
         ar = torch.arange(n_h, device=device)
-        col_pad = ar[None, :] >= n_h_valid[:, None]          # (B, N_h)
+        col_pad = ar[None, :] >= n_h_valid[:, None]  # (B, N_h)
         pad2d = col_pad.unsqueeze(1).expand(B, n_v, n_h)
         return pad2d.reshape(B, n_v * n_h)
 
     def _pool_vertical(self, tokens, n_v, n_h):
         B, _, D = tokens.shape
-        return tokens.reshape(B, n_v, n_h, D).mean(dim=1)    # (B, N_h, D)
+        return tokens.reshape(B, n_v, n_h, D).mean(dim=1)  # (B, N_h, D)
 
     def forward(self, img):
         """
@@ -1026,9 +1052,7 @@ class HWMv9(nn.Module):
         ctc_logits = self.ctc_head(z_seq) if self.ctc_head is not None else None
         return None, z_seq, ctc_logits
 
-    def compute_loss(
-        self, img, targets=None, input_lengths=None, target_lengths=None
-    ):
+    def compute_loss(self, img, targets=None, input_lengths=None, target_lengths=None):
         img = self._round_up_width(img)
         B, H, W = img.shape
         n_v = self.n_v
@@ -1065,30 +1089,33 @@ class HWMv9(nn.Module):
         valid_flat = None
         if self.use_msn:
             mask2d = sample_2d_block_mask(
-                B, n_v_g, n_h_g,
+                B,
+                n_v_g,
+                n_h_g,
                 num_blocks=self.mask_num_blocks,
-                min_h=self.mask_min_h, max_h=self.mask_max_h,
-                min_w=self.mask_min_w, max_w=self.mask_max_w,
-                valid_h_lengths=n_h_valid, device=img.device,
+                min_h=self.mask_min_h,
+                max_h=self.mask_max_h,
+                min_w=self.mask_min_w,
+                max_w=self.mask_max_w,
+                valid_h_lengths=n_h_valid,
+                device=img.device,
             )
             mask_flat = mask2d.reshape(B, n_v_g * n_h_g)
 
             # Upsample (B, n_v, n_h) bool to (B, H, W) bool by repeating
             # each grid cell over its corresponding pixel block.
-            pixel_mask = (
-                mask2d.repeat_interleave(self.total_stride_h, dim=1)
-                       .repeat_interleave(self.total_stride_w, dim=2)
-            )
-            img_masked = torch.where(
-                pixel_mask, self.mask_pixel.expand_as(img), img
-            )
+            pixel_mask = mask2d.repeat_interleave(
+                self.total_stride_h, dim=1
+            ).repeat_interleave(self.total_stride_w, dim=2)
+            img_masked = torch.where(pixel_mask, self.mask_pixel.expand_as(img), img)
 
             tokens_masked, _ = self.encoder.patchify(img_masked)
             z_masked = self.encoder.transformer_pass(
                 tokens_masked, n_v_g, n_h_g, src_key_padding_mask=pad_mask_flat
             )
             valid_flat = (
-                ~pad_mask_flat if pad_mask_flat is not None
+                ~pad_mask_flat
+                if pad_mask_flat is not None
                 else torch.ones_like(mask_flat)
             )
 
@@ -1102,6 +1129,282 @@ class HWMv9(nn.Module):
             input_lengths=n_h_valid,
             target_lengths=target_lengths,
         )
+
+    def adapt(self, img, input_lengths=None):
+        return self.compute_loss(img, input_lengths=input_lengths)
+
+    def count_parameters(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+class HWMv10(nn.Module):
+    """
+    Handwriting World Model v10 — I-JEPA with hybrid CNN+ViT encoder.
+
+    The encoder's own transformer is used for BOTH the clean (teacher) and
+    the masked (context/student) branches.  Two transformer_pass calls
+    share the same weights but differ in their key_padding_mask:
+
+      1. Clean pass  — all tokens visible  → z_clean  (for CTC, SIGReg,
+         and as JEPA targets via stop-gradient).
+      2. Context pass — target+padding tokens hidden from self-attention
+         → z_ctx.  Visible tokens cannot attend to masked ones, so zero
+         information leakage.  The predictor then reads out predictions
+         at masked positions via cross-attention.
+
+    This is the I-JEPA recipe: the context encoder and the target encoder
+    share weights (no EMA needed when SIGReg prevents collapse), and a
+    lightweight cross-attention predictor maps context → target positions.
+
+    Flow:
+
+      image (B, H, W)
+        → CNN stem + patch_embed → raw_tokens (B, N_v*N_h, D)
+          │
+          ├─ transformer_pass(all visible) → z_clean
+          │    ├─ vertical pool → BiLSTM CTC → ctc_logits
+          │    └─ SIGRegV2(z_clean)                         ← anti-collapse
+          │
+          └─ JEPA branch:
+                 sample 2D block mask on (N_v, N_h) grid
+                 mask_token at target positions in raw_tokens
+                 transformer_pass(key_pad_mask=targets+pad) → z_ctx
+                     ↑ target tokens invisible to self-attention
+                 cross_attn_predictor(z_ctx, mask_token) → z_pred
+                 LN(z_pred), LN(sg(z_clean[targets])) → MSE
+    """
+
+    def __init__(
+        self,
+        img_height=120,
+        stem_channels=64,
+        patch_h=3,
+        patch_w=4,
+        embedding_dim=384,
+        num_layers=4,
+        num_heads=8,
+        ff_dim=1536,
+        pred_num_layers=2,
+        pred_ff_dim=768,
+        dropout=0.1,
+        num_classes=None,
+        lambda_pred=1.0,
+        lambda_sigreg=0.1,
+        lambda_ctc=1.0,
+        sigreg_var=25.0,
+        sigreg_cov=1.0,
+        sigreg_gamma=1.0,
+        ctc_hidden=512,
+        ctc_num_lstm=1,
+        mask_num_blocks=5,
+        mask_min_h=2,
+        mask_max_h=6,
+        mask_min_w=4,
+        mask_max_w=24,
+        max_n_h=400,
+        use_jepa=True,
+    ):
+        super().__init__()
+        self.img_height = img_height
+        self.patch_h = patch_h
+        self.patch_w = patch_w
+        self.embedding_dim = embedding_dim
+        self.use_jepa = use_jepa
+        self.mask_num_blocks = mask_num_blocks
+        self.mask_min_h = mask_min_h
+        self.mask_max_h = mask_max_h
+        self.mask_min_w = mask_min_w
+        self.mask_max_w = mask_max_w
+        self.total_stride_h = 4 * patch_h
+        self.total_stride_w = 4 * patch_w
+        self.n_v = img_height // self.total_stride_h
+
+        self.encoder = HybridCNNViTEncoder(
+            img_height=img_height,
+            stem_channels=stem_channels,
+            patch_h=patch_h,
+            patch_w=patch_w,
+            embedding_dim=embedding_dim,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            ff_dim=ff_dim,
+            dropout=dropout,
+            max_n_h=max_n_h,
+        )
+
+        self.jepa_predictor = JEPACrossAttnPredictor(
+            embedding_dim=embedding_dim,
+            num_layers=pred_num_layers,
+            num_heads=num_heads,
+            ff_dim=pred_ff_dim,
+            dropout=dropout,
+        )
+
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, embedding_dim))
+        nn.init.trunc_normal_(self.mask_token, std=0.02)
+
+        self.pred_norm = nn.LayerNorm(embedding_dim)
+        self.target_norm = nn.LayerNorm(embedding_dim)
+
+        self.ctc_head = (
+            CTCHeadBiLSTM(
+                embedding_dim,
+                num_classes,
+                hidden_dim=ctc_hidden,
+                num_lstm_layers=ctc_num_lstm,
+            )
+            if num_classes
+            else None
+        )
+
+        self.criterion = JEPALoss(
+            lambda_pred=lambda_pred,
+            lambda_sigreg=lambda_sigreg,
+            lambda_ctc=lambda_ctc,
+            sigreg_var=sigreg_var,
+            sigreg_cov=sigreg_cov,
+            sigreg_gamma=sigreg_gamma,
+        )
+
+    def _round_up_width(self, img):
+        W = img.shape[-1]
+        pad = (self.total_stride_w - W % self.total_stride_w) % self.total_stride_w
+        if pad > 0:
+            img = F.pad(img, (0, pad))
+        return img
+
+    def _convert_lengths_to_patches(self, input_lengths):
+        factor = max(1, self.total_stride_w // 8)
+        return input_lengths // factor
+
+    def _padding_mask(self, n_h_valid, n_v, n_h, device):
+        B = n_h_valid.size(0)
+        ar = torch.arange(n_h, device=device)
+        col_pad = ar[None, :] >= n_h_valid[:, None]
+        pad2d = col_pad.unsqueeze(1).expand(B, n_v, n_h)
+        return pad2d.reshape(B, n_v * n_h)
+
+    def _pool_vertical(self, tokens, n_v, n_h):
+        B, _, D = tokens.shape
+        return tokens.reshape(B, n_v, n_h, D).mean(dim=1)
+
+    def _jepa_predict(self, raw_tokens, n_v, n_h, n_h_valid=None):
+        B, N, D = raw_tokens.shape
+
+        target_mask_2d = sample_2d_block_mask(
+            B,
+            n_v,
+            n_h,
+            num_blocks=self.mask_num_blocks,
+            min_h=self.mask_min_h,
+            max_h=self.mask_max_h,
+            min_w=self.mask_min_w,
+            max_w=self.mask_max_w,
+            valid_h_lengths=n_h_valid,
+            device=raw_tokens.device,
+        )
+        target_mask = target_mask_2d.reshape(B, N)
+
+        ctx_kpm = target_mask.clone()
+        if n_h_valid is not None:
+            ar = torch.arange(n_h, device=target_mask.device)
+            pad_mask = ar[None, :] >= n_h_valid[:, None]
+            pad2d = pad_mask.unsqueeze(1).expand(B, n_v, n_h)
+            ctx_kpm = target_mask | pad2d.reshape(B, N)
+
+        all_masked = ctx_kpm.all(dim=1)
+        if all_masked.any():
+            ctx_kpm = ctx_kpm.clone()
+            ctx_kpm[all_masked, 0] = False
+
+        # Masked context: replace target tokens with mask_token, then
+        # run the SAME encoder transformer with key_padding_mask hiding
+        # targets + padding.  Self-attention among visible tokens only.
+        mask_tok = self.mask_token.expand(B, N, D)
+        ctx_tokens = torch.where(target_mask.unsqueeze(-1), mask_tok, raw_tokens)
+        z_ctx = self.encoder.transformer_pass(
+            ctx_tokens, n_v, n_h, src_key_padding_mask=ctx_kpm
+        )
+
+        # Cross-attention predictor: queries = mask_token + pos_enc at
+        # every position, K/V = context output.  Memory mask hides the
+        # same target+padding positions so queries cannot cheat.
+        pred_full = self.jepa_predictor(
+            context=z_ctx,
+            memory_key_padding_mask=ctx_kpm,
+            mask_token=self.mask_token,
+            seq_len=N,
+        )
+
+        return pred_full, target_mask
+
+    def forward(self, img):
+        img = self._round_up_width(img)
+        tokens, (n_v, n_h) = self.encoder(img)
+        z_seq = self._pool_vertical(tokens, n_v, n_h)
+        ctc_logits = self.ctc_head(z_seq) if self.ctc_head is not None else None
+        return None, z_seq, ctc_logits
+
+    def compute_loss(self, img, targets=None, input_lengths=None, target_lengths=None):
+        img = self._round_up_width(img)
+        B, H, W = img.shape
+        n_v = self.n_v
+        n_h = W // self.total_stride_w
+
+        n_h_valid = None
+        if input_lengths is not None:
+            n_h_valid = torch.clamp(
+                self._convert_lengths_to_patches(input_lengths.to(img.device)),
+                max=n_h,
+            )
+
+        # 1. Patchify: CNN stem + patch_embed — benefits from AMP.
+        raw_tokens, (n_v_g, n_h_g) = self.encoder.patchify(img)
+
+        # 2-4. Transformer passes, JEPA branch, and loss — run in float32.
+        # The double transformer pass (clean + context) through the same
+        # encoder amplifies gradients and can overflow float16 after the
+        # warmup LR ramp.  Disabling autocast here forces float32 for
+        # the transformer, predictor, and all loss computations.
+        _amp_ctx = (
+            torch.amp.autocast("cuda", enabled=False)
+            if img.is_cuda
+            else contextlib.nullcontext()
+        )
+        with _amp_ctx:
+            raw_tokens = raw_tokens.float()
+
+            z_clean = self.encoder.transformer_pass(raw_tokens, n_v_g, n_h_g)
+
+            z_seq = self._pool_vertical(z_clean, n_v_g, n_h_g)
+            ctc_logits = self.ctc_head(z_seq) if self.ctc_head is not None else None
+
+            z_pred = None
+            z_target = None
+            if self.use_jepa:
+                pred_full, target_mask = self._jepa_predict(
+                    raw_tokens, n_v_g, n_h_g, n_h_valid
+                )
+
+                if target_mask.any():
+                    z_pred_t = pred_full[target_mask]
+                    z_tgt_t = z_clean.detach()[target_mask]
+                else:
+                    z_pred_t = pred_full[:, 0, :]
+                    z_tgt_t = z_clean.detach()[:, 0, :]
+
+                z_pred = self.pred_norm(z_pred_t)
+                z_target = self.target_norm(z_tgt_t)
+
+            return self.criterion(
+                z_pred=z_pred,
+                z_target=z_target,
+                z_seq=z_clean,
+                ctc_logits=ctc_logits,
+                targets=targets,
+                input_lengths=n_h_valid,
+                target_lengths=target_lengths,
+            )
 
     def adapt(self, img, input_lengths=None):
         return self.compute_loss(img, input_lengths=input_lengths)

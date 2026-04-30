@@ -34,7 +34,7 @@ from torch.utils.data import DataLoader, random_split
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config
-from model import HWMv2, HWMv3, HWMv4, HWMv5, HWMv6, HWMv7, HWMv8, HWMv9
+from model import HWMv2, HWMv3, HWMv4, HWMv5, HWMv6, HWMv7, HWMv8, HWMv9, HWMv10
 from data_alto import (
     AltoLineDataset,
     UnannotatedLineDataset,
@@ -116,7 +116,13 @@ def _step_adapt(model, batch, optimizer, device, use_amp):
 
 
 def train_epoch(
-    model, loader, optimizer, device, epoch, mode="full", scaler=None,
+    model,
+    loader,
+    optimizer,
+    device,
+    epoch,
+    mode="full",
+    scaler=None,
     adapt_loader=None,
 ):
     model.train()
@@ -161,7 +167,9 @@ def train_epoch(
                 torch.cuda.empty_cache()
 
             running = {k: v / max(1, num_batches // 2) for k, v in totals.items()}
-            _progress_bar(epoch, batch_idx * 2 + 1, total_batches, running, time.time() - t0)
+            _progress_bar(
+                epoch, batch_idx * 2 + 1, total_batches, running, time.time() - t0
+            )
     else:
         # Pure full or pure adapt mode
         step_fn = _step_full if mode == "full" else _step_adapt
@@ -208,11 +216,18 @@ def _set_encoder_frozen(model, frozen):
     """Freeze/unfreeze encoder + SSL trunk (CTC head stays trainable).
 
     v5-v7 expose ``predictor``; v8 exposes ``decoder`` instead (MAE pixel
-    head). Only toggle those that actually exist.
+    head). v10 exposes ``context_transformer``, ``jepa_predictor``, and
+    ``proj_head``.  Only toggle those that actually exist.
     """
     for p in model.encoder.parameters():
         p.requires_grad_(not frozen)
-    for name in ("predictor", "decoder", "jepa_predictor", "proj_head"):
+    for name in (
+        "predictor",
+        "decoder",
+        "jepa_predictor",
+        "proj_head",
+        "context_transformer",
+    ):
         sub = getattr(model, name, None)
         if sub is not None:
             for p in sub.parameters():
@@ -230,7 +245,13 @@ def _build_param_groups(model, lr, encoder_lr_mult):
     collect whichever attributes exist on the model.
     """
     trunk_params = list(model.encoder.parameters())
-    for name in ("predictor", "decoder", "jepa_predictor", "proj_head"):
+    for name in (
+        "predictor",
+        "decoder",
+        "jepa_predictor",
+        "proj_head",
+        "context_transformer",
+    ):
         sub = getattr(model, name, None)
         if sub is not None:
             trunk_params.extend(list(sub.parameters()))
@@ -246,17 +267,25 @@ def _build_scheduler(optimizer, remaining_epochs, warmup_epochs):
     """Linear warmup (if any) followed by cosine decay over remaining epochs."""
     if warmup_epochs > 0 and remaining_epochs > warmup_epochs:
         warmup = optim.lr_scheduler.LinearLR(
-            optimizer, start_factor=0.1, end_factor=1.0,
+            optimizer,
+            start_factor=0.1,
+            end_factor=1.0,
             total_iters=warmup_epochs,
         )
         cosine = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=remaining_epochs - warmup_epochs, eta_min=1e-6,
+            optimizer,
+            T_max=remaining_epochs - warmup_epochs,
+            eta_min=1e-6,
         )
         return optim.lr_scheduler.SequentialLR(
-            optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs],
+            optimizer,
+            schedulers=[warmup, cosine],
+            milestones=[warmup_epochs],
         )
     return optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(1, remaining_epochs), eta_min=1e-6,
+        optimizer,
+        T_max=max(1, remaining_epochs),
+        eta_min=1e-6,
     )
 
 
@@ -337,8 +366,14 @@ def train(
             for i, g in enumerate(optimizer.param_groups)
         )
         losses = train_epoch(
-            model, train_loader, optimizer, device, epoch,
-            mode=mode, scaler=scaler, adapt_loader=adapt_loader,
+            model,
+            train_loader,
+            optimizer,
+            device,
+            epoch,
+            mode=mode,
+            scaler=scaler,
+            adapt_loader=adapt_loader,
         )
         scheduler.step()
 
@@ -375,15 +410,25 @@ def train(
 
             cer_samples = min(100, len(train_loader.dataset) // 10)
             train_cer = evaluate_cer(
-                model, train_loader, device, idx_to_char,
-                max_samples=cer_samples, verbose=False,
+                model,
+                train_loader,
+                device,
+                idx_to_char,
+                max_samples=cer_samples,
+                verbose=False,
             )
             if val_loader:
                 val_cer = evaluate_cer(
-                    model, val_loader, device, idx_to_char,
-                    max_samples=cer_samples, verbose=True,
+                    model,
+                    val_loader,
+                    device,
+                    idx_to_char,
+                    max_samples=cer_samples,
+                    verbose=True,
                 )
-                print(f"  Train CER: {train_cer:.1%} | Val CER: {val_cer:.1%} ({cer_samples} samples)")
+                print(
+                    f"  Train CER: {train_cer:.1%} | Val CER: {val_cer:.1%} ({cer_samples} samples)"
+                )
             else:
                 print(f"  Train CER: {train_cer:.1%} ({cer_samples} samples)")
 
@@ -399,7 +444,7 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=["mixed", "full", "adapt"], default="mixed")
     parser.add_argument(
         "--model-version",
-        choices=["v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9"],
+        choices=["v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10"],
         default="v5",
     )
     parser.add_argument("--epochs", type=int, default=30)
@@ -493,8 +538,8 @@ if __name__ == "__main__":
 
     if args.data == "alto":
         ver = args.model_version
-        if ver in ("v5", "v6", "v7", "v8", "v9"):
-            if ver == "v9":
+        if ver in ("v5", "v6", "v7", "v8", "v9", "v10"):
+            if ver in ("v9", "v10"):
                 img_h = config.IMG_HEIGHT_V9
             elif ver == "v8":
                 img_h = config.IMG_HEIGHT_V8
@@ -528,7 +573,7 @@ if __name__ == "__main__":
             generator=torch.Generator().manual_seed(42),
         )
 
-        if ver in ("v5", "v6", "v7", "v8", "v9"):
+        if ver in ("v5", "v6", "v7", "v8", "v9", "v10"):
             collate = partial(collate_alto_v5_fn, char_to_idx=char_to_idx)
         else:
             collate = partial(
@@ -566,7 +611,7 @@ if __name__ == "__main__":
             adapt_ds = UnannotatedLineDataset(
                 unannotated_dirs, img_height=img_h, augment=True
             )
-            if ver in ("v5", "v6", "v7", "v8", "v9"):
+            if ver in ("v5", "v6", "v7", "v8", "v9", "v10"):
                 adapt_collate = collate_unannotated_v5_fn
             else:
                 adapt_collate = partial(
@@ -581,7 +626,9 @@ if __name__ == "__main__":
                 pin_memory=pin_mem,
                 persistent_workers=args.num_workers > 0,
             )
-            print(f"Mixed mode: {len(train_ds)} annotated + {len(adapt_ds)} unannotated lines")
+            print(
+                f"Mixed mode: {len(train_ds)} annotated + {len(adapt_ds)} unannotated lines"
+            )
     else:
         raise ValueError("Only 'alto' data mode is supported")
 
@@ -609,9 +656,7 @@ if __name__ == "__main__":
 
     if ver in ("v5", "v6", "v7"):
         target_norm = (
-            args.target_norm
-            if args.target_norm is not None
-            else config.TARGET_NORM_V5
+            args.target_norm if args.target_norm is not None else config.TARGET_NORM_V5
         )
         pred_loss_type = args.pred_loss or config.PRED_LOSS_V5
         if args.no_jepa:
@@ -771,6 +816,57 @@ if __name__ == "__main__":
             use_msn=use_msn,
         ).to(device)
         save_path = "hwm_v9.pt"
+    elif ver == "v10":
+        if args.no_jepa:
+            lambda_pred = 0.0
+            use_jepa = False
+        else:
+            lambda_pred = (
+                args.lambda_pred
+                if args.lambda_pred is not None
+                else config.LAMBDA_PRED_V10
+            )
+            use_jepa = lambda_pred > 0
+        print(
+            f"v10 JEPA config: use_jepa={use_jepa} lambda_pred={lambda_pred} "
+            f"lambda_sigreg={config.LAMBDA_SIGREG_V10} "
+            f"lambda_ctc={config.LAMBDA_CTC_V10} "
+            f"stem_ch={config.STEM_CHANNELS_V10} "
+            f"patch={config.PATCH_H_V10}x{config.PATCH_W_V10} "
+            f"embed_dim={config.EMBEDDING_DIM_V10} "
+            f"pred_layers={config.PRED_NUM_LAYERS_V10} "
+            f"mask_blocks={config.MASK_NUM_BLOCKS_V10}"
+        )
+        model = HWMv10(
+            img_height=config.IMG_HEIGHT_V10,
+            stem_channels=config.STEM_CHANNELS_V10,
+            patch_h=config.PATCH_H_V10,
+            patch_w=config.PATCH_W_V10,
+            embedding_dim=config.EMBEDDING_DIM_V10,
+            num_layers=config.NUM_LAYERS_V10,
+            num_heads=config.NUM_HEADS_V10,
+            ff_dim=config.FF_DIM_V10,
+            pred_num_layers=config.PRED_NUM_LAYERS_V10,
+            pred_ff_dim=config.PRED_FF_DIM_V10,
+            dropout=config.DROPOUT,
+            num_classes=model_num_classes,
+            lambda_pred=lambda_pred,
+            lambda_sigreg=config.LAMBDA_SIGREG_V10,
+            lambda_ctc=config.LAMBDA_CTC_V10,
+            sigreg_var=config.SIGREG_VAR_V10,
+            sigreg_cov=config.SIGREG_COV_V10,
+            sigreg_gamma=config.SIGREG_GAMMA_V10,
+            ctc_hidden=config.CTC_HIDDEN_V10,
+            ctc_num_lstm=config.CTC_NUM_LSTM_V10,
+            mask_num_blocks=config.MASK_NUM_BLOCKS_V10,
+            mask_min_h=config.MASK_MIN_H_V10,
+            mask_max_h=config.MASK_MAX_H_V10,
+            mask_min_w=config.MASK_MIN_W_V10,
+            mask_max_w=config.MASK_MAX_W_V10,
+            max_n_h=config.MAX_N_H_V10,
+            use_jepa=use_jepa,
+        ).to(device)
+        save_path = "hwm_v10.pt"
     elif ver == "v4":
         model = HWMv4(
             img_height=config.IMG_HEIGHT_V4,

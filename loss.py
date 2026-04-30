@@ -320,9 +320,9 @@ class MAEHybridLoss(nn.Module):
 
     def forward(
         self,
-        pred_pixels,        # (B, N, P) full grid predictions, or None
-        target_pixels,      # (B, N, P) ground-truth pixel patches, or None
-        valid_mask,         # (B, N) bool — positions to score (masked & valid)
+        pred_pixels,  # (B, N, P) full grid predictions, or None
+        target_pixels,  # (B, N, P) ground-truth pixel patches, or None
+        valid_mask,  # (B, N) bool — positions to score (masked & valid)
         ctc_logits=None,
         targets=None,
         input_lengths=None,
@@ -339,8 +339,7 @@ class MAEHybridLoss(nn.Module):
             losses["mae"] = mae.detach().item()
         else:
             device = (
-                ctc_logits.device if ctc_logits is not None
-                else torch.device("cpu")
+                ctc_logits.device if ctc_logits is not None else torch.device("cpu")
             )
             total = torch.zeros((), device=device)
 
@@ -350,7 +349,137 @@ class MAEHybridLoss(nn.Module):
             total = total + self.lambda_ctc * ctc
             losses["ctc"] = ctc.detach().item()
 
-        losses["total"] = total.detach().item() if isinstance(total, torch.Tensor) else float(total)
+        losses["total"] = (
+            total.detach().item() if isinstance(total, torch.Tensor) else float(total)
+        )
+        return total, losses
+
+
+class SIGRegLossV2(nn.Module):
+    """
+    SIGReg corrected: operates on RAW z (no standardisation).
+
+    The original SIGRegLoss divides by per-dim std before computing the
+    covariance.  That makes the loss scale-invariant — tiny-magnitude
+    quasi-constant embeddings pass the regulariser because after
+    normalisation they look like unit-variance noise.  Result: the
+    encoder collapses and MSN / MSE loss drops to ~0 trivially.
+
+    V2 keeps the off-diagonal covariance penalty from SIGReg but adds
+    a variance hinge (like VICReg) on the RAW std, so scale collapse
+    is penalised directly.
+
+    Components:
+      - var_loss: mean(relu(gamma - std(z_d)))  over all D dims.
+        Ensures every dimension has std >= gamma.  Anti-scale-collapse.
+      - cov_loss: mean over all D*D entries of (cov_raw - I)^2.
+        Decorrelates dimensions, same as original SIGReg but on raw z.
+    """
+
+    def __init__(self, lambda_var=25.0, lambda_cov=1.0, gamma=1.0, eps=1e-4):
+        super().__init__()
+        self.lambda_var = lambda_var
+        self.lambda_cov = lambda_cov
+        self.gamma = gamma
+        self.eps = eps
+        self._eye_cache = {}
+
+    def _get_eye(self, size, device):
+        key = (size, device)
+        if key not in self._eye_cache:
+            self._eye_cache[key] = torch.eye(size, device=device)
+        return self._eye_cache[key]
+
+    def forward(self, z):
+        z = z.float()
+        if z.dim() == 3:
+            B, T, D = z.shape
+            z = z.reshape(B * T, D)
+        N, D = z.shape
+
+        std = torch.sqrt(z.var(dim=0) + self.eps)
+        var_loss = torch.mean(F.relu(self.gamma - std))
+
+        z_c = z - z.mean(dim=0)
+        cov = (z_c.T @ z_c) / N
+        eye = self._get_eye(D, z.device)
+        cov_loss = ((cov - eye) ** 2).mean()
+
+        total = self.lambda_var * var_loss + self.lambda_cov * cov_loss
+        return total, var_loss.detach(), cov_loss.detach()
+
+
+class JEPALoss(nn.Module):
+    """
+    Loss for HWMv10: JEPA prediction + SIGRegV2 + optional CTC.
+
+    L = lambda_pred * MSE(proj(z_pred), proj(sg(z_target)))
+      + lambda_sigreg * SIGRegV2(z_seq)
+      + lambda_ctc * CTC(z_pooled, targets)
+    """
+
+    def __init__(
+        self,
+        lambda_pred=1.0,
+        lambda_sigreg=0.1,
+        lambda_ctc=1.0,
+        sigreg_var=25.0,
+        sigreg_cov=1.0,
+        sigreg_gamma=1.0,
+    ):
+        super().__init__()
+        self.lambda_pred = lambda_pred
+        self.lambda_sigreg = lambda_sigreg
+        self.lambda_ctc = lambda_ctc
+        self.reg = SIGRegLossV2(
+            lambda_var=sigreg_var,
+            lambda_cov=sigreg_cov,
+            gamma=sigreg_gamma,
+        )
+        self.mse = nn.MSELoss()
+        self.ctc_loss = nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
+
+    def forward(
+        self,
+        z_pred=None,
+        z_target=None,
+        z_seq=None,
+        ctc_logits=None,
+        targets=None,
+        input_lengths=None,
+        target_lengths=None,
+    ):
+        losses = {}
+        device = (
+            z_seq.device
+            if z_seq is not None
+            else ctc_logits.device
+            if ctc_logits is not None
+            else torch.device("cpu")
+        )
+
+        if z_pred is not None and z_target is not None:
+            pred = self.mse(z_pred.float(), z_target.float())
+            losses["pred"] = pred.detach().item()
+        else:
+            pred = torch.zeros((), device=device)
+
+        reg_total = torch.zeros((), device=device)
+        if z_seq is not None:
+            reg_total, var_l, cov_l = self.reg(z_seq)
+            losses["sigreg"] = reg_total.detach().item()
+            losses["var"] = var_l.item()
+            losses["cov"] = cov_l.item()
+
+        total = self.lambda_pred * pred + self.lambda_sigreg * reg_total
+
+        if ctc_logits is not None and targets is not None:
+            ctc_input = ctc_logits.permute(1, 0, 2)
+            ctc = self.ctc_loss(ctc_input, targets, input_lengths, target_lengths)
+            total = total + self.lambda_ctc * ctc
+            losses["ctc"] = ctc.detach().item()
+
+        losses["total"] = total.detach().item()
         return total, losses
 
 
@@ -389,10 +518,10 @@ class MSNLoss(nn.Module):
 
     def forward(
         self,
-        z_masked,            # (B, N, D) student output, or None (CTC-only)
-        z_clean,             # (B, N, D) teacher output (not yet detached)
-        mask_flat,           # (B, N) bool — True = masked (target) position
-        valid_flat,          # (B, N) bool — True = non-padding position
+        z_masked,  # (B, N, D) student output, or None (CTC-only)
+        z_clean,  # (B, N, D) teacher output (not yet detached)
+        mask_flat,  # (B, N) bool — True = masked (target) position
+        valid_flat,  # (B, N) bool — True = non-padding position
         ctc_logits=None,
         targets=None,
         input_lengths=None,
@@ -416,8 +545,7 @@ class MSNLoss(nn.Module):
             total = self.lambda_msn * msn + self.lambda_sigreg * reg
         else:
             device = (
-                ctc_logits.device if ctc_logits is not None
-                else torch.device("cpu")
+                ctc_logits.device if ctc_logits is not None else torch.device("cpu")
             )
             total = torch.zeros((), device=device)
 

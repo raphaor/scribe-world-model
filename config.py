@@ -266,5 +266,44 @@ MASK_MAX_W_V9 = 16
 MAX_N_H_V9 = 400
 
 
+# --- HWM-v10 ---
+# v7 JEPA architecture (cross-attention predictor + projection head) with
+# the hybrid CNN+ViT encoder from v9.  SIGReg corrected (no normalisation,
+# variance hinge on raw z) replaces VICReg.  MSE prediction loss (LeWM-
+# style) replaces InfoNCE.  CTC with BiLSTM restored.
+
+IMG_HEIGHT_V10 = 120
+STEM_CHANNELS_V10 = 64
+PATCH_H_V10 = 3
+PATCH_W_V10 = 4
+
+EMBEDDING_DIM_V10 = 384
+NUM_LAYERS_V10 = 4
+NUM_HEADS_V10 = 8
+FF_DIM_V10 = 1536
+
+PRED_NUM_LAYERS_V10 = 2
+PRED_FF_DIM_V10 = 768
+
+LAMBDA_PRED_V10 = 1.0
+LAMBDA_SIGREG_V10 = 0.1
+LAMBDA_CTC_V10 = 1.0
+
+SIGREG_VAR_V10 = 25.0
+SIGREG_COV_V10 = 1.0
+SIGREG_GAMMA_V10 = 1.0
+
+CTC_HIDDEN_V10 = 512
+CTC_NUM_LSTM_V10 = 1
+
+MASK_NUM_BLOCKS_V10 = 5
+MASK_MIN_H_V10 = 2
+MASK_MAX_H_V10 = 6
+MASK_MIN_W_V10 = 4
+MASK_MAX_W_V10 = 24
+
+MAX_N_H_V10 = 400
+
+
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
