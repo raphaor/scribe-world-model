@@ -4,6 +4,7 @@ Complete architecture combining encoder and predictor
 """
 
 import contextlib
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,7 +19,14 @@ from encoder import (
     HybridCNNViTEncoder,
 )
 from predictor import TransformerPredictor, JEPACrossAttnPredictor, MAEDecoder
-from loss import HWMLoss, HybridLoss, MAEHybridLoss, MSNLoss, JEPALoss
+from loss import (
+    HWMLoss,
+    HybridLoss,
+    MAEHybridLoss,
+    MSNLoss,
+    JEPALoss,
+    SimSiamHybridLoss,
+)
 from ctc_head import CTCHead, CTCHeadBiLSTM
 from jepa import sample_jepa_mask, sample_2d_block_mask
 import config
@@ -1405,6 +1413,297 @@ class HWMv10(nn.Module):
                 input_lengths=n_h_valid,
                 target_lengths=target_lengths,
             )
+
+    def adapt(self, img, input_lengths=None):
+        return self.compute_loss(img, input_lengths=input_lengths)
+
+    def count_parameters(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+class HWMv11(nn.Module):
+    """
+    Handwriting World Model v11 — Kraken 1D encoder + SimSiam consistency.
+
+    Pretext: encode a clean view and a heavily perturbed view of the
+    same line, pool both to a single line vector, and pull them
+    together via cosine similarity (with a predictor MLP on the
+    perturbed branch for SimSiam-style asymmetry). SIGRegV2 prevents
+    collapse on the raw frame embeddings; CTC trains recognition.
+
+    Why this is different from v5-v10:
+      - 6 prior versions hit the same JEPA wall (shared encoder + stop-
+        grad target collapses without EMA / contrastive negatives).
+      - v11 sidesteps that entirely: the consistency target is the
+        SAME encoder's output on a different view (still stop-grad),
+        but with two key changes that historically work without EMA:
+        (a) SimSiam predictor MLP on the student side ⇒ asymmetry,
+        (b) consistency at the LINE pool level (not frame level) ⇒
+            position-only collapse cannot satisfy it because the
+            perturbations include horizontal shift.
+
+    Flow
+    ----
+        line image (B, H, W)
+          ├─► clean view  ─► KrakenEncoder ─► z_clean (B, T, D)
+          │                                       │
+          │                              ┌────────┴───────┐
+          │                              │                │
+          │                       pool over T     BiLSTM CTC head
+          │                       (padding-aware)         │
+          │                              │                ▼
+          │                       v_clean (B, D)     log_softmax
+          │                              │           (B, T, num_cls)
+          │                              │
+          │                          stop-grad
+          │                              │
+          │                              ▼  cos_sim
+          │                              ▲
+          │                              │
+          └─► perturb(view) ─► KrakenEncoder ─► z_pert ─► pool ─► v_pert
+                                  (same weights)                     │
+                                                              predictor MLP
+                                                                     │
+                                                                  p_pert
+
+        L = -λ_cons · cos_sim(p_pert, sg(v_clean))
+            + λ_reg · SIGRegV2(z_clean)
+            + λ_ctc · CTC(z_clean, targets)
+
+    The KrakenEncoder runs twice per training step (once on clean,
+    once on perturbed). At inference, only the clean path runs:
+    encoder → BiLSTM → CTC. The predictor MLP is discarded.
+    """
+
+    def __init__(
+        self,
+        img_height=120,
+        embedding_dim=384,
+        pred_hidden=384,
+        num_classes=None,
+        lambda_cons=1.0,
+        lambda_sigreg=0.1,
+        lambda_ctc=1.0,
+        sigreg_var=25.0,
+        sigreg_cov=1.0,
+        sigreg_gamma=1.0,
+        ctc_hidden=256,
+        ctc_num_lstm=1,
+        # Perturbation hyperparameters (view 2)
+        pert_shift_x=4,
+        pert_shear_deg=5.0,
+        pert_mask_blocks=4,
+        pert_mask_w_min=16,
+        pert_mask_w_max=32,
+        pert_contrast_min=0.7,
+        pert_contrast_max=1.3,
+        pert_brightness=0.1,
+        pert_noise_std=0.03,
+        use_pretext=True,
+    ):
+        super().__init__()
+        self.img_height = img_height
+        self.embedding_dim = embedding_dim
+        self.use_pretext = use_pretext
+
+        self.encoder = KrakenEncoder(
+            img_height=img_height, embedding_dim=embedding_dim
+        )
+
+        # SimSiam predictor MLP on the perturbed branch only. The
+        # asymmetry is what prevents the trivial "encoder = identity"
+        # collapse; without it the consistency loss has a degenerate
+        # minimum at p_pert = v_clean = const.
+        self.predictor = nn.Sequential(
+            nn.Linear(embedding_dim, pred_hidden),
+            nn.GELU(),
+            nn.Linear(pred_hidden, embedding_dim),
+        )
+
+        # Learnable scalar substituted in pixel space at masked blocks.
+        # Single parameter (broadcast to image shape) so the mask value
+        # adapts to the dataset's normalisation range.
+        self.mask_pixel = nn.Parameter(torch.zeros(()))
+
+        self.ctc_head = (
+            CTCHeadBiLSTM(
+                embedding_dim,
+                num_classes,
+                hidden_dim=ctc_hidden,
+                num_lstm_layers=ctc_num_lstm,
+            )
+            if num_classes
+            else None
+        )
+
+        self.criterion = SimSiamHybridLoss(
+            lambda_cons=lambda_cons,
+            lambda_sigreg=lambda_sigreg,
+            lambda_ctc=lambda_ctc,
+            sigreg_var=sigreg_var,
+            sigreg_cov=sigreg_cov,
+            sigreg_gamma=sigreg_gamma,
+        )
+
+        # Perturbation hyperparameters
+        self.pert_shift_x = pert_shift_x
+        self.pert_shear_deg = pert_shear_deg
+        self.pert_mask_blocks = pert_mask_blocks
+        self.pert_mask_w_min = pert_mask_w_min
+        self.pert_mask_w_max = pert_mask_w_max
+        self.pert_contrast_min = pert_contrast_min
+        self.pert_contrast_max = pert_contrast_max
+        self.pert_brightness = pert_brightness
+        self.pert_noise_std = pert_noise_std
+
+    def _perturb(self, img, input_lengths=None):
+        """
+        Apply the v11 perturbation stack to ``img`` (B, H, W).
+
+        Returns the perturbed image with the same shape.
+
+        Order:
+          1. Photometric (per-sample contrast, brightness, gaussian noise)
+          2. Affine (per-sample horizontal shear + horizontal shift)
+          3. Pixel-space block masking
+        """
+        B, H, W = img.shape
+        device = img.device
+
+        # 1. Photometric: per-sample contrast and brightness.
+        contrast = (
+            torch.rand(B, 1, 1, device=device)
+            * (self.pert_contrast_max - self.pert_contrast_min)
+            + self.pert_contrast_min
+        )
+        brightness = (
+            torch.rand(B, 1, 1, device=device) * 2 - 1
+        ) * self.pert_brightness
+        img = img * contrast + brightness
+        if self.pert_noise_std > 0:
+            img = img + torch.randn_like(img) * self.pert_noise_std
+
+        # 2. Affine: horizontal shear + horizontal shift, per sample.
+        # theta maps OUTPUT normalised coords [-1, 1] -> INPUT coords:
+        #   x_in = x_out + (-tan(α)) * y_out + (-2 * shift_px / W)
+        #   y_in = y_out
+        if self.pert_shear_deg > 0 or self.pert_shift_x > 0:
+            shear_rad = (
+                (torch.rand(B, device=device) * 2 - 1)
+                * self.pert_shear_deg
+                * math.pi
+                / 180.0
+            )
+            shift_px = (
+                torch.rand(B, device=device) * 2 - 1
+            ) * self.pert_shift_x
+            theta = torch.zeros(B, 2, 3, device=device, dtype=img.dtype)
+            theta[:, 0, 0] = 1.0
+            theta[:, 0, 1] = -torch.tan(shear_rad).to(img.dtype)
+            theta[:, 0, 2] = (-2.0 * shift_px / max(W, 1)).to(img.dtype)
+            theta[:, 1, 1] = 1.0
+            grid = F.affine_grid(
+                theta, size=(B, 1, H, W), align_corners=False
+            )
+            img = F.grid_sample(
+                img.unsqueeze(1),
+                grid,
+                mode="bilinear",
+                padding_mode="border",
+                align_corners=False,
+            ).squeeze(1)
+
+        # 3. Pixel-space block masking. Sample per-sample column blocks
+        # within the valid (non-padding) region so we don't waste blocks
+        # on padding. Replace masked pixels with the learned scalar.
+        if self.pert_mask_blocks > 0:
+            mask = torch.zeros(B, W, dtype=torch.bool, device=device)
+            for b in range(B):
+                eff_w = (
+                    int(input_lengths[b].item() * 8)
+                    if input_lengths is not None
+                    else W
+                )
+                eff_w = max(eff_w, self.pert_mask_w_min + 1)
+                upper_w = min(self.pert_mask_w_max, eff_w - 1)
+                for _ in range(self.pert_mask_blocks):
+                    w_blk = int(
+                        torch.randint(
+                            self.pert_mask_w_min, upper_w + 1, (1,)
+                        ).item()
+                    )
+                    start = int(
+                        torch.randint(0, eff_w - w_blk + 1, (1,)).item()
+                    )
+                    mask[b, start : start + w_blk] = True
+            mask2d = mask.unsqueeze(1).expand(B, H, W)
+            img = torch.where(
+                mask2d, self.mask_pixel.to(img.dtype).expand_as(img), img
+            )
+
+        return img
+
+    def _pool_temporal(self, z_seq, input_lengths=None):
+        """
+        Padding-aware mean over the time axis.
+
+        Args:
+            z_seq: (B, T, D)
+            input_lengths: (B,) long, T units (image width // 8).
+                If None, average over all T.
+        Returns:
+            (B, D) line vector.
+        """
+        B, T, D = z_seq.shape
+        if input_lengths is None:
+            return z_seq.mean(dim=1)
+        ar = torch.arange(T, device=z_seq.device)
+        valid = (ar[None, :] < input_lengths[:, None]).float()
+        z_masked = z_seq * valid.unsqueeze(-1)
+        denom = input_lengths.clamp(min=1).float().unsqueeze(-1)
+        return z_masked.sum(dim=1) / denom
+
+    def forward(self, img):
+        """
+        Inference forward: encoder + (BiLSTM) CTC head only.
+        Returned tuple matches the (pred, z_seq, ctc_logits) contract.
+        """
+        z_seq = self.encoder(img)
+        ctc_logits = self.ctc_head(z_seq) if self.ctc_head is not None else None
+        return None, z_seq, ctc_logits
+
+    def compute_loss(
+        self, img, targets=None, input_lengths=None, target_lengths=None
+    ):
+        # 1. Clean view: full image through Kraken. With grad — feeds
+        # CTC, SIGRegV2, and serves as the (stop-grad) consistency target.
+        z_clean = self.encoder(img)
+        ctc_logits = self.ctc_head(z_clean) if self.ctc_head is not None else None
+
+        p_pert = None
+        v_clean = None
+        if self.use_pretext:
+            # 2. Perturbed view: same image, run through perturbation
+            # stack, then through the SAME Kraken weights.
+            img_pert = self._perturb(img, input_lengths=input_lengths)
+            z_pert = self.encoder(img_pert)
+
+            # 3. Pool both views to a single line vector.
+            v_clean = self._pool_temporal(z_clean, input_lengths)
+            v_pert = self._pool_temporal(z_pert, input_lengths)
+
+            # 4. Predictor MLP on the perturbed branch (SimSiam asymmetry).
+            p_pert = self.predictor(v_pert)
+
+        return self.criterion(
+            p_pert=p_pert,
+            v_clean=v_clean,
+            z_seq=z_clean,
+            ctc_logits=ctc_logits,
+            targets=targets,
+            input_lengths=input_lengths,
+            target_lengths=target_lengths,
+        )
 
     def adapt(self, img, input_lengths=None):
         return self.compute_loss(img, input_lengths=input_lengths)

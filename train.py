@@ -34,7 +34,18 @@ from torch.utils.data import DataLoader, random_split
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config
-from model import HWMv2, HWMv3, HWMv4, HWMv5, HWMv6, HWMv7, HWMv8, HWMv9, HWMv10
+from model import (
+    HWMv2,
+    HWMv3,
+    HWMv4,
+    HWMv5,
+    HWMv6,
+    HWMv7,
+    HWMv8,
+    HWMv9,
+    HWMv10,
+    HWMv11,
+)
 from data_alto import (
     AltoLineDataset,
     UnannotatedLineDataset,
@@ -444,7 +455,7 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=["mixed", "full", "adapt"], default="mixed")
     parser.add_argument(
         "--model-version",
-        choices=["v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10"],
+        choices=["v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11"],
         default="v5",
     )
     parser.add_argument("--epochs", type=int, default=30)
@@ -538,8 +549,10 @@ if __name__ == "__main__":
 
     if args.data == "alto":
         ver = args.model_version
-        if ver in ("v5", "v6", "v7", "v8", "v9", "v10"):
-            if ver in ("v9", "v10"):
+        if ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11"):
+            if ver == "v11":
+                img_h = config.IMG_HEIGHT_V11
+            elif ver in ("v9", "v10"):
                 img_h = config.IMG_HEIGHT_V9
             elif ver == "v8":
                 img_h = config.IMG_HEIGHT_V8
@@ -573,7 +586,7 @@ if __name__ == "__main__":
             generator=torch.Generator().manual_seed(42),
         )
 
-        if ver in ("v5", "v6", "v7", "v8", "v9", "v10"):
+        if ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11"):
             collate = partial(collate_alto_v5_fn, char_to_idx=char_to_idx)
         else:
             collate = partial(
@@ -611,7 +624,7 @@ if __name__ == "__main__":
             adapt_ds = UnannotatedLineDataset(
                 unannotated_dirs, img_height=img_h, augment=True
             )
-            if ver in ("v5", "v6", "v7", "v8", "v9", "v10"):
+            if ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11"):
                 adapt_collate = collate_unannotated_v5_fn
             else:
                 adapt_collate = partial(
@@ -867,6 +880,56 @@ if __name__ == "__main__":
             use_jepa=use_jepa,
         ).to(device)
         save_path = "hwm_v10.pt"
+    elif ver == "v11":
+        # v11: Kraken 1D encoder + SimSiam consistency on perturbed view.
+        # ``--no-jepa`` disables the SSL pretext (CTC-only baseline).
+        if args.no_jepa:
+            lambda_cons = 0.0
+            use_pretext = False
+        else:
+            lambda_cons = (
+                args.lambda_pred
+                if args.lambda_pred is not None
+                else config.LAMBDA_CONS_V11
+            )
+            use_pretext = lambda_cons > 0
+        print(
+            f"v11 SimSiam config: use_pretext={use_pretext} "
+            f"lambda_cons={lambda_cons} "
+            f"lambda_sigreg={config.LAMBDA_SIGREG_V11} "
+            f"lambda_ctc={config.LAMBDA_CTC_V11} "
+            f"embed_dim={config.EMBEDDING_DIM_V11} "
+            f"pred_hidden={config.PRED_HIDDEN_V11} | "
+            f"pert: shift=±{config.PERT_V11_SHIFT_X}px "
+            f"shear=±{config.PERT_V11_SHEAR_DEG}° "
+            f"mask={config.PERT_V11_MASK_BLOCKS} blocks "
+            f"({config.PERT_V11_MASK_W_MIN}-{config.PERT_V11_MASK_W_MAX}px)"
+        )
+        model = HWMv11(
+            img_height=config.IMG_HEIGHT_V11,
+            embedding_dim=config.EMBEDDING_DIM_V11,
+            pred_hidden=config.PRED_HIDDEN_V11,
+            num_classes=model_num_classes,
+            lambda_cons=lambda_cons,
+            lambda_sigreg=config.LAMBDA_SIGREG_V11,
+            lambda_ctc=config.LAMBDA_CTC_V11,
+            sigreg_var=config.SIGREG_VAR_V11,
+            sigreg_cov=config.SIGREG_COV_V11,
+            sigreg_gamma=config.SIGREG_GAMMA_V11,
+            ctc_hidden=config.CTC_HIDDEN_V11,
+            ctc_num_lstm=config.CTC_NUM_LSTM_V11,
+            pert_shift_x=config.PERT_V11_SHIFT_X,
+            pert_shear_deg=config.PERT_V11_SHEAR_DEG,
+            pert_mask_blocks=config.PERT_V11_MASK_BLOCKS,
+            pert_mask_w_min=config.PERT_V11_MASK_W_MIN,
+            pert_mask_w_max=config.PERT_V11_MASK_W_MAX,
+            pert_contrast_min=config.PERT_V11_CONTRAST_MIN,
+            pert_contrast_max=config.PERT_V11_CONTRAST_MAX,
+            pert_brightness=config.PERT_V11_BRIGHTNESS,
+            pert_noise_std=config.PERT_V11_NOISE_STD,
+            use_pretext=use_pretext,
+        ).to(device)
+        save_path = "hwm_v11.pt"
     elif ver == "v4":
         model = HWMv4(
             img_height=config.IMG_HEIGHT_V4,

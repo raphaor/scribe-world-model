@@ -561,6 +561,104 @@ class MSNLoss(nn.Module):
         return total, losses
 
 
+class SimSiamHybridLoss(nn.Module):
+    """
+    HWMv11 loss: SimSiam-style cosine consistency + SIGRegV2 + optional CTC.
+
+    Pretext: encode a clean view and a perturbed view of the same line,
+    pool each to a single line vector, run the perturbed pool through a
+    predictor MLP, then maximise the cosine similarity between the
+    student prediction and the (stop-grad) clean target.
+
+        L = -lambda_cons * cos_sim(p_pert, sg(v_clean))
+            + lambda_sigreg * SIGRegV2(z_clean)
+            + lambda_ctc    * CTC(z_clean, targets)
+
+    Notes
+    -----
+    - Cosine (not MSE) makes the target scale-invariant: shrinking the
+      embedding magnitudes does NOT minimise the consistency loss. This
+      removes one collapse mode by construction.
+    - SIGRegV2 (variance hinge on RAW std + covariance decorrelation)
+      keeps embeddings spread out per-dim and decorrelated. Gradient
+      flows through z_clean only; the perturbed branch trains via the
+      consistency term.
+    - The predictor MLP lives on the perturbed branch only (set
+      asymmetry, SimSiam recipe). It is what prevents the "encoder ==
+      identity" collapse that would otherwise satisfy cos_sim = 1.
+    - Loss is computed at the LINE level (after temporal pooling), so
+      perturbations that shift positions horizontally (the v11 default)
+      do not break alignment.
+    """
+
+    def __init__(
+        self,
+        lambda_cons=1.0,
+        lambda_sigreg=0.1,
+        lambda_ctc=1.0,
+        sigreg_var=25.0,
+        sigreg_cov=1.0,
+        sigreg_gamma=1.0,
+    ):
+        super().__init__()
+        self.lambda_cons = lambda_cons
+        self.lambda_sigreg = lambda_sigreg
+        self.lambda_ctc = lambda_ctc
+        self.reg = SIGRegLossV2(
+            lambda_var=sigreg_var,
+            lambda_cov=sigreg_cov,
+            gamma=sigreg_gamma,
+        )
+        self.ctc_loss = nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
+
+    def forward(
+        self,
+        p_pert=None,         # (B, D) predictor output on perturbed view, or None
+        v_clean=None,        # (B, D) pooled clean view, or None
+        z_seq=None,          # (B, T, D) raw clean encoder output, or None
+        ctc_logits=None,
+        targets=None,
+        input_lengths=None,
+        target_lengths=None,
+    ):
+        losses = {}
+        device = (
+            z_seq.device
+            if z_seq is not None
+            else ctc_logits.device
+            if ctc_logits is not None
+            else torch.device("cpu")
+        )
+        total = torch.zeros((), device=device)
+
+        if p_pert is not None and v_clean is not None:
+            # Cosine similarity on line vectors. Stop-grad on the clean
+            # target — gradients flow only through the perturbed branch
+            # (predictor + encoder of the perturbed view).
+            cos = F.cosine_similarity(
+                p_pert.float(), v_clean.detach().float(), dim=-1
+            )
+            cons = -cos.mean()
+            losses["cons"] = cons.detach().item()
+            total = total + self.lambda_cons * cons
+
+        if z_seq is not None:
+            reg_total, var_l, cov_l = self.reg(z_seq)
+            losses["sigreg"] = reg_total.detach().item()
+            losses["var"] = var_l.item()
+            losses["cov"] = cov_l.item()
+            total = total + self.lambda_sigreg * reg_total
+
+        if ctc_logits is not None and targets is not None:
+            ctc_input = ctc_logits.permute(1, 0, 2)
+            ctc = self.ctc_loss(ctc_input, targets, input_lengths, target_lengths)
+            total = total + self.lambda_ctc * ctc
+            losses["ctc"] = ctc.detach().item()
+
+        losses["total"] = total.detach().item()
+        return total, losses
+
+
 def test_loss():
     """Test loss functions"""
     print("\nTesting Loss Functions...")

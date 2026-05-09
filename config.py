@@ -305,5 +305,54 @@ MASK_MAX_W_V10 = 24
 MAX_N_H_V10 = 400
 
 
+# --- HWM-v11 ---
+# Return to a pure 1D Kraken-style encoder, with a SimSiam-inspired
+# consistency pretext: encode a clean view and a heavily perturbed view
+# of the same line, pool both to a single line vector, and pull them
+# together via cosine similarity. SIGRegV2 prevents collapse on the
+# raw frame embeddings; CTC trains the recognition path.
+#
+# Why this design:
+#   - 6 prior versions (v5-v10) hit the JEPA "moving target" wall.
+#     Symmetric encoder with stop-grad target collapses without EMA.
+#   - SimSiam-style asymmetry (predictor MLP on one branch only) breaks
+#     the trivial-identity solution without needing an EMA teacher.
+#   - Consistency at the pooled (line-level) granularity targets style
+#     INVARIANCE, which matches the project goal of transfer to new
+#     scribes — not predictive reconstruction at the frame level.
+
+IMG_HEIGHT_V11 = 120
+EMBEDDING_DIM_V11 = 384
+
+# Predictor MLP: 2 layers, hidden = embed_dim. Standard SimSiam scale.
+PRED_HIDDEN_V11 = 384
+
+# CTC head — BiLSTM provides temporal context for character recognition.
+CTC_HIDDEN_V11 = 256
+CTC_NUM_LSTM_V11 = 1
+
+# Loss weights.
+LAMBDA_CONS_V11 = 1.0      # consistency (cosine, perturbed -> clean)
+LAMBDA_SIGREG_V11 = 0.1    # anti-collapse on raw z
+LAMBDA_CTC_V11 = 1.0       # supervised recognition
+
+# SIGRegV2 (variance hinge on raw std + cov decorrelation).
+SIGREG_VAR_V11 = 25.0
+SIGREG_COV_V11 = 1.0
+SIGREG_GAMMA_V11 = 1.0
+
+# Perturbations applied to view 2 (the "hard" view).
+# Tuned for moderate-strong augmentation; cf. v11 design notes.
+PERT_V11_SHIFT_X = 4               # ±4 pixels horizontal shift (kills position-only collapse)
+PERT_V11_SHEAR_DEG = 5.0           # ±5° horizontal shear (style invariance)
+PERT_V11_MASK_BLOCKS = 4           # number of pixel-space mask blocks
+PERT_V11_MASK_W_MIN = 16           # mask-block width range, in pixels
+PERT_V11_MASK_W_MAX = 32
+PERT_V11_CONTRAST_MIN = 0.7
+PERT_V11_CONTRAST_MAX = 1.3
+PERT_V11_BRIGHTNESS = 0.1          # ±0.1 additive shift on normalised pixels
+PERT_V11_NOISE_STD = 0.03          # gaussian noise std
+
+
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
