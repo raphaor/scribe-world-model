@@ -528,6 +528,15 @@ if __name__ == "__main__":
         "CTC-only baseline.",
     )
     parser.add_argument(
+        "--lambda-sigreg",
+        type=float,
+        default=None,
+        help="Override the SIGReg / VICReg / SIGRegV2 anti-collapse weight. "
+        "Defaults to the per-model config constant. Useful in pure --mode "
+        "adapt to push the anti-collapse pressure when CTC isn't there to "
+        "prevent shortcuts.",
+    )
+    parser.add_argument(
         "--pred-loss",
         choices=["mse", "infonce"],
         default=None,
@@ -893,10 +902,15 @@ if __name__ == "__main__":
                 else config.LAMBDA_CONS_V11
             )
             use_pretext = lambda_cons > 0
+        lambda_sigreg_v11 = (
+            args.lambda_sigreg
+            if args.lambda_sigreg is not None
+            else config.LAMBDA_SIGREG_V11
+        )
         print(
             f"v11 SimSiam config: use_pretext={use_pretext} "
             f"lambda_cons={lambda_cons} "
-            f"lambda_sigreg={config.LAMBDA_SIGREG_V11} "
+            f"lambda_sigreg={lambda_sigreg_v11} "
             f"lambda_ctc={config.LAMBDA_CTC_V11} "
             f"embed_dim={config.EMBEDDING_DIM_V11} "
             f"pred_hidden={config.PRED_HIDDEN_V11} | "
@@ -911,7 +925,7 @@ if __name__ == "__main__":
             pred_hidden=config.PRED_HIDDEN_V11,
             num_classes=model_num_classes,
             lambda_cons=lambda_cons,
-            lambda_sigreg=config.LAMBDA_SIGREG_V11,
+            lambda_sigreg=lambda_sigreg_v11,
             lambda_ctc=config.LAMBDA_CTC_V11,
             sigreg_var=config.SIGREG_VAR_V11,
             sigreg_cov=config.SIGREG_COV_V11,
