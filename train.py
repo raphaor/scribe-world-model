@@ -464,6 +464,23 @@ if __name__ == "__main__":
     parser.add_argument("--data", default="alto", choices=["alto", "synthetic"])
     parser.add_argument("--alto-dirs", nargs="+", default=config.ALTO_DIRS)
     parser.add_argument(
+        "--exclude-dirs",
+        nargs="+",
+        default=[],
+        help="Substrings to exclude from --alto-dirs (case-sensitive substring "
+        "match). For each dir in --alto-dirs, if any --exclude-dirs entry "
+        "appears in its path, the dir is dropped. Useful for the held-out-"
+        "scribe transfer protocol: pre-train SSL on all dirs except one, "
+        "then fine-tune CTC on the held-out dir only.",
+    )
+    parser.add_argument(
+        "--save-path",
+        default=None,
+        help="Override the default checkpoint save path (e.g. hwm_v11.pt). "
+        "Use to keep adapt/fine-tune/baseline runs from overwriting each "
+        "other (e.g. --save-path hwm_v11_adapt.pt).",
+    )
+    parser.add_argument(
         "--unannotated-dirs",
         nargs="+",
         default=None,
@@ -555,6 +572,25 @@ if __name__ == "__main__":
     optimizer_state = None
     scheduler_state = None
     scaler_state = None
+
+    # Apply --exclude-dirs filter against --alto-dirs (substring match).
+    if args.exclude_dirs:
+        original_dirs = list(args.alto_dirs)
+        args.alto_dirs = [
+            d for d in args.alto_dirs
+            if not any(ex in d for ex in args.exclude_dirs)
+        ]
+        excluded = [d for d in original_dirs if d not in args.alto_dirs]
+        print(f"Excluded {len(excluded)} dir(s) matching {args.exclude_dirs}:")
+        for d in excluded:
+            print(f"  - {d}")
+        print(f"Using {len(args.alto_dirs)} dir(s):")
+        for d in args.alto_dirs:
+            print(f"  + {d}")
+        if not args.alto_dirs:
+            raise ValueError(
+                "All --alto-dirs were excluded; nothing left to train on."
+            )
 
     if args.data == "alto":
         ver = args.model_version
@@ -984,7 +1020,12 @@ if __name__ == "__main__":
         ).to(device)
         save_path = "hwm_v2.pt"
 
+    # User override (e.g. to keep adapt vs fine-tune vs baseline runs separate).
+    if args.save_path:
+        save_path = args.save_path
+
     print(f"Model params: {model.count_parameters():,}")
+    print(f"Save path: {save_path}")
 
     if ckpt is not None:
         state_dict = ckpt["model_state_dict"]

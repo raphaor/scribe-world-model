@@ -342,16 +342,22 @@ SIGREG_COV_V11 = 1.0
 SIGREG_GAMMA_V11 = 1.0
 
 # Perturbations applied to view 2 (the "hard" view).
-# Tuned for moderate-strong augmentation; cf. v11 design notes.
-PERT_V11_SHIFT_X = 4               # ±4 pixels horizontal shift (kills position-only collapse)
-PERT_V11_SHEAR_DEG = 5.0           # ±5° horizontal shear (style invariance)
-PERT_V11_MASK_BLOCKS = 4           # number of pixel-space mask blocks
-PERT_V11_MASK_W_MIN = 16           # mask-block width range, in pixels
-PERT_V11_MASK_W_MAX = 32
-PERT_V11_CONTRAST_MIN = 0.7
-PERT_V11_CONTRAST_MAX = 1.3
-PERT_V11_BRIGHTNESS = 0.1          # ±0.1 additive shift on normalised pixels
-PERT_V11_NOISE_STD = 0.03          # gaussian noise std
+#
+# Original v11 release used softer values (shift=4, shear=5, mask_blocks=4,
+# mask_w=[16,32], noise=0.03). Observed result: ``cons`` saturated at -0.92
+# from epoch 1 of the adapt run — the encoder was trivially invariant to
+# those weak perturbations and the pretext stopped producing gradient
+# signal. Bumped to harder defaults so the encoder must actually learn an
+# invariant representation instead of getting it for free.
+PERT_V11_SHIFT_X = 8               # was 4 — ±8 px horizontal shift
+PERT_V11_SHEAR_DEG = 10.0          # was 5°  — ±10° shear (more style variation)
+PERT_V11_MASK_BLOCKS = 6           # was 4  — more occlusion blocks
+PERT_V11_MASK_W_MIN = 16           # unchanged
+PERT_V11_MASK_W_MAX = 40           # was 32 — wider blocks possible
+PERT_V11_CONTRAST_MIN = 0.65       # was 0.7
+PERT_V11_CONTRAST_MAX = 1.35       # was 1.3
+PERT_V11_BRIGHTNESS = 0.15         # was 0.1
+PERT_V11_NOISE_STD = 0.05          # was 0.03
 
 
 def count_parameters(model):
