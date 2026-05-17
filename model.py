@@ -15,6 +15,7 @@ from encoder import (
     Conv2DEncoderV2,
     Conv2DEncoderV3,
     KrakenEncoder,
+    KrakenEncoderV12,
     ViTEncoder,
     HybridCNNViTEncoder,
 )
@@ -26,6 +27,7 @@ from loss import (
     MSNLoss,
     JEPALoss,
     SimSiamHybridLoss,
+    V12Loss,
 )
 from ctc_head import CTCHead, CTCHeadBiLSTM
 from jepa import sample_jepa_mask, sample_2d_block_mask
@@ -1706,6 +1708,282 @@ class HWMv11(nn.Module):
         )
 
     def adapt(self, img, input_lengths=None):
+        return self.compute_loss(img, input_lengths=input_lengths)
+
+    def count_parameters(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+class HWMv12(nn.Module):
+    """
+    Handwriting World Model v12 — Kraken 1D conv + Transformer encoder,
+    masked-segment prediction (MSN/data2vec) + Epps-Pulley SIGReg + CTC,
+    with an optional writer/page contrastive branch.
+
+    This realises the original project intuition: a Kraken decoding
+    LSTM is "moved upstream into the encoder" and replaced by a
+    Transformer; the remaining BiLSTM stays in the CTC head.
+
+    Three structural choices vs v5-v11:
+
+      1. Option B — NO final LayerNorm on the encoder. The paper's
+         SIGReg cannot match a Gaussian if a per-sample LayerNorm pins
+         frames to a sphere. The only LayerNorm in the v12 path sits
+         inside the CTC head (``ctc_norm``), where it merely stabilises
+         the BiLSTM. SIGReg, the pretext target and the writer branch
+         all consume the raw, un-normalised ``z``.
+
+      2. Real SIGReg — the Epps-Pulley regulariser from the paper
+         (random projections + univariate normality test), not the
+         VICReg-style ``SIGRegV2`` of v10/v11.
+
+      3. Pixel-space masking — masked frame spans are blanked in the
+         IMAGE, before the conv stem. The wide Kraken kernels would
+         otherwise leak masked content into neighbour tokens (the v9
+         token-masking failure). The transformer itself in-paints the
+         blanked region; no separate predictor module.
+
+    Flow
+    ----
+        line image (B, H, W)
+          ├─► clean view ─► KrakenEncoderV12 ─► z  (B, T, D)  [raw]
+          │       ├─ LayerNorm → BiLSTM → CTC
+          │       ├─ SIGReg(z)                    ← anti-collapse
+          │       └─ pool_T → style_proj → SupCon  [optional, writer_id]
+          │
+          └─► pixel-masked view ─► KrakenEncoderV12 ─► z_masked
+                  InfoNCE( jepa_proj(z_masked@masked),
+                           jepa_proj(sg z@masked) )
+
+        L = λ_ctc·CTC + λ_jepa·InfoNCE + λ_sigreg·SIGReg ( + λ_wc·SupCon )
+
+    At inference only the clean path runs: encoder → LayerNorm → BiLSTM
+    → CTC. ``adapt()`` runs the self-supervised terms only (InfoNCE +
+    SIGReg) — masked-segment prediction on an unlabelled new writer's
+    lines forces the encoder to internalise that hand.
+    """
+
+    def __init__(
+        self,
+        img_height=120,
+        embedding_dim=192,
+        num_layers=3,
+        num_heads=3,
+        ff_dim=384,
+        dropout=0.1,
+        num_classes=None,
+        lambda_ctc=1.0,
+        lambda_jepa=0.5,
+        lambda_sigreg=0.1,
+        lambda_wc=0.2,
+        ctc_hidden=192,
+        ctc_num_lstm=1,
+        proj_dim=128,
+        proj_hidden=192,
+        jepa_num_targets=4,
+        jepa_min_size=8,
+        jepa_max_size=20,
+        sigreg_projections=256,
+        sigreg_knots=17,
+        infonce_temp=0.1,
+        supcon_temp=0.1,
+        use_pretext=True,
+        use_writer_contrastive=False,
+    ):
+        super().__init__()
+        self.img_height = img_height
+        self.embedding_dim = embedding_dim
+        self.use_pretext = use_pretext
+        self.use_writer_contrastive = use_writer_contrastive
+        self.jepa_num_targets = jepa_num_targets
+        self.jepa_min_size = jepa_min_size
+        self.jepa_max_size = jepa_max_size
+        # Conv stem width stride (3 × MaxPool(2)). Frame t covers pixel
+        # columns [8t, 8t+8); used to map a frame mask back to pixels.
+        self.frame_stride = 8
+
+        self.encoder = KrakenEncoderV12(
+            img_height=img_height,
+            embedding_dim=embedding_dim,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            ff_dim=ff_dim,
+            dropout=dropout,
+        )
+
+        # Learnable scalar substituted in pixel space at masked columns.
+        self.mask_pixel = nn.Parameter(torch.zeros(()))
+
+        # SSL projection head for the InfoNCE pretext. Routing the
+        # pretext gradient through a projector keeps raw z aligned with
+        # CTC (the v6 rationale). Discarded at inference.
+        self.jepa_proj = nn.Sequential(
+            nn.Linear(embedding_dim, proj_hidden),
+            nn.GELU(),
+            nn.Linear(proj_hidden, proj_dim),
+        )
+
+        # Writer/page contrastive projection head. Built unconditionally
+        # so enabling the branch later needs no architecture change;
+        # only used when ``use_writer_contrastive`` and a writer_id is
+        # passed. Discarded at inference.
+        self.style_proj = nn.Sequential(
+            nn.Linear(embedding_dim, proj_hidden),
+            nn.GELU(),
+            nn.Linear(proj_hidden, proj_dim),
+        )
+
+        # The ONLY LayerNorm in the v12 path — stabilises the BiLSTM.
+        self.ctc_norm = nn.LayerNorm(embedding_dim)
+        self.ctc_head = (
+            CTCHeadBiLSTM(
+                embedding_dim,
+                num_classes,
+                hidden_dim=ctc_hidden,
+                num_lstm_layers=ctc_num_lstm,
+            )
+            if num_classes
+            else None
+        )
+
+        self.criterion = V12Loss(
+            lambda_ctc=lambda_ctc,
+            lambda_jepa=lambda_jepa,
+            lambda_sigreg=lambda_sigreg,
+            lambda_wc=lambda_wc,
+            infonce_temp=infonce_temp,
+            supcon_temp=supcon_temp,
+            sigreg_projections=sigreg_projections,
+            sigreg_knots=sigreg_knots,
+        )
+
+    def _pool_temporal(self, z_seq, input_lengths=None):
+        """Padding-aware mean over the time axis → (B, D) line vector."""
+        B, T, D = z_seq.shape
+        if input_lengths is None:
+            return z_seq.mean(dim=1)
+        ar = torch.arange(T, device=z_seq.device)
+        valid = (ar[None, :] < input_lengths.clamp(max=T)[:, None]).float()
+        z_masked = z_seq * valid.unsqueeze(-1)
+        denom = input_lengths.clamp(min=1, max=T).float().unsqueeze(-1)
+        return z_masked.sum(dim=1) / denom
+
+    def _make_masks(self, img, T, input_lengths):
+        """
+        Sample a frame-level block mask, return the pixel-masked image
+        and the corresponding frame mask.
+
+        The frame mask is sampled first (``sample_jepa_mask``, valid-
+        region aware), then upsampled by ``frame_stride`` to pixel
+        columns so frame mask and pixel mask are exactly consistent.
+        """
+        B, _, W = img.shape
+        frame_mask = sample_jepa_mask(
+            B,
+            T,
+            num_targets=self.jepa_num_targets,
+            min_size=self.jepa_min_size,
+            max_size=self.jepa_max_size,
+            valid_lengths=input_lengths,
+            device=img.device,
+        )  # (B, T)
+
+        pixel_mask = frame_mask.repeat_interleave(self.frame_stride, dim=1)
+        if pixel_mask.shape[1] < W:
+            pixel_mask = F.pad(pixel_mask, (0, W - pixel_mask.shape[1]))
+        else:
+            pixel_mask = pixel_mask[:, :W]
+
+        img_masked = torch.where(
+            pixel_mask.unsqueeze(1),
+            self.mask_pixel.to(img.dtype).expand_as(img),
+            img,
+        )
+        return img_masked, frame_mask
+
+    def forward(self, img):
+        """
+        Inference forward: encoder + LayerNorm + BiLSTM CTC head.
+        Returned tuple matches the (pred, z_seq, ctc_logits) contract.
+        """
+        z_seq = self.encoder(img)
+        ctc_logits = (
+            self.ctc_head(self.ctc_norm(z_seq)) if self.ctc_head is not None else None
+        )
+        return None, z_seq, ctc_logits
+
+    def compute_loss(
+        self,
+        img,
+        targets=None,
+        input_lengths=None,
+        target_lengths=None,
+        writer_id=None,
+    ):
+        # The encoder transformer runs twice (clean + masked) sharing
+        # weights; that amplifies gradients and can overflow float16.
+        # Run the whole forward + loss in float32, as in v10.
+        _amp_ctx = (
+            torch.amp.autocast("cuda", enabled=False)
+            if img.is_cuda
+            else contextlib.nullcontext()
+        )
+        with _amp_ctx:
+            img = img.float()
+            if input_lengths is not None:
+                input_lengths = input_lengths.to(img.device)
+
+            # 1. Clean branch — feeds CTC, SIGReg, JEPA targets, SupCon.
+            z_clean = self.encoder(img, input_lengths)  # (B, T, D) raw
+            B, T, D = z_clean.shape
+
+            ctc_in = input_lengths.clamp(max=T) if input_lengths is not None else None
+
+            ctc_logits = (
+                self.ctc_head(self.ctc_norm(z_clean))
+                if self.ctc_head is not None
+                else None
+            )
+
+            # Valid (non-padding) frame mask, shared by SIGReg and the
+            # pretext target selection.
+            valid_mask = None
+            if ctc_in is not None:
+                ar = torch.arange(T, device=img.device)
+                valid_mask = ar[None, :] < ctc_in[:, None]  # (B, T)
+
+            # 2. Masked-segment pretext (MSN-style, InfoNCE).
+            z_pred = z_target = None
+            if self.use_pretext:
+                img_masked, frame_mask = self._make_masks(img, T, ctc_in)
+                if valid_mask is not None:
+                    frame_mask = frame_mask & valid_mask
+                if frame_mask.any():
+                    z_masked = self.encoder(img_masked, input_lengths)
+                    z_pred = self.jepa_proj(z_masked[frame_mask])
+                    z_target = self.jepa_proj(z_clean.detach()[frame_mask])
+
+            # 3. Writer/page contrastive (optional, dormant w/o writer_id).
+            line_vec = None
+            if self.use_writer_contrastive and writer_id is not None:
+                v = self._pool_temporal(z_clean, ctc_in)
+                line_vec = self.style_proj(v)
+
+            return self.criterion(
+                z_pred=z_pred,
+                z_target=z_target,
+                z_seq=z_clean,
+                valid_mask=valid_mask,
+                ctc_logits=ctc_logits,
+                targets=targets,
+                input_lengths=ctc_in,
+                target_lengths=target_lengths,
+                line_vec=line_vec,
+                writer_id=writer_id,
+            )
+
+    def adapt(self, img, input_lengths=None):
+        """Self-supervised step: InfoNCE + SIGReg only (no CTC, no SupCon)."""
         return self.compute_loss(img, input_lengths=input_lengths)
 
     def count_parameters(self):

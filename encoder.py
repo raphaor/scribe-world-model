@@ -240,6 +240,115 @@ class KrakenEncoder(nn.Module):
         return self.norm(self.proj(x))         # (B, T, D)
 
 
+class KrakenEncoderV12(nn.Module):
+    """
+    Option-B encoder for HWMv12: Kraken-style 1D conv stem + Transformer,
+    with NO final LayerNorm.
+
+    The conv stem (wide rectangular kernels) extracts stroke-level
+    features and downsamples width by 8. A Transformer encoder then
+    contextualises the frame sequence — this is the Kraken BiLSTM
+    "moved into the encoder and replaced by attention".
+
+    The output ``z`` is deliberately UN-normalised. A per-sample final
+    LayerNorm constrains every frame to a hypersphere; the Gaussian
+    target of the paper's SIGReg cannot match a sphere-supported
+    distribution, so SIGReg never converges (LeWorldModel paper,
+    Sec. 3.1). A LayerNorm is therefore applied only downstream, inside
+    the CTC head, where it just stabilises the BiLSTM input.
+
+    The internal transformer is pre-LN (``norm_first=True``) for
+    training stability; no normalisation is applied to the final
+    output (``nn.TransformerEncoder`` with ``norm=None``).
+
+    Input:  (B, H, W) grayscale line image, H = img_height.
+    Output: (B, T, D) raw embedding sequence, T = W // 8.
+    """
+
+    def __init__(
+        self,
+        img_height=120,
+        embedding_dim=192,
+        num_layers=3,
+        num_heads=3,
+        ff_dim=384,
+        dropout=0.1,
+    ):
+        super().__init__()
+        self.img_height = img_height
+        self.embedding_dim = embedding_dim
+
+        # Conv stem identical to KrakenEncoder: rectangular kernels
+        # capture horizontal stroke structure, 3 MaxPools → W/8, H/8.
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=(3, 13), padding=(1, 6)),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.MaxPool2d(2, 2),
+            nn.Conv2d(32, 32, kernel_size=(3, 13), padding=(1, 6)),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.MaxPool2d(2, 2),
+            nn.Conv2d(32, 64, kernel_size=(3, 9), padding=(1, 4)),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.MaxPool2d(2, 2),
+            nn.Conv2d(64, 64, kernel_size=(3, 9), padding=(1, 4)),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+        )
+
+        h_out = img_height // 8
+        self.feature_dim = 64 * h_out
+        # Projection only — NO LayerNorm (Option B).
+        self.proj = nn.Linear(self.feature_dim, embedding_dim)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embedding_dim,
+            nhead=num_heads,
+            dim_feedforward=ff_dim,
+            dropout=dropout,
+            batch_first=True,
+            activation="gelu",
+            norm_first=True,
+        )
+        # norm=None ⇒ no final LayerNorm on the transformer output.
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+    def _padding_mask(self, T, input_lengths, device):
+        """(B, T) bool, True = padding frame (t >= input_lengths[b])."""
+        ar = torch.arange(T, device=device)
+        return ar[None, :] >= input_lengths[:, None]
+
+    def forward(self, img, input_lengths=None):
+        """
+        Args:
+            img: (B, H, W) grayscale line image.
+            input_lengths: optional (B,) long, valid frame counts in
+                T units (image width // 8). Used to hide padding frames
+                from self-attention.
+        Returns:
+            z: (B, T, D) raw (un-normalised) embedding sequence.
+        """
+        x = img.unsqueeze(1)               # (B, 1, H, W)
+        x = self.conv(x)                   # (B, 64, H/8, W/8)
+        B, C, H, T = x.shape
+        x = x.permute(0, 3, 1, 2).reshape(B, T, C * H)  # (B, T, 64*H/8)
+        tokens = self.proj(x)              # (B, T, D) — no LayerNorm
+
+        kpm = None
+        if input_lengths is not None:
+            kpm = self._padding_mask(T, input_lengths.clamp(max=T), img.device)
+            # A fully-padded row would make the attention softmax NaN.
+            # Extremely rare; unmask position 0 to keep it defined.
+            all_pad = kpm.all(dim=1)
+            if all_pad.any():
+                kpm = kpm.clone()
+                kpm[all_pad, 0] = False
+
+        return self.transformer(tokens, src_key_padding_mask=kpm)
+
+
 class ViTEncoder(nn.Module):
     """
     Vision-Transformer-style encoder for HWMv8.

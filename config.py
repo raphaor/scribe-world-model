@@ -360,5 +360,67 @@ PERT_V11_BRIGHTNESS = 0.15         # was 0.1
 PERT_V11_NOISE_STD = 0.05          # was 0.03
 
 
+# --- HWM-v12 ---
+# Kraken 1D conv stem + Transformer encoder (the Kraken BiLSTM "moved
+# into the encoder and replaced by attention"), trained with three
+# objectives:
+#   - CTC                      : supervised recognition
+#   - InfoNCE masked-segment   : MSN/data2vec pretext — predict the
+#       embedding of pixel-masked frame spans from context. The
+#       transformer IS the predictor (no separate module).
+#   - SIGReg (Epps-Pulley)     : the paper's real anti-collapse term
+#       (random projections + normality test), NOT the VICReg-style
+#       SIGRegV2 of v10/v11.
+# Optional 4th term: SupCon over a writer/page id (dormant until the
+# collate provides writer_id; see use_writer_contrastive).
+#
+# Design decisions (see design discussion):
+#   - Option B: NO final LayerNorm on the encoder output. A per-sample
+#     LayerNorm pins frames to a sphere, which the Gaussian SIGReg
+#     target cannot match. LN is applied only inside the CTC head.
+#   - Masking is in PIXEL space, before the conv stem: the wide Kraken
+#     kernels would otherwise leak masked content into neighbour tokens.
+# Dimensions kept deliberately light — scale up if it trains well.
+
+IMG_HEIGHT_V12 = 120
+EMBEDDING_DIM_V12 = 192
+NUM_LAYERS_V12 = 3
+NUM_HEADS_V12 = 3
+FF_DIM_V12 = 384
+
+# CTC head — BiLSTM, fed by the only LayerNorm in the v12 path.
+CTC_HIDDEN_V12 = 192
+CTC_NUM_LSTM_V12 = 1
+
+# SSL projection heads (InfoNCE + SupCon). Discarded at inference.
+PROJ_DIM_V12 = 128
+PROJ_HIDDEN_V12 = 192
+
+# Loss weights.
+LAMBDA_CTC_V12 = 1.0
+LAMBDA_JEPA_V12 = 0.5      # InfoNCE masked-segment prediction
+LAMBDA_SIGREG_V12 = 0.1    # Epps-Pulley SIGReg (paper default lambda)
+LAMBDA_WC_V12 = 0.2        # SupCon writer/page contrastive (if enabled)
+
+INFONCE_TEMP_V12 = 0.1
+SUPCON_TEMP_V12 = 0.1
+
+# Masked-segment pretext: T = W/8 frames (~100-250 for a typical line).
+# 4 blocks of 8-20 frames mask roughly 10-30 % of the sequence.
+JEPA_NUM_TARGETS_V12 = 4
+JEPA_MIN_SIZE_V12 = 8
+JEPA_MAX_SIZE_V12 = 20
+
+# Epps-Pulley SIGReg. The paper shows performance is insensitive to
+# both quantities; 256 projections keeps the (N x M x K) tensor small.
+SIGREG_PROJECTIONS_V12 = 256
+SIGREG_KNOTS_V12 = 17
+
+# Writer/page contrastive branch. Off by default: the collate does not
+# yet emit a writer_id. To enable later, plumb a per-line page id
+# through the collate and set this True.
+USE_WRITER_CONTRASTIVE_V12 = False
+
+
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)

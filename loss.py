@@ -3,6 +3,7 @@ HWM Loss Functions
 Prediction loss + SIGReg regularizer
 """
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -652,6 +653,251 @@ class SimSiamHybridLoss(nn.Module):
         if ctc_logits is not None and targets is not None:
             ctc_input = ctc_logits.permute(1, 0, 2)
             ctc = self.ctc_loss(ctc_input, targets, input_lengths, target_lengths)
+            total = total + self.lambda_ctc * ctc
+            losses["ctc"] = ctc.detach().item()
+
+        losses["total"] = total.detach().item()
+        return total, losses
+
+
+class SIGRegEppsPulleyLoss(nn.Module):
+    """
+    SIGReg as defined in the LeWorldModel paper (Maes et al.) — the
+    *real* one, not the VICReg-style ``SIGRegLossV2``.
+
+    Embeddings are projected onto M random unit directions; on each 1D
+    projection the Epps-Pulley normality statistic is optimised against
+    a standard normal N(0, 1). By the Cramér-Wold theorem, matching
+    every 1D marginal to N(0, 1) matches the full joint distribution to
+    an isotropic Gaussian N(0, I). This single term therefore pins the
+    mean to 0, the variance to 1, AND enforces Gaussianity — which is
+    why the paper needs only one regularisation weight.
+
+    Epps-Pulley statistic. ``T(h)`` is the squared L2 distance between
+    the empirical characteristic function (ECF) of a 1D sample and that
+    of N(0, 1), ``phi_0(t) = exp(-t^2 / 2)``, integrated against the
+    Gaussian weight ``exp(-t^2 / 2)``::
+
+        T(h) = integral |phi_n(t) - phi_0(t)|^2 exp(-t^2/2) dt
+             ~ sum_k w_k [ (Re phi_n(t_k) - phi_0(t_k))^2
+                           + (Im phi_n(t_k))^2 ]
+
+    with ``phi_n(t) = mean_j exp(i t h_j)``. The integral is evaluated
+    by Gauss-Hermite quadrature: the substitution ``t = sqrt(2) x``
+    turns the ``exp(-t^2/2)`` weight into the ``exp(-x^2)`` weight that
+    Gauss-Hermite integrates exactly, so the knots are ``sqrt(2) x_k``
+    and the quadrature weights ``sqrt(2) a_k``. Everything is
+    differentiable in ``h`` and hence in the encoder parameters.
+
+    IMPORTANT: the encoder output must be UN-normalised (no final
+    LayerNorm). A per-sample LayerNorm constrains samples to a sphere,
+    a support an isotropic Gaussian cannot have — SIGReg then never
+    settles (paper Sec. 3.1). HWMv12's encoder follows this (Option B).
+    """
+
+    def __init__(self, num_projections=256, num_knots=17, resample=True):
+        super().__init__()
+        self.num_projections = num_projections
+        self.resample = resample
+
+        # Gauss-Hermite nodes/weights: integral f(x) exp(-x^2) dx
+        #   ~ sum_k a_k f(x_k).  Rescale to the exp(-t^2/2) weight.
+        nodes, gh_w = np.polynomial.hermite.hermgauss(num_knots)
+        sqrt2 = float(np.sqrt(2.0))
+        knots = torch.tensor(nodes * sqrt2, dtype=torch.float32)
+        quad_w = torch.tensor(gh_w * sqrt2, dtype=torch.float32)
+        self.register_buffer("knots", knots)                    # (K,)
+        self.register_buffer("quad_w", quad_w)                   # (K,)
+        # Target ECF of N(0,1) at the knots (purely real).
+        self.register_buffer("phi0", torch.exp(-0.5 * knots * knots))  # (K,)
+        # Optional fixed projection set (used when resample=False).
+        self._fixed_U = None
+
+    def _directions(self, dim, device):
+        u = torch.randn(self.num_projections, dim, device=device)
+        return F.normalize(u, dim=1)
+
+    def forward(self, z, valid_mask=None):
+        """
+        Args:
+            z: (B, T, D) or (N, D) embeddings — raw, un-normalised.
+            valid_mask: optional (B, T) or (N,) bool, True = real
+                (non-padding) position. Padding frames are excluded so
+                they don't bias the distribution towards a spike.
+        Returns:
+            scalar SIGReg loss (mean Epps-Pulley statistic over the M
+            projections).
+        """
+        z = z.float()
+        if z.dim() == 3:
+            z = z.reshape(-1, z.shape[-1])
+        if valid_mask is not None:
+            z = z[valid_mask.reshape(-1)]
+
+        N, D = z.shape
+        if N < 2:
+            return z.new_zeros(())
+
+        if self.resample or self._fixed_U is None or self._fixed_U.shape[1] != D:
+            U = self._directions(D, z.device)
+            if not self.resample:
+                self._fixed_U = U
+        else:
+            U = self._fixed_U
+
+        h = z @ U.t()                                  # (N, M) projections
+        # ECF at every knot:  phi_n(t_k) = mean_j exp(i t_k h_j).
+        th = h.unsqueeze(-1) * self.knots.view(1, 1, -1)   # (N, M, K)
+        cos = th.cos().mean(dim=0)                     # (M, K) = Re phi_n
+        sin = th.sin().mean(dim=0)                     # (M, K) = Im phi_n
+        diff2 = (cos - self.phi0.view(1, -1)) ** 2 + sin ** 2  # (M, K)
+        stat = (diff2 * self.quad_w.view(1, -1)).sum(dim=-1)   # (M,)
+        return stat.mean()
+
+
+class SupConLoss(nn.Module):
+    """
+    Supervised contrastive loss (Khosla et al. 2020).
+
+    For each anchor, every other sample sharing its label is a positive
+    and all remaining samples are negatives. Used by HWMv12 to make line
+    embeddings of the same writer/page cluster together — an explicit
+    "writer style" signal on top of the masked-segment pretext.
+
+    Note on false negatives: with a page id used as a writer proxy, two
+    lines from different pages of the *same* clerk are treated as a
+    negative pair. This is label noise, tolerated as standard in
+    contrastive learning; the branch is optional and weighted low.
+    """
+
+    def __init__(self, temperature=0.1):
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self, feats, labels):
+        """
+        Args:
+            feats: (B, D) line embeddings (already projected).
+            labels: (B,) long writer/page ids.
+        Returns:
+            (loss, coverage) — coverage is the fraction of anchors that
+            had at least one positive in the batch (0 ⇒ loss is 0).
+        """
+        feats = F.normalize(feats.float(), dim=-1)
+        B = feats.shape[0]
+        device = feats.device
+        if B < 2:
+            return feats.new_zeros(()), feats.new_zeros(())
+
+        sim = feats @ feats.t() / self.temperature        # (B, B)
+        eye = torch.eye(B, dtype=torch.bool, device=device)
+        labels = labels.view(-1)
+        pos = (labels[:, None] == labels[None, :]) & ~eye  # (B, B)
+
+        # log-softmax over all non-self entries. Mask the diagonal with
+        # finfo.min (a large *finite* negative) rather than -inf: -inf
+        # would survive into log_prob and give -inf * 0 = NaN when
+        # multiplied by the (False) diagonal of ``pos``.
+        sim = sim.masked_fill(eye, torch.finfo(sim.dtype).min)
+        log_prob = sim - torch.logsumexp(sim, dim=1, keepdim=True)
+
+        pos_count = pos.sum(dim=1)
+        loss_i = -(log_prob * pos).sum(dim=1) / pos_count.clamp(min=1)
+        valid = pos_count > 0
+        if not valid.any():
+            return feats.new_zeros(()), feats.new_zeros(())
+        return loss_i[valid].mean(), valid.float().mean()
+
+
+class V12Loss(nn.Module):
+    """
+    HWMv12 objective — four terms, three active by default:
+
+        L = lambda_ctc    * CTC
+          + lambda_jepa   * InfoNCE(masked-segment prediction)
+          + lambda_sigreg * SIGReg(Epps-Pulley, paper)
+          + lambda_wc     * SupCon(writer/page id)        [optional]
+
+    - InfoNCE (not MSE) on the masked-segment pretext: MSE has the
+      trivial minimum ``pred = E[target|context]`` that collapses to
+      the mean (the v5-v10 wall). In-batch negatives remove it.
+    - SIGReg is the real Epps-Pulley regulariser; it needs the
+      un-normalised encoder output (Option B).
+    - SupCon fires only when ``writer_id`` is supplied; otherwise the
+      branch is inert at zero cost.
+    """
+
+    def __init__(
+        self,
+        lambda_ctc=1.0,
+        lambda_jepa=0.5,
+        lambda_sigreg=0.1,
+        lambda_wc=0.2,
+        infonce_temp=0.1,
+        supcon_temp=0.1,
+        sigreg_projections=256,
+        sigreg_knots=17,
+    ):
+        super().__init__()
+        self.lambda_ctc = lambda_ctc
+        self.lambda_jepa = lambda_jepa
+        self.lambda_sigreg = lambda_sigreg
+        self.lambda_wc = lambda_wc
+        self.infonce = InfoNCELoss(temperature=infonce_temp)
+        self.sigreg = SIGRegEppsPulleyLoss(
+            num_projections=sigreg_projections, num_knots=sigreg_knots
+        )
+        self.supcon = SupConLoss(temperature=supcon_temp)
+        self.ctc_loss = nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
+
+    def forward(
+        self,
+        z_pred=None,        # (N, P) projected masked-frame predictions
+        z_target=None,      # (N, P) projected stop-grad targets
+        z_seq=None,         # (B, T, D) raw clean encoder output (SIGReg)
+        valid_mask=None,    # (B, T) bool, True = non-padding frame
+        ctc_logits=None,
+        targets=None,
+        input_lengths=None,
+        target_lengths=None,
+        line_vec=None,      # (B, P) projected line vectors (SupCon)
+        writer_id=None,     # (B,) long writer/page ids, or None
+    ):
+        losses = {}
+        device = (
+            z_seq.device
+            if z_seq is not None
+            else ctc_logits.device
+            if ctc_logits is not None
+            else torch.device("cpu")
+        )
+        total = torch.zeros((), device=device)
+
+        # 1. Masked-segment InfoNCE. Needs >=2 masked frames for negatives.
+        if z_pred is not None and z_target is not None and z_pred.shape[0] >= 2:
+            jepa, acc = self.infonce(z_pred, z_target)
+            total = total + self.lambda_jepa * jepa
+            losses["jepa"] = jepa.detach().item()
+            losses["jepa_acc"] = acc.item()
+
+        # 2. SIGReg anti-collapse on the raw clean embeddings.
+        if z_seq is not None and self.lambda_sigreg > 0:
+            reg = self.sigreg(z_seq, valid_mask=valid_mask)
+            total = total + self.lambda_sigreg * reg
+            losses["sigreg"] = reg.detach().item()
+
+        # 3. Writer/page SupCon (optional).
+        if line_vec is not None and writer_id is not None and self.lambda_wc > 0:
+            wc, cov = self.supcon(line_vec, writer_id)
+            total = total + self.lambda_wc * wc
+            losses["wc"] = wc.detach().item()
+            losses["wc_cov"] = cov.detach().item()
+
+        # 4. CTC recognition.
+        if ctc_logits is not None and targets is not None:
+            ctc = self.ctc_loss(
+                ctc_logits.permute(1, 0, 2), targets, input_lengths, target_lengths
+            )
             total = total + self.lambda_ctc * ctc
             losses["ctc"] = ctc.detach().item()
 

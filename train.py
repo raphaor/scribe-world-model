@@ -45,6 +45,7 @@ from model import (
     HWMv9,
     HWMv10,
     HWMv11,
+    HWMv12,
 )
 from data_alto import (
     AltoLineDataset,
@@ -455,7 +456,9 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=["mixed", "full", "adapt"], default="mixed")
     parser.add_argument(
         "--model-version",
-        choices=["v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11"],
+        choices=[
+            "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12",
+        ],
         default="v5",
     )
     parser.add_argument("--epochs", type=int, default=30)
@@ -594,8 +597,10 @@ if __name__ == "__main__":
 
     if args.data == "alto":
         ver = args.model_version
-        if ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11"):
-            if ver == "v11":
+        if ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12"):
+            if ver == "v12":
+                img_h = config.IMG_HEIGHT_V12
+            elif ver == "v11":
                 img_h = config.IMG_HEIGHT_V11
             elif ver in ("v9", "v10"):
                 img_h = config.IMG_HEIGHT_V9
@@ -631,7 +636,7 @@ if __name__ == "__main__":
             generator=torch.Generator().manual_seed(42),
         )
 
-        if ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11"):
+        if ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12"):
             collate = partial(collate_alto_v5_fn, char_to_idx=char_to_idx)
         else:
             collate = partial(
@@ -669,7 +674,7 @@ if __name__ == "__main__":
             adapt_ds = UnannotatedLineDataset(
                 unannotated_dirs, img_height=img_h, augment=True
             )
-            if ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11"):
+            if ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12"):
                 adapt_collate = collate_unannotated_v5_fn
             else:
                 adapt_collate = partial(
@@ -980,6 +985,62 @@ if __name__ == "__main__":
             use_pretext=use_pretext,
         ).to(device)
         save_path = "hwm_v11.pt"
+    elif ver == "v12":
+        # v12: Kraken conv + Transformer encoder (Option B, no final LN),
+        # masked-segment InfoNCE + Epps-Pulley SIGReg + CTC. ``--no-jepa``
+        # disables the SSL pretext (CTC + SIGReg baseline).
+        if args.no_jepa:
+            lambda_jepa = 0.0
+            use_pretext = False
+        else:
+            lambda_jepa = (
+                args.lambda_pred
+                if args.lambda_pred is not None
+                else config.LAMBDA_JEPA_V12
+            )
+            use_pretext = lambda_jepa > 0
+        lambda_sigreg_v12 = (
+            args.lambda_sigreg
+            if args.lambda_sigreg is not None
+            else config.LAMBDA_SIGREG_V12
+        )
+        print(
+            f"v12 config: use_pretext={use_pretext} lambda_jepa={lambda_jepa} "
+            f"lambda_sigreg={lambda_sigreg_v12} lambda_ctc={config.LAMBDA_CTC_V12} "
+            f"writer_contrastive={config.USE_WRITER_CONTRASTIVE_V12} "
+            f"embed_dim={config.EMBEDDING_DIM_V12} layers={config.NUM_LAYERS_V12} | "
+            f"mask: {config.JEPA_NUM_TARGETS_V12} blocks "
+            f"[{config.JEPA_MIN_SIZE_V12},{config.JEPA_MAX_SIZE_V12}] frames | "
+            f"sigreg: {config.SIGREG_PROJECTIONS_V12} proj, "
+            f"{config.SIGREG_KNOTS_V12} knots"
+        )
+        model = HWMv12(
+            img_height=config.IMG_HEIGHT_V12,
+            embedding_dim=config.EMBEDDING_DIM_V12,
+            num_layers=config.NUM_LAYERS_V12,
+            num_heads=config.NUM_HEADS_V12,
+            ff_dim=config.FF_DIM_V12,
+            dropout=config.DROPOUT,
+            num_classes=model_num_classes,
+            lambda_ctc=config.LAMBDA_CTC_V12,
+            lambda_jepa=lambda_jepa,
+            lambda_sigreg=lambda_sigreg_v12,
+            lambda_wc=config.LAMBDA_WC_V12,
+            ctc_hidden=config.CTC_HIDDEN_V12,
+            ctc_num_lstm=config.CTC_NUM_LSTM_V12,
+            proj_dim=config.PROJ_DIM_V12,
+            proj_hidden=config.PROJ_HIDDEN_V12,
+            jepa_num_targets=config.JEPA_NUM_TARGETS_V12,
+            jepa_min_size=config.JEPA_MIN_SIZE_V12,
+            jepa_max_size=config.JEPA_MAX_SIZE_V12,
+            sigreg_projections=config.SIGREG_PROJECTIONS_V12,
+            sigreg_knots=config.SIGREG_KNOTS_V12,
+            infonce_temp=config.INFONCE_TEMP_V12,
+            supcon_temp=config.SUPCON_TEMP_V12,
+            use_pretext=use_pretext,
+            use_writer_contrastive=config.USE_WRITER_CONTRASTIVE_V12,
+        ).to(device)
+        save_path = "hwm_v12.pt"
     elif ver == "v4":
         model = HWMv4(
             img_height=config.IMG_HEIGHT_V4,
