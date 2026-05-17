@@ -1920,24 +1920,46 @@ class HWMv12(nn.Module):
         target_lengths=None,
         writer_id=None,
     ):
-        # The encoder transformer runs twice (clean + masked) sharing
-        # weights; that amplifies gradients and can overflow float16.
-        # Run the whole forward + loss in float32, as in v10.
-        _amp_ctx = (
+        if input_lengths is not None:
+            input_lengths = input_lengths.to(img.device)
+
+        # 1. Encoder passes — run under the caller's autocast so the conv
+        # stem (the dominant activation-memory cost) uses fp16 under AMP.
+        # The encoder keeps its own transformer in float32 internally.
+        # The transformer runs twice (clean + masked) sharing weights.
+        z_clean = self.encoder(img, input_lengths)  # (B, T, D) raw
+        B, T, D = z_clean.shape
+        ctc_in = input_lengths.clamp(max=T) if input_lengths is not None else None
+
+        # Valid (non-padding) frame mask, shared by SIGReg and the
+        # pretext target selection.
+        valid_mask = None
+        if ctc_in is not None:
+            ar = torch.arange(T, device=img.device)
+            valid_mask = ar[None, :] < ctc_in[:, None]  # (B, T)
+
+        z_masked = None
+        frame_mask = None
+        if self.use_pretext:
+            img_masked, frame_mask = self._make_masks(img, T, ctc_in)
+            if valid_mask is not None:
+                frame_mask = frame_mask & valid_mask
+            if frame_mask.any():
+                z_masked = self.encoder(img_masked, input_lengths)
+            else:
+                frame_mask = None
+
+        # 2. Heads + loss — forced to float32. SIGReg and InfoNCE run long
+        # reductions that are sensitive to fp16 precision; the tensors
+        # here are small (the sequence is /8 downsampled) so the float32
+        # cost is negligible.
+        _f32 = (
             torch.amp.autocast("cuda", enabled=False)
             if img.is_cuda
             else contextlib.nullcontext()
         )
-        with _amp_ctx:
-            img = img.float()
-            if input_lengths is not None:
-                input_lengths = input_lengths.to(img.device)
-
-            # 1. Clean branch — feeds CTC, SIGReg, JEPA targets, SupCon.
-            z_clean = self.encoder(img, input_lengths)  # (B, T, D) raw
-            B, T, D = z_clean.shape
-
-            ctc_in = input_lengths.clamp(max=T) if input_lengths is not None else None
+        with _f32:
+            z_clean = z_clean.float()
 
             ctc_logits = (
                 self.ctc_head(self.ctc_norm(z_clean))
@@ -1945,25 +1967,14 @@ class HWMv12(nn.Module):
                 else None
             )
 
-            # Valid (non-padding) frame mask, shared by SIGReg and the
-            # pretext target selection.
-            valid_mask = None
-            if ctc_in is not None:
-                ar = torch.arange(T, device=img.device)
-                valid_mask = ar[None, :] < ctc_in[:, None]  # (B, T)
-
-            # 2. Masked-segment pretext (MSN-style, InfoNCE).
+            # Masked-segment pretext (MSN-style, InfoNCE).
             z_pred = z_target = None
-            if self.use_pretext:
-                img_masked, frame_mask = self._make_masks(img, T, ctc_in)
-                if valid_mask is not None:
-                    frame_mask = frame_mask & valid_mask
-                if frame_mask.any():
-                    z_masked = self.encoder(img_masked, input_lengths)
-                    z_pred = self.jepa_proj(z_masked[frame_mask])
-                    z_target = self.jepa_proj(z_clean.detach()[frame_mask])
+            if z_masked is not None and frame_mask is not None:
+                z_masked = z_masked.float()
+                z_pred = self.jepa_proj(z_masked[frame_mask])
+                z_target = self.jepa_proj(z_clean.detach()[frame_mask])
 
-            # 3. Writer/page contrastive (optional, dormant w/o writer_id).
+            # Writer/page contrastive (optional, dormant w/o writer_id).
             line_vec = None
             if self.use_writer_contrastive and writer_id is not None:
                 v = self._pool_temporal(z_clean, ctc_in)

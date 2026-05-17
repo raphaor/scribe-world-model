@@ -3,6 +3,8 @@ HWM Encoder - CNN 1D for encoding handwriting columns
 Converts image columns to latent embeddings
 """
 
+import contextlib
+
 import torch
 import torch.nn as nn
 
@@ -334,7 +336,6 @@ class KrakenEncoderV12(nn.Module):
         x = self.conv(x)                   # (B, 64, H/8, W/8)
         B, C, H, T = x.shape
         x = x.permute(0, 3, 1, 2).reshape(B, T, C * H)  # (B, T, 64*H/8)
-        tokens = self.proj(x)              # (B, T, D) — no LayerNorm
 
         kpm = None
         if input_lengths is not None:
@@ -346,7 +347,19 @@ class KrakenEncoderV12(nn.Module):
                 kpm = kpm.clone()
                 kpm[all_pad, 0] = False
 
-        return self.transformer(tokens, src_key_padding_mask=kpm)
+        # The conv stem (the dominant activation-memory cost — it runs on
+        # the full-resolution image) executes in fp16 under AMP. The
+        # projection + transformer are forced to float32: their memory is
+        # negligible (the sequence is /8 downsampled), and float32 keeps
+        # the attention stack clear of any fp16 overflow.
+        _f32 = (
+            torch.amp.autocast("cuda", enabled=False)
+            if x.is_cuda
+            else contextlib.nullcontext()
+        )
+        with _f32:
+            tokens = self.proj(x.float())  # (B, T, D) — no LayerNorm
+            return self.transformer(tokens, src_key_padding_mask=kpm)
 
 
 class ViTEncoder(nn.Module):
