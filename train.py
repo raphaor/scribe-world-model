@@ -22,6 +22,7 @@ Curriculum / fine-tuning (pretrain adapt → fine-tune full):
 import sys
 import os
 import gc
+import copy
 import argparse
 import time
 from collections import defaultdict
@@ -35,7 +36,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, random_split, Subset
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -428,13 +429,16 @@ def train(
         if model.ctc_head and idx_to_char:
             from recognize import evaluate_cer
 
-            cer_samples = min(100, len(train_loader.dataset) // 10)
+            # Train CER: a fixed random subset — a cheap progress proxy.
+            # Val CER: the FULL val set — the metric that matters for the
+            # full -> adapt protocol, and cheap now (eval is forward-only).
+            train_samples = min(500, len(train_loader.dataset) // 10)
             train_cer = evaluate_cer(
                 model,
                 train_loader,
                 device,
                 idx_to_char,
-                max_samples=cer_samples,
+                max_samples=train_samples,
                 verbose=False,
             )
             if val_loader:
@@ -443,14 +447,15 @@ def train(
                     val_loader,
                     device,
                     idx_to_char,
-                    max_samples=cer_samples,
+                    max_samples=None,
                     verbose=True,
                 )
                 print(
-                    f"  Train CER: {train_cer:.1%} | Val CER: {val_cer:.1%} ({cer_samples} samples)"
+                    f"  Train CER: {train_cer:.1%} ({train_samples} samp) | "
+                    f"Val CER: {val_cer:.1%} (full)"
                 )
             else:
-                print(f"  Train CER: {train_cer:.1%} ({cer_samples} samples)")
+                print(f"  Train CER: {train_cer:.1%} ({train_samples} samp)")
 
         gc.collect()
         if device.type == "cuda":
@@ -646,6 +651,14 @@ if __name__ == "__main__":
             [train_size, val_size],
             generator=torch.Generator().manual_seed(42),
         )
+        # Validation must be measured on CLEAN images. train_ds and
+        # val_ds both wrap the same AltoLineDataset, so `augment` is
+        # shared — rebind val to a shallow copy that shares the `samples`
+        # list (no RAM duplication) but carries its own augment=False.
+        # The split indices are reused, so the partition is unchanged.
+        _val_base = copy.copy(dataset)
+        _val_base.augment = False
+        val_ds = Subset(_val_base, val_ds.indices)
 
         if ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12"):
             collate = partial(collate_alto_v5_fn, char_to_idx=char_to_idx)

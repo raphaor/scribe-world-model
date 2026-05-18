@@ -4,6 +4,8 @@ Greedy CTC decoding and Character Error Rate (CER) evaluation.
 """
 
 import sys
+import random
+
 import torch
 
 
@@ -65,15 +67,85 @@ def compute_cer(predictions, ground_truths):
     return total_dist / max(total_len, 1)
 
 
+# Fixed seed: the displayed sample is the SAME 10 lines every epoch and
+# across runs. The dataset order is deterministic and the train/val
+# split is seeded, so fixed indices map to fixed lines.
+_SAMPLE_SEED = 20240517
+_NUM_SAMPLES = 10
+# Fixed seed for the truncated-CER subset (see evaluate_cer).
+_CER_SEED = 770414
+
+
+def _show_fixed_samples(model, loader, device, idx_to_char, use_amp):
+    """
+    Print predictions for a fixed random subset of the loader's dataset.
+
+    Replaces the old "first 10 in loader order": with a width-bucketed
+    loader the first batch holds only the narrowest (trivial) lines.
+    Indices are drawn once from a fixed seed so the sample is stable
+    epoch-to-epoch and run-to-run; augmentation is disabled for the
+    fetch so the pixels — and predictions — don't jitter.
+    """
+    ds = loader.dataset
+    n = len(ds)
+    if n == 0:
+        return
+    k = min(_NUM_SAMPLES, n)
+    pick = sorted(random.Random(_SAMPLE_SEED).sample(range(n), k))
+
+    base = ds.dataset if isinstance(ds, torch.utils.data.Subset) else ds
+    old_aug = getattr(base, "augment", False)
+    if hasattr(base, "augment"):
+        base.augment = False
+    try:
+        items = [ds[i] for i in pick]
+    finally:
+        if hasattr(base, "augment"):
+            base.augment = old_aug
+
+    img_seqs, _t, input_lengths, _tl, raw_texts = loader.collate_fn(items)
+    img_seqs = img_seqs.to(device, non_blocking=True)
+    with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp):
+        _, _, ctc_logits = model(img_seqs)
+    decoded = ctc_greedy_decode(ctc_logits.cpu(), input_lengths.clone(), idx_to_char)
+
+    print(f"\nExamples ({k} fixed random lines, idx {pick}):")
+    for pred, gt in zip(decoded, raw_texts):
+        mark = "OK" if pred == gt else "ERR"
+        print(f"  [{mark}] GT:   {_safe_print(gt)}")
+        print(f"        PRED: {_safe_print(pred)}")
+
+
 def evaluate_cer(model, loader, device, idx_to_char, max_samples=None, verbose=True):
-    """Run full CTC evaluation on a DataLoader."""
+    """
+    Run CTC evaluation on a DataLoader.
+
+    With max_samples=None the whole dataset is evaluated. When
+    max_samples truncates, a FIXED seeded random subset is evaluated —
+    NOT the first max_samples in loader order: the width-bucket sampler
+    iterates shortest-first, so loader order would make the CER a sample
+    of the easiest (shortest) lines — optimistically biased and not
+    representative. The seeded subset is also stable epoch-to-epoch.
+    """
     model.eval()
-    all_preds = []
-    all_gts = []
     use_amp = device.type == "cuda"
 
+    ds = loader.dataset
+    n = len(ds)
+    if max_samples is not None and max_samples < n:
+        idx = sorted(random.Random(_CER_SEED).sample(range(n), max_samples))
+        eval_loader = torch.utils.data.DataLoader(
+            torch.utils.data.Subset(ds, idx),
+            batch_size=64,
+            collate_fn=loader.collate_fn,
+        )
+    else:
+        eval_loader = loader  # full pass — loader order is irrelevant
+
+    all_preds = []
+    all_gts = []
     with torch.no_grad():
-        for batch_idx, batch in enumerate(loader):
+        for batch in eval_loader:
             img_seqs, targets, input_lengths, target_lengths, raw_texts = batch
             img_seqs = img_seqs.to(device, non_blocking=True)
             input_lengths_cpu = input_lengths.clone()
@@ -87,17 +159,10 @@ def evaluate_cer(model, loader, device, idx_to_char, max_samples=None, verbose=T
             all_preds.extend(decoded)
             all_gts.extend(raw_texts)
 
-            if max_samples and len(all_preds) >= max_samples:
-                break
-
     cer = compute_cer(all_preds, all_gts)
 
     if verbose:
-        print("\nExamples (first 10):")
-        for pred, gt in zip(all_preds[:10], all_gts[:10]):
-            mark = "OK" if pred == gt else "ERR"
-            print(f"  [{mark}] GT:   {_safe_print(gt)}")
-            print(f"        PRED: {_safe_print(pred)}")
+        _show_fixed_samples(model, loader, device, idx_to_char, use_amp)
 
     torch.cuda.empty_cache()
     return cer
