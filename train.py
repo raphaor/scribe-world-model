@@ -429,9 +429,10 @@ def train(
         if model.ctc_head and idx_to_char:
             from recognize import evaluate_cer
 
-            # Train CER: a fixed random subset — a cheap progress proxy.
-            # Val CER: the FULL val set — the metric that matters for the
-            # full -> adapt protocol, and cheap now (eval is forward-only).
+            # Train + Val CER: each on a fixed random 500-line subset
+            # (seeded -> representative AND stable epoch-to-epoch). A
+            # full-val pass every epoch was too slow. The protocol's
+            # "official" CER stays a separate full recognize.py run.
             train_samples = min(500, len(train_loader.dataset) // 10)
             train_cer = evaluate_cer(
                 model,
@@ -442,17 +443,18 @@ def train(
                 verbose=False,
             )
             if val_loader:
+                val_samples = min(500, len(val_loader.dataset) // 10)
                 val_cer = evaluate_cer(
                     model,
                     val_loader,
                     device,
                     idx_to_char,
-                    max_samples=None,
+                    max_samples=val_samples,
                     verbose=True,
                 )
                 print(
                     f"  Train CER: {train_cer:.1%} ({train_samples} samp) | "
-                    f"Val CER: {val_cer:.1%} (full)"
+                    f"Val CER: {val_cer:.1%} ({val_samples} samp)"
                 )
             else:
                 print(f"  Train CER: {train_cer:.1%} ({train_samples} samp)")
