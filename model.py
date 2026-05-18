@@ -1789,6 +1789,7 @@ class HWMv12(nn.Module):
         supcon_temp=0.1,
         use_pretext=True,
         use_writer_contrastive=False,
+        use_checkpoint=False,
     ):
         super().__init__()
         self.img_height = img_height
@@ -1809,6 +1810,7 @@ class HWMv12(nn.Module):
             num_heads=num_heads,
             ff_dim=ff_dim,
             dropout=dropout,
+            use_checkpoint=use_checkpoint,
         )
 
         # Learnable scalar substituted in pixel space at masked columns.

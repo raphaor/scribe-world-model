@@ -546,6 +546,14 @@ if __name__ == "__main__":
         "self-supervised pretext task actually helps CTC.",
     )
     parser.add_argument(
+        "--grad-checkpoint",
+        action="store_true",
+        help="(v12) Gradient-checkpoint the encoder conv stem: drop its "
+        "activations and recompute them in the backward pass. ~30%% more "
+        "compute for a large peak-VRAM cut — lets a bigger batch fit "
+        "without spilling into shared GPU memory.",
+    )
+    parser.add_argument(
         "--target-norm",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -1064,6 +1072,7 @@ if __name__ == "__main__":
             supcon_temp=config.SUPCON_TEMP_V12,
             use_pretext=use_pretext,
             use_writer_contrastive=config.USE_WRITER_CONTRASTIVE_V12,
+            use_checkpoint=args.grad_checkpoint,
         ).to(device)
         save_path = "hwm_v12.pt"
     elif ver == "v4":

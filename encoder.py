@@ -7,6 +7,7 @@ import contextlib
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 
 class CNNEncoder(nn.Module):
@@ -275,10 +276,17 @@ class KrakenEncoderV12(nn.Module):
         num_heads=3,
         ff_dim=384,
         dropout=0.1,
+        use_checkpoint=False,
     ):
         super().__init__()
         self.img_height = img_height
         self.embedding_dim = embedding_dim
+        # Gradient checkpointing on the conv stem: the stem runs on the
+        # full-resolution image and is the dominant activation-memory
+        # cost (×2 — v12 encodes a clean and a masked view per step).
+        # Checkpointing drops its activations and recomputes them in
+        # the backward pass — ~30% more compute for a large memory cut.
+        self.use_checkpoint = use_checkpoint
 
         # Conv stem identical to KrakenEncoder: rectangular kernels
         # capture horizontal stroke structure, 3 MaxPools → W/8, H/8.
@@ -333,7 +341,13 @@ class KrakenEncoderV12(nn.Module):
             z: (B, T, D) raw (un-normalised) embedding sequence.
         """
         x = img.unsqueeze(1)               # (B, 1, H, W)
-        x = self.conv(x)                   # (B, 64, H/8, W/8)
+        if self.use_checkpoint and self.training:
+            # use_reentrant=False: works although `x` itself carries no
+            # grad (the conv parameters do), and restores the RNG state
+            # so the Dropout masks match between forward and recompute.
+            x = checkpoint(self.conv, x, use_reentrant=False)
+        else:
+            x = self.conv(x)               # (B, 64, H/8, W/8)
         B, C, H, T = x.shape
         x = x.permute(0, 3, 1, 2).reshape(B, T, C * H)  # (B, T, 64*H/8)
 
