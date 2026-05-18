@@ -68,7 +68,10 @@ def _parse_page(args):
             continue
 
         line_img = line_img.resize((new_w, img_height), Image.LANCZOS)
-        arr = np.array(line_img.convert("L"), dtype=np.float32)
+        # Store as uint8 (1 byte/pixel): the in-RAM dataset is otherwise
+        # 4x larger for nothing. __getitem__ does `/ 255.0` which promotes
+        # to float anyway, and _augment casts via uint8 already.
+        arr = np.array(line_img.convert("L"), dtype=np.uint8)
         samples.append((arr, text))
         chars.update(text)
 
@@ -121,16 +124,23 @@ class AltoLineDataset(Dataset):
 
         tasks = [(xml_path, img_height, max_width) for xml_path in xml_files]
 
+        # Parse in parallel but reassemble in deterministic task order.
+        # as_completed yields by completion time, so extending samples
+        # directly would make the list order — and hence the seeded
+        # random_split train/val partition — depend on thread timing.
+        # Index the results to keep the split a pure function of the data.
+        results = [None] * len(tasks)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(_parse_page, t): t for t in tasks}
+            futures = {executor.submit(_parse_page, t): i for i, t in enumerate(tasks)}
             done = 0
             for future in as_completed(futures):
                 done += 1
-                page_samples, page_chars = future.result()
-                self.samples.extend(page_samples)
-                self.chars.update(page_chars)
+                results[futures[future]] = future.result()
                 sys.stdout.write(f"\r  Parsing pages: {done}/{len(tasks)}")
                 sys.stdout.flush()
+        for page_samples, page_chars in results:
+            self.samples.extend(page_samples)
+            self.chars.update(page_chars)
 
         sys.stdout.write("\n")
         print(f"Loaded {len(self.samples)} lines from {len(alto_dirs)} dirs")
@@ -205,15 +215,18 @@ class UnannotatedLineDataset(Dataset):
 
         tasks = [(xml_path, img_height, max_width) for xml_path in xml_files]
 
+        # Deterministic task-order reassembly (see AltoLineDataset).
+        results = [None] * len(tasks)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(_parse_page, t): t for t in tasks}
+            futures = {executor.submit(_parse_page, t): i for i, t in enumerate(tasks)}
             done = 0
             for future in as_completed(futures):
                 done += 1
-                page_samples, _ = future.result()
-                self.samples.extend([arr for arr, _text in page_samples])
+                results[futures[future]] = future.result()
                 sys.stdout.write(f"\r  Parsing unannotated pages: {done}/{len(tasks)}")
                 sys.stdout.flush()
+        for page_samples, _chars in results:
+            self.samples.extend([arr for arr, _text in page_samples])
 
         sys.stdout.write("\n")
         print(f"Loaded {len(self.samples)} unannotated lines from {len(dirs)} dirs")
@@ -364,3 +377,91 @@ def build_alphabet(alto_dirs):
 
     print(f"Alphabet: {len(chars)} characters")
     return char_to_idx, idx_to_char
+
+
+def line_widths(ds):
+    """
+    Return the pixel width of every sample of ``ds``, in dataset order.
+
+    Handles a bare AltoLineDataset / UnannotatedLineDataset as well as a
+    ``torch.utils.data.Subset`` (as produced by ``random_split``). The
+    returned widths are positional — width[p] is the width of the sample
+    the loader sees at position ``p`` — so a LengthBucketBatchSampler
+    built on them yields valid indices for that (sub)dataset.
+    """
+    if isinstance(ds, torch.utils.data.Subset):
+        base, idxs = ds.dataset, ds.indices
+    else:
+        base, idxs = ds, range(len(ds))
+    samples = base.samples
+    widths = []
+    for i in idxs:
+        s = samples[i]
+        arr = s[0] if isinstance(s, tuple) else s   # (arr, text) or bare arr
+        widths.append(int(arr.shape[1]))
+    return widths
+
+
+class LengthBucketBatchSampler:
+    """
+    Width-homogeneous, memory-budgeted batch sampler.
+
+    Two problems with plain shuffled batching of variable-width lines:
+      * a batch is padded to its widest line, so one ~2000px line in a
+        batch of otherwise-narrow lines wastes most of the tensor;
+      * peak VRAM is set by the unluckiest batch — irreproducible spikes.
+
+    This sampler sorts lines by width inside shuffled pools, so each
+    batch pads to a near-uniform width, and caps every batch by a fixed
+    ``count * max_width`` token budget: a batch of wide lines simply
+    holds fewer lines. Peak activation memory is therefore bounded and
+    predictable, and padding waste is near zero.
+
+    ``batch_size`` is the count for a *median-width* batch and the hard
+    upper bound on count; wider batches get fewer lines, never more.
+    Yields positional indices, so it works directly on a Subset.
+    """
+
+    def __init__(self, widths, batch_size, shuffle=True, pool_factor=50):
+        self.widths = [int(w) for w in widths]
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.pool_size = max(batch_size, batch_size * pool_factor)
+        if self.widths:
+            med = sorted(self.widths)[len(self.widths) // 2]
+        else:
+            med = 1
+        self.cap = batch_size * max(1, med)          # count*width budget
+        self._len = len(self._build(shuffle=False))
+
+    def _build(self, shuffle):
+        n = len(self.widths)
+        order = list(range(n))
+        if shuffle:
+            random.shuffle(order)
+        batches = []
+        for ps in range(0, n, self.pool_size):
+            pool = sorted(order[ps:ps + self.pool_size], key=lambda i: self.widths[i])
+            batch, bmax = [], 0
+            for i in pool:
+                w = self.widths[i]
+                nmax = max(bmax, w)
+                if batch and (
+                    len(batch) >= self.batch_size
+                    or (len(batch) + 1) * nmax > self.cap
+                ):
+                    batches.append(batch)
+                    batch, nmax = [], w
+                batch.append(i)
+                bmax = nmax
+            if batch:
+                batches.append(batch)
+        if shuffle:
+            random.shuffle(batches)
+        return batches
+
+    def __iter__(self):
+        return iter(self._build(self.shuffle))
+
+    def __len__(self):
+        return self._len

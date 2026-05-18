@@ -27,6 +27,12 @@ import time
 from collections import defaultdict
 from functools import partial
 
+# Must be set before the CUDA caching allocator initialises (i.e. before
+# `import torch`). expandable_segments lets the allocator grow/shrink
+# segments instead of fragmenting — with variable-width batches this
+# avoids spilling into slow shared GPU memory.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
@@ -54,6 +60,8 @@ from data_alto import (
     collate_unannotated_fn,
     collate_alto_v5_fn,
     collate_unannotated_v5_fn,
+    line_widths,
+    LengthBucketBatchSampler,
 )
 
 
@@ -567,7 +575,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if torch.cuda.is_available():
-        torch.backends.cudnn.benchmark = True
+        # benchmark=True only pays off with STABLE input shapes; here the
+        # batch width changes every step, so it would re-benchmark and
+        # cache a conv workspace per shape — fragmentation, not speed.
+        torch.backends.cudnn.benchmark = False
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
@@ -643,23 +654,32 @@ if __name__ == "__main__":
                 collate_alto_fn, window_size=ws, stride=stride, char_to_idx=char_to_idx
             )
         pin_mem = device.type == "cuda"
-        train_loader = DataLoader(
-            train_ds,
-            batch_size=args.batch_size,
-            shuffle=True,
-            collate_fn=collate,
-            num_workers=args.num_workers,
-            pin_memory=pin_mem,
-            persistent_workers=args.num_workers > 0,
-        )
-        val_loader = DataLoader(
-            val_ds,
-            batch_size=args.batch_size,
-            collate_fn=collate,
-            num_workers=args.num_workers,
-            pin_memory=pin_mem,
-            persistent_workers=args.num_workers > 0,
-        )
+        # v5+ feeds full-line images (variable width) to the loader, so
+        # bucket by width to bound peak VRAM and kill padding waste.
+        # v2-v4 pre-extract fixed-size frame columns — plain batching.
+        use_bucketing = ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12")
+
+        def _make_loader(ds, collate_fn, shuffle):
+            common = dict(
+                collate_fn=collate_fn,
+                num_workers=args.num_workers,
+                pin_memory=pin_mem,
+                persistent_workers=args.num_workers > 0,
+            )
+            if use_bucketing:
+                return DataLoader(
+                    ds,
+                    batch_sampler=LengthBucketBatchSampler(
+                        line_widths(ds), args.batch_size, shuffle=shuffle
+                    ),
+                    **common,
+                )
+            return DataLoader(
+                ds, batch_size=args.batch_size, shuffle=shuffle, **common
+            )
+
+        train_loader = _make_loader(train_ds, collate, shuffle=True)
+        val_loader = _make_loader(val_ds, collate, shuffle=False)
 
         # --- Build adapt_loader for mixed mode ---
         # NOTE: when --unannotated-dirs is not provided, the same ALTO dirs
@@ -680,15 +700,7 @@ if __name__ == "__main__":
                 adapt_collate = partial(
                     collate_unannotated_fn, window_size=ws, stride=stride
                 )
-            adapt_loader = DataLoader(
-                adapt_ds,
-                batch_size=args.batch_size,
-                shuffle=True,
-                collate_fn=adapt_collate,
-                num_workers=args.num_workers,
-                pin_memory=pin_mem,
-                persistent_workers=args.num_workers > 0,
-            )
+            adapt_loader = _make_loader(adapt_ds, adapt_collate, shuffle=True)
             print(
                 f"Mixed mode: {len(train_ds)} annotated + {len(adapt_ds)} unannotated lines"
             )
