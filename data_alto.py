@@ -404,21 +404,23 @@ def line_widths(ds):
 
 class LengthBucketBatchSampler:
     """
-    Width-homogeneous, memory-budgeted batch sampler.
+    Width-homogeneous, fixed-count batch sampler.
 
-    Two problems with plain shuffled batching of variable-width lines:
-      * a batch is padded to its widest line, so one ~2000px line in a
-        batch of otherwise-narrow lines wastes most of the tensor;
-      * peak VRAM is set by the unluckiest batch — irreproducible spikes.
+    Plain shuffled batching of variable-width lines pads every batch to
+    its widest line — one ~2000px line in an otherwise-narrow batch
+    wastes most of the tensor and spikes VRAM unpredictably.
 
-    This sampler sorts lines by width inside shuffled pools, so each
-    batch pads to a near-uniform width, and caps every batch by a fixed
-    ``count * max_width`` token budget: a batch of wide lines simply
-    holds fewer lines. Peak activation memory is therefore bounded and
-    predictable, and padding waste is near zero.
+    This sampler sorts lines by width inside shuffled pools and cuts
+    fixed ``batch_size``-line batches from each pool, so every batch is
+    near-uniform in width: padding waste is near zero, and peak VRAM is
+    the *widest* batch (``batch_size`` lines at the maximum line width)
+    — choose ``batch_size`` so that batch fits.
 
-    ``batch_size`` is the count for a *median-width* batch and the hard
-    upper bound on count; wider batches get fewer lines, never more.
+    Every batch holds exactly ``batch_size`` lines (bar the last of each
+    pool). Uniform count matters for training: with CTC's mean reduction
+    and JEPA's in-batch InfoNCE negatives, a variable count would
+    silently re-weight long lines and swing the contrastive loss scale.
+    Batch *order* is shuffled, so an epoch never drifts short->long.
     Yields positional indices, so it works directly on a Subset.
     """
 
@@ -427,11 +429,6 @@ class LengthBucketBatchSampler:
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.pool_size = max(batch_size, batch_size * pool_factor)
-        if self.widths:
-            med = sorted(self.widths)[len(self.widths) // 2]
-        else:
-            med = 1
-        self.cap = batch_size * max(1, med)          # count*width budget
         self._len = len(self._build(shuffle=False))
 
     def _build(self, shuffle):
@@ -441,21 +438,11 @@ class LengthBucketBatchSampler:
             random.shuffle(order)
         batches = []
         for ps in range(0, n, self.pool_size):
+            # Sort the pool by width, then cut fixed-size chunks: each
+            # batch is width-homogeneous AND holds batch_size lines.
             pool = sorted(order[ps:ps + self.pool_size], key=lambda i: self.widths[i])
-            batch, bmax = [], 0
-            for i in pool:
-                w = self.widths[i]
-                nmax = max(bmax, w)
-                if batch and (
-                    len(batch) >= self.batch_size
-                    or (len(batch) + 1) * nmax > self.cap
-                ):
-                    batches.append(batch)
-                    batch, nmax = [], w
-                batch.append(i)
-                bmax = nmax
-            if batch:
-                batches.append(batch)
+            for bs in range(0, len(pool), self.batch_size):
+                batches.append(pool[bs:bs + self.batch_size])
         if shuffle:
             random.shuffle(batches)
         return batches
