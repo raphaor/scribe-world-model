@@ -14,6 +14,7 @@ from kraken.lib.xml import XMLPage
 from kraken.lib.segmentation import extract_polygons
 import torch
 from torch.utils.data import Dataset
+import math
 import os
 import sys
 import glob
@@ -422,14 +423,25 @@ class LengthBucketBatchSampler:
     silently re-weight long lines and swing the contrastive loss scale.
     Batch *order* is shuffled, so an epoch never drifts short->long.
     Yields positional indices, so it works directly on a Subset.
+
+    ``oversample_factor`` duplicates batches that contain at least one
+    line wider than ``long_threshold_px``, so the model sees long lines
+    more often per epoch.  oversample_factor=2.0 means each such batch
+    appears twice (one original + one extra copy).
     """
 
-    def __init__(self, widths, batch_size, shuffle=True, pool_factor=50):
+    def __init__(self, widths, batch_size, shuffle=True, pool_factor=10,
+                 oversample_factor=1.0, long_threshold_px=800):
         self.widths = [int(w) for w in widths]
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.pool_size = max(batch_size, batch_size * pool_factor)
-        self._len = len(self._build(shuffle=False))
+        self.oversample_factor = oversample_factor
+        self.long_threshold_px = long_threshold_px
+        self._extra = (math.floor(self.oversample_factor - 1)
+                       if self.oversample_factor > 1.0 else 0)
+        base_batches = self._build(shuffle=False)
+        self._len = self._apply_oversample(base_batches, count_only=True)
 
     def _build(self, shuffle):
         n = len(self.widths)
@@ -438,8 +450,6 @@ class LengthBucketBatchSampler:
             random.shuffle(order)
         batches = []
         for ps in range(0, n, self.pool_size):
-            # Sort the pool by width, then cut fixed-size chunks: each
-            # batch is width-homogeneous AND holds batch_size lines.
             pool = sorted(order[ps:ps + self.pool_size], key=lambda i: self.widths[i])
             for bs in range(0, len(pool), self.batch_size):
                 batches.append(pool[bs:bs + self.batch_size])
@@ -447,8 +457,26 @@ class LengthBucketBatchSampler:
             random.shuffle(batches)
         return batches
 
+    def _is_long_batch(self, batch):
+        return any(self.widths[i] >= self.long_threshold_px for i in batch)
+
+    def _apply_oversample(self, batches, count_only=False):
+        if self._extra == 0:
+            return len(batches) if count_only else batches
+        long_count = sum(1 for b in batches if self._is_long_batch(b))
+        total = len(batches) + long_count * self._extra
+        if count_only:
+            return total
+        out = list(batches)
+        for b in batches:
+            if self._is_long_batch(b):
+                out.extend([b] * self._extra)
+        return out
+
     def __iter__(self):
-        return iter(self._build(self.shuffle))
+        batches = self._build(self.shuffle)
+        batches = self._apply_oversample(batches)
+        return iter(batches)
 
     def __len__(self):
         return self._len
