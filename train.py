@@ -507,6 +507,19 @@ if __name__ == "__main__":
     )
     parser.add_argument("--checkpoint", default=None, help="Resume from checkpoint")
     parser.add_argument(
+        "--oversample-factor",
+        type=float,
+        default=1.0,
+        help="Oversample batches containing long lines (>= --long-threshold-px). "
+        "2.0 = each long batch appears twice per epoch. 1.0 = disabled.",
+    )
+    parser.add_argument(
+        "--long-threshold-px",
+        type=int,
+        default=800,
+        help="Width threshold (px) for oversampling long-line batches.",
+    )
+    parser.add_argument(
         "--num-workers",
         type=int,
         default=0,
@@ -693,7 +706,9 @@ if __name__ == "__main__":
                 return DataLoader(
                     ds,
                     batch_sampler=LengthBucketBatchSampler(
-                        line_widths(ds), args.batch_size, shuffle=shuffle
+                        line_widths(ds), args.batch_size, shuffle=shuffle,
+                        oversample_factor=args.oversample_factor,
+                        long_threshold_px=args.long_threshold_px,
                     ),
                     **common,
                 )
