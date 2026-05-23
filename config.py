@@ -421,6 +421,51 @@ SIGREG_KNOTS_V12 = 17
 # through the collate and set this True.
 USE_WRITER_CONTRASTIVE_V12 = False
 
+# --- HWM-v13 ---
+# Capacity bump: same v12 architecture (KrakenEncoderV12 + Transformer + BiLSTM CTC)
+# but wider embedding (384 vs 192) and 2 BiLSTM layers in the CTC head (vs 1).
+# Target: match lectaurep_base (4.0M, 3×BiLSTM200, 960-dim input) capacity.
+#
+# Dimension comparison with lectaurep_base:
+#   lectaurep_base: conv→960 features → 3×BiLSTM(200) → 400 bidir
+#   v13:           conv→960 features → proj→384 → Transformer(384) → 2×BiLSTM(384)
+#
+# The conv stem is identical (4 conv layers, same kernels, 64 filters out).
+# KrakenEncoderV12.feature_dim = 64 * (120/8) = 960, then projected to 384.
+
+EMBEDDING_DIM_V13 = 384
+NUM_LAYERS_V13 = 3          # same transformer depth as v12
+NUM_HEADS_V13 = 6           # 384/6 = 64 per head (was 192/3=64, same ratio)
+FF_DIM_V13 = 768            # 2× embedding_dim (same ratio as v12)
+
+# CTC head — 2 BiLSTM layers (vs 1 in v12), hidden stays at 192.
+CTC_HIDDEN_V13 = 192
+CTC_NUM_LSTM_V13 = 2
+
+# SSL projection heads — scaled up with embedding_dim.
+PROJ_DIM_V13 = 128
+PROJ_HIDDEN_V13 = 384
+
+# Loss weights — keep v12 defaults, they worked.
+LAMBDA_CTC_V13 = 1.0
+LAMBDA_JEPA_V13 = 0.5
+LAMBDA_SIGREG_V13 = 0.1
+LAMBDA_WC_V13 = 0.2
+
+INFONCE_TEMP_V13 = 0.1
+SUPCON_TEMP_V13 = 0.1
+
+# Masked-segment pretext — same as v12.
+JEPA_NUM_TARGETS_V13 = 4
+JEPA_MIN_SIZE_V13 = 8
+JEPA_MAX_SIZE_V13 = 20
+
+# SIGReg — same as v12.
+SIGREG_PROJECTIONS_V13 = 256
+SIGREG_KNOTS_V13 = 17
+
+USE_WRITER_CONTRASTIVE_V13 = False
+
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)

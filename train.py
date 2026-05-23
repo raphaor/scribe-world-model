@@ -472,7 +472,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model-version",
         choices=[
-            "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12",
+            "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13",
         ],
         default="v5",
     )
@@ -1092,6 +1092,61 @@ if __name__ == "__main__":
             use_checkpoint=args.grad_checkpoint,
         ).to(device)
         save_path = "hwm_v12.pt"
+    elif ver == "v13":
+        if args.lambda_pred is not None and args.lambda_pred == 0:
+            lambda_jepa = 0.0
+            use_pretext = False
+        else:
+            lambda_jepa = (
+                args.lambda_pred
+                if args.lambda_pred is not None
+                else config.LAMBDA_JEPA_V13
+            )
+            use_pretext = lambda_jepa > 0
+        lambda_sigreg_v13 = (
+            args.lambda_sigreg
+            if args.lambda_sigreg is not None
+            else config.LAMBDA_SIGREG_V13
+        )
+        print(
+            f"v13 config: use_pretext={use_pretext} lambda_jepa={lambda_jepa} "
+            f"lambda_sigreg={lambda_sigreg_v13} lambda_ctc={config.LAMBDA_CTC_V13} "
+            f"writer_contrastive={config.USE_WRITER_CONTRASTIVE_V13} "
+            f"embed_dim={config.EMBEDDING_DIM_V13} layers={config.NUM_LAYERS_V13} "
+            f"ctc_lstm={config.CTC_NUM_LSTM_V13} | "
+            f"mask: {config.JEPA_NUM_TARGETS_V13} blocks "
+            f"[{config.JEPA_MIN_SIZE_V13},{config.JEPA_MAX_SIZE_V13}] frames | "
+            f"sigreg: {config.SIGREG_PROJECTIONS_V13} proj, "
+            f"{config.SIGREG_KNOTS_V13} knots"
+        )
+        model = HWMv12(
+            img_height=config.IMG_HEIGHT_V12,
+            embedding_dim=config.EMBEDDING_DIM_V13,
+            num_layers=config.NUM_LAYERS_V13,
+            num_heads=config.NUM_HEADS_V13,
+            ff_dim=config.FF_DIM_V13,
+            dropout=config.DROPOUT,
+            num_classes=model_num_classes,
+            lambda_ctc=config.LAMBDA_CTC_V13,
+            lambda_jepa=lambda_jepa,
+            lambda_sigreg=lambda_sigreg_v13,
+            lambda_wc=config.LAMBDA_WC_V13,
+            ctc_hidden=config.CTC_HIDDEN_V13,
+            ctc_num_lstm=config.CTC_NUM_LSTM_V13,
+            proj_dim=config.PROJ_DIM_V13,
+            proj_hidden=config.PROJ_HIDDEN_V13,
+            jepa_num_targets=config.JEPA_NUM_TARGETS_V13,
+            jepa_min_size=config.JEPA_MIN_SIZE_V13,
+            jepa_max_size=config.JEPA_MAX_SIZE_V13,
+            sigreg_projections=config.SIGREG_PROJECTIONS_V13,
+            sigreg_knots=config.SIGREG_KNOTS_V13,
+            infonce_temp=config.INFONCE_TEMP_V13,
+            supcon_temp=config.SUPCON_TEMP_V13,
+            use_pretext=use_pretext,
+            use_writer_contrastive=config.USE_WRITER_CONTRASTIVE_V13,
+            use_checkpoint=args.grad_checkpoint,
+        ).to(device)
+        save_path = "hwm_v13.pt"
     elif ver == "v4":
         model = HWMv4(
             img_height=config.IMG_HEIGHT_V4,
