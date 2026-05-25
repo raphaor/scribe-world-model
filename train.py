@@ -472,7 +472,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model-version",
         choices=[
-            "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13",
+            "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14",
         ],
         default="v5",
     )
@@ -636,8 +636,8 @@ if __name__ == "__main__":
 
     if args.data == "alto":
         ver = args.model_version
-        if ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13"):
-            if ver in ("v12", "v13"):
+        if ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14"):
+            if ver in ("v12", "v13", "v14"):
                 img_h = config.IMG_HEIGHT_V12
             elif ver == "v11":
                 img_h = config.IMG_HEIGHT_V11
@@ -683,7 +683,7 @@ if __name__ == "__main__":
         _val_base.augment = False
         val_ds = Subset(_val_base, val_ds.indices)
 
-        if ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13"):
+        if ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14"):
             collate = partial(collate_alto_v5_fn, char_to_idx=char_to_idx)
         else:
             collate = partial(
@@ -693,7 +693,7 @@ if __name__ == "__main__":
         # v5+ feeds full-line images (variable width) to the loader, so
         # bucket by width to bound peak VRAM and kill padding waste.
         # v2-v4 pre-extract fixed-size frame columns — plain batching.
-        use_bucketing = ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13")
+        use_bucketing = ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14")
 
         def _make_loader(ds, collate_fn, shuffle):
             common = dict(
@@ -732,7 +732,7 @@ if __name__ == "__main__":
             adapt_ds = UnannotatedLineDataset(
                 unannotated_dirs, img_height=img_h, augment=True
             )
-            if ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13"):
+            if ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14"):
                 adapt_collate = collate_unannotated_v5_fn
             else:
                 adapt_collate = partial(
@@ -1147,6 +1147,63 @@ if __name__ == "__main__":
             use_checkpoint=args.grad_checkpoint,
         ).to(device)
         save_path = "hwm_v13.pt"
+    elif ver == "v14":
+        # v14: compromise capacity (embed_dim=256, 3 BiLSTM CTC layers)
+        # with unified SIGReg (no shape/scale split). Full training only.
+        if args.lambda_pred is not None and args.lambda_pred == 0:
+            lambda_jepa = 0.0
+            use_pretext = False
+        else:
+            lambda_jepa = (
+                args.lambda_pred
+                if args.lambda_pred is not None
+                else config.LAMBDA_JEPA_V14
+            )
+            use_pretext = lambda_jepa > 0
+        lambda_sigreg_v14 = (
+            args.lambda_sigreg
+            if args.lambda_sigreg is not None
+            else config.LAMBDA_SIGREG_V14
+        )
+        print(
+            f"v14 config: use_pretext={use_pretext} lambda_jepa={lambda_jepa} "
+            f"lambda_sigreg={lambda_sigreg_v14} lambda_ctc={config.LAMBDA_CTC_V14} "
+            f"writer_contrastive={config.USE_WRITER_CONTRASTIVE_V14} "
+            f"embed_dim={config.EMBEDDING_DIM_V14} layers={config.NUM_LAYERS_V14} "
+            f"ctc_lstm={config.CTC_NUM_LSTM_V14} | "
+            f"mask: {config.JEPA_NUM_TARGETS_V14} blocks "
+            f"[{config.JEPA_MIN_SIZE_V14},{config.JEPA_MAX_SIZE_V14}] frames | "
+            f"sigreg: {config.SIGREG_PROJECTIONS_V14} proj, "
+            f"{config.SIGREG_KNOTS_V14} knots"
+        )
+        model = HWMv12(
+            img_height=config.IMG_HEIGHT_V12,
+            embedding_dim=config.EMBEDDING_DIM_V14,
+            num_layers=config.NUM_LAYERS_V14,
+            num_heads=config.NUM_HEADS_V14,
+            ff_dim=config.FF_DIM_V14,
+            dropout=config.DROPOUT,
+            num_classes=model_num_classes,
+            lambda_ctc=config.LAMBDA_CTC_V14,
+            lambda_jepa=lambda_jepa,
+            lambda_sigreg=lambda_sigreg_v14,
+            lambda_wc=config.LAMBDA_WC_V14,
+            ctc_hidden=config.CTC_HIDDEN_V14,
+            ctc_num_lstm=config.CTC_NUM_LSTM_V14,
+            proj_dim=config.PROJ_DIM_V14,
+            proj_hidden=config.PROJ_HIDDEN_V14,
+            jepa_num_targets=config.JEPA_NUM_TARGETS_V14,
+            jepa_min_size=config.JEPA_MIN_SIZE_V14,
+            jepa_max_size=config.JEPA_MAX_SIZE_V14,
+            sigreg_projections=config.SIGREG_PROJECTIONS_V14,
+            sigreg_knots=config.SIGREG_KNOTS_V14,
+            infonce_temp=config.INFONCE_TEMP_V14,
+            supcon_temp=config.SUPCON_TEMP_V14,
+            use_pretext=use_pretext,
+            use_writer_contrastive=config.USE_WRITER_CONTRASTIVE_V14,
+            use_checkpoint=args.grad_checkpoint,
+        ).to(device)
+        save_path = "hwm_v14.pt"
     elif ver == "v4":
         model = HWMv4(
             img_height=config.IMG_HEIGHT_V4,

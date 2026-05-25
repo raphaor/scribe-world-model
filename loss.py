@@ -693,26 +693,6 @@ class SIGRegEppsPulleyLoss(nn.Module):
     LayerNorm). A per-sample LayerNorm constrains samples to a sphere,
     a support an isotropic Gaussian cannot have — SIGReg then never
     settles (paper Sec. 3.1). HWMv12's encoder follows this (Option B).
-
-    Numerical caveat fixed here (Option B internal split). The raw EP
-    statistic tries to enforce mean=0, var=1 AND Gaussian shape in one
-    term, but its gradient VANISHES once the projected variance is far
-    from 1: at var >> 1 the ``cos(t h)``/``sin(t h)`` (and their
-    derivatives) average to ~0, so the statistic saturates at a constant
-    (~0.696 with these knots) and stops regularising — observed in the
-    first HWMv12 adapt run. The fix splits the job:
-
-      * the scale/mean pin is a separate, explicit term
-        ``mean^2 + (std - 1)^2`` whose gradient never vanishes — it owns
-        the scale of z and pulls it back from both collapse and blow-up;
-      * the EP statistic is then computed on z STANDARDISED by *detached*
-        per-dimension batch statistics, so its input is always O(1) and
-        it stays in its useful gradient range. It now measures only the
-        SHAPE (skew, kurtosis, multimodality, residual anisotropy).
-
-    The standardisation is per-dimension across the batch (BatchNorm-
-    style), NOT per-sample (LayerNorm-style), so it does NOT reintroduce
-    the sphere pathology the paper warns about.
     """
 
     def __init__(
@@ -720,13 +700,11 @@ class SIGRegEppsPulleyLoss(nn.Module):
         num_projections=256,
         num_knots=17,
         resample=True,
-        scale_weight=1.0,
         eps=1e-6,
     ):
         super().__init__()
         self.num_projections = num_projections
         self.resample = resample
-        self.scale_weight = scale_weight
         self.eps = eps
 
         # Gauss-Hermite nodes/weights: integral f(x) exp(-x^2) dx
@@ -746,18 +724,15 @@ class SIGRegEppsPulleyLoss(nn.Module):
         u = torch.randn(self.num_projections, dim, device=device)
         return F.normalize(u, dim=1)
 
-    def forward(self, z, valid_mask=None, return_parts=False):
+    def forward(self, z, valid_mask=None):
         """
         Args:
             z: (B, T, D) or (N, D) embeddings — raw, un-normalised.
             valid_mask: optional (B, T) or (N,) bool, True = real
                 (non-padding) position. Padding frames are excluded so
                 they don't bias the distribution towards a spike.
-            return_parts: if True, also return a dict with the separate
-                ``shape`` (EP) and ``scale`` (moment-pin) components.
         Returns:
-            scalar SIGReg loss = EP-shape statistic + scale_weight *
-            (mean^2 + (std-1)^2). Optionally the (loss, parts) tuple.
+            scalar SIGReg loss = Epps-Pulley statistic on raw z.
         """
         z = z.float()
         if z.dim() == 3:
@@ -767,23 +742,7 @@ class SIGRegEppsPulleyLoss(nn.Module):
 
         N, D = z.shape
         if N < 2:
-            zero = z.new_zeros(())
-            return (zero, {"shape": 0.0, "scale": 0.0}) if return_parts else zero
-
-        # --- Scale/mean pin (differentiable — this term owns the scale).
-        # Two-sided in std-space: pulls back BOTH collapse (var -> 0) and
-        # blow-up (var >> 1). EP alone cannot — its gradient vanishes far
-        # from var = 1. Std-space (not var-space) keeps the magnitude
-        # sane: var=500 -> (std-1)^2 ~ 440, not ~250000.
-        mu = z.mean(dim=0)                                  # (D,)
-        var = z.var(dim=0, unbiased=False)                  # (D,)
-        std = var.clamp(min=self.eps).sqrt()                # (D,)
-        scale_loss = (mu ** 2).mean() + ((std - 1.0) ** 2).mean()
-
-        # --- EP shape test on z STANDARDISED by *detached* stats. EP
-        # shapes the geometry of z but never its scale (scale_loss's
-        # job); with O(1) input it stays in its useful gradient range.
-        z_std = (z - mu.detach()) / std.detach()
+            return z.new_zeros(())
 
         if self.resample or self._fixed_U is None or self._fixed_U.shape[1] != D:
             U = self._directions(D, z.device)
@@ -792,7 +751,7 @@ class SIGRegEppsPulleyLoss(nn.Module):
         else:
             U = self._fixed_U
 
-        h = z_std @ U.t()                              # (N, M) projections
+        h = z @ U.t()                              # (N, M) projections
         # ECF at every knot:  phi_n(t_k) = mean_j exp(i t_k h_j).
         th = h.unsqueeze(-1) * self.knots.view(1, 1, -1)   # (N, M, K)
         cos = th.cos().mean(dim=0)                     # (M, K) = Re phi_n
@@ -800,13 +759,7 @@ class SIGRegEppsPulleyLoss(nn.Module):
         diff2 = (cos - self.phi0.view(1, -1)) ** 2 + sin ** 2  # (M, K)
         shape_loss = (diff2 * self.quad_w.view(1, -1)).sum(dim=-1).mean()  # ()
 
-        loss = shape_loss + self.scale_weight * scale_loss
-        if return_parts:
-            return loss, {
-                "shape": shape_loss.detach().item(),
-                "scale": scale_loss.detach().item(),
-            }
-        return loss
+        return shape_loss
 
 
 class SupConLoss(nn.Module):
@@ -936,13 +889,9 @@ class V12Loss(nn.Module):
 
         # 2. SIGReg anti-collapse on the raw clean embeddings.
         if z_seq is not None and self.lambda_sigreg > 0:
-            reg, parts = self.sigreg(
-                z_seq, valid_mask=valid_mask, return_parts=True
-            )
+            reg = self.sigreg(z_seq, valid_mask=valid_mask)
             total = total + self.lambda_sigreg * reg
             losses["sigreg"] = reg.detach().item()
-            losses["sigreg_shape"] = parts["shape"]
-            losses["sigreg_scale"] = parts["scale"]
 
         # 3. Writer/page SupCon (optional).
         if line_vec is not None and writer_id is not None and self.lambda_wc > 0:

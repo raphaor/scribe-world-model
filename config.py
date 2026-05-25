@@ -467,5 +467,47 @@ SIGREG_KNOTS_V13 = 17
 USE_WRITER_CONTRASTIVE_V13 = False
 
 
+# --- HWM-v14 ---
+# Compromise between v12 (192-dim, 2M params) and v13 (384-dim, 6.3M params).
+# embed_dim=256 keeps the model lighter while 3 BiLSTM layers in the CTC head
+# (vs 2 in v13, 1 in v12) compensate with more temporal modeling capacity.
+# SIGReg is reverted to the unified form (no shape/scale split) — the split
+# was introduced for an adapt-training experiment that is now abandoned.
+# Full training only, letting CTC guide the encoder from epoch 1.
+
+EMBEDDING_DIM_V14 = 256
+NUM_LAYERS_V14 = 3          # same transformer depth as v12/v13
+NUM_HEADS_V14 = 4           # 256/4 = 64 per head (same ratio)
+FF_DIM_V14 = 512            # 2× embedding_dim (same ratio)
+
+# CTC head — 3 BiLSTM layers (vs 2 in v13, 1 in v12).
+CTC_HIDDEN_V14 = 192
+CTC_NUM_LSTM_V14 = 3
+
+# SSL projection heads.
+PROJ_DIM_V14 = 128
+PROJ_HIDDEN_V14 = 256
+
+# Loss weights — same as v12/v13.
+LAMBDA_CTC_V14 = 1.0
+LAMBDA_JEPA_V14 = 0.5
+LAMBDA_SIGREG_V14 = 0.1
+LAMBDA_WC_V14 = 0.2
+
+INFONCE_TEMP_V14 = 0.1
+SUPCON_TEMP_V14 = 0.1
+
+# Masked-segment pretext — same as v12/v13.
+JEPA_NUM_TARGETS_V14 = 4
+JEPA_MIN_SIZE_V14 = 8
+JEPA_MAX_SIZE_V14 = 20
+
+# SIGReg — same as v12/v13 (unified, no shape/scale split).
+SIGREG_PROJECTIONS_V14 = 256
+SIGREG_KNOTS_V14 = 17
+
+USE_WRITER_CONTRASTIVE_V14 = False
+
+
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
