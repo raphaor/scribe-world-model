@@ -69,7 +69,7 @@ from data_alto import (
 def _progress_bar(epoch, batch_idx, total_batches, losses, elapsed, bar_width=30):
     pct = (batch_idx + 1) / total_batches
     filled = int(bar_width * pct)
-    bar = "\u2588" * filled + "\u2591" * (bar_width - filled)
+    bar = "#" * filled + "-" * (bar_width - filled)
     loss_str = " | ".join(f"{k}={v:.4f}" for k, v in losses.items())
     eta = elapsed / pct - elapsed if pct > 0 else 0
     sys.stdout.write(
@@ -636,8 +636,8 @@ if __name__ == "__main__":
 
     if args.data == "alto":
         ver = args.model_version
-        if ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12"):
-            if ver == "v12":
+        if ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13"):
+            if ver in ("v12", "v13"):
                 img_h = config.IMG_HEIGHT_V12
             elif ver == "v11":
                 img_h = config.IMG_HEIGHT_V11
@@ -683,7 +683,7 @@ if __name__ == "__main__":
         _val_base.augment = False
         val_ds = Subset(_val_base, val_ds.indices)
 
-        if ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12"):
+        if ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13"):
             collate = partial(collate_alto_v5_fn, char_to_idx=char_to_idx)
         else:
             collate = partial(
@@ -693,7 +693,7 @@ if __name__ == "__main__":
         # v5+ feeds full-line images (variable width) to the loader, so
         # bucket by width to bound peak VRAM and kill padding waste.
         # v2-v4 pre-extract fixed-size frame columns — plain batching.
-        use_bucketing = ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12")
+        use_bucketing = ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13")
 
         def _make_loader(ds, collate_fn, shuffle):
             common = dict(
@@ -732,7 +732,7 @@ if __name__ == "__main__":
             adapt_ds = UnannotatedLineDataset(
                 unannotated_dirs, img_height=img_h, augment=True
             )
-            if ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12"):
+            if ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13"):
                 adapt_collate = collate_unannotated_v5_fn
             else:
                 adapt_collate = partial(
