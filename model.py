@@ -57,8 +57,14 @@ class LectaurepClone(nn.Module):
     with the existing train.py / recognize.py infrastructure.
     """
 
-    def __init__(self, img_height=120, num_classes=100, hidden=200,
-                 num_lstm_layers=3, dropout=0.1):
+    def __init__(
+        self,
+        img_height=120,
+        num_classes=100,
+        hidden=200,
+        num_lstm_layers=3,
+        dropout=0.1,
+    ):
         super().__init__()
         self.img_height = img_height
         self.embedding_dim = 64 * (img_height // 8)  # 960 for h=120
@@ -72,17 +78,14 @@ class LectaurepClone(nn.Module):
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.MaxPool2d(2, 2),
-
             nn.Conv2d(32, 32, kernel_size=(3, 13), padding=(1, 6)),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.MaxPool2d(2, 2),
-
             nn.Conv2d(32, 64, kernel_size=(3, 9), padding=(1, 4)),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.MaxPool2d(2, 2),
-
             nn.Conv2d(64, 64, kernel_size=(3, 9), padding=(1, 4)),
             nn.ReLU(),
             nn.Dropout(dropout),
@@ -94,8 +97,13 @@ class LectaurepClone(nn.Module):
         for i in range(num_lstm_layers):
             input_dim = self.embedding_dim if i == 0 else hidden * 2
             self.lstm_layers.append(
-                nn.LSTM(input_dim, hidden, num_layers=1,
-                        batch_first=True, bidirectional=True)
+                nn.LSTM(
+                    input_dim,
+                    hidden,
+                    num_layers=1,
+                    batch_first=True,
+                    bidirectional=True,
+                )
             )
 
         self.lstm_dropouts = nn.ModuleList(
@@ -116,11 +124,11 @@ class LectaurepClone(nn.Module):
 
     def _encode(self, img):
         """CNN forward: (B, H, W) → (B, T, 960)."""
-        x = img.unsqueeze(1)                # (B, 1, H, W)
-        x = self.encoder(x)                 # (B, 64, H/8, W/8)
+        x = img.unsqueeze(1)  # (B, 1, H, W)
+        x = self.encoder(x)  # (B, 64, H/8, W/8)
         B, C, H, T = x.shape
-        x = x.permute(0, 3, 1, 2)          # (B, T, C, H)
-        x = x.reshape(B, T, C * H)         # (B, T, 960)
+        x = x.permute(0, 3, 1, 2)  # (B, T, C, H)
+        x = x.reshape(B, T, C * H)  # (B, T, 960)
         return x
 
     def _bilstm(self, z_seq):
@@ -137,8 +145,9 @@ class LectaurepClone(nn.Module):
         ctc_logits = self.ctc_head(z_seq)  # CTCHead includes log_softmax
         return None, z_seq, ctc_logits
 
-    def compute_loss(self, img, targets=None, input_lengths=None,
-                     target_lengths=None, writer_id=None):
+    def compute_loss(
+        self, img, targets=None, input_lengths=None, target_lengths=None, writer_id=None
+    ):
         """CTC-only loss.  Compatible with train.py's _step_full contract."""
         if input_lengths is not None:
             input_lengths = input_lengths.to(img.device)
@@ -157,11 +166,13 @@ class LectaurepClone(nn.Module):
         # ketos filters these upstream; we clamp and warn instead.
         bad = (ctc_in < target_lengths).sum().item()
         if bad > 0:
-            print(f"  [CTC] WARNING: {bad}/{B} samples have "
-                  f"input_length < target_length — loss will be 0 for those")
+            print(
+                f"  [CTC] WARNING: {bad}/{B} samples have "
+                f"input_length < target_length — loss will be 0 for those"
+            )
 
         ctc_loss = F.ctc_loss(
-            ctc_logits.permute(1, 0, 2),     # (T, B, C)
+            ctc_logits.permute(1, 0, 2),  # (T, B, C)
             targets,
             ctc_in,
             target_lengths,
@@ -169,6 +180,9 @@ class LectaurepClone(nn.Module):
             zero_infinity=True,
         )
         return ctc_loss, {"ctc": ctc_loss.item(), "total": ctc_loss.item()}
+
+    def adapt(self, img_seqs, input_lengths=None):
+        return None, None
 
     def count_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -1648,9 +1662,7 @@ class HWMv11(nn.Module):
         self.embedding_dim = embedding_dim
         self.use_pretext = use_pretext
 
-        self.encoder = KrakenEncoder(
-            img_height=img_height, embedding_dim=embedding_dim
-        )
+        self.encoder = KrakenEncoder(img_height=img_height, embedding_dim=embedding_dim)
 
         # SimSiam predictor MLP on the perturbed branch only. The
         # asymmetry is what prevents the trivial "encoder = identity"
@@ -1718,9 +1730,7 @@ class HWMv11(nn.Module):
             * (self.pert_contrast_max - self.pert_contrast_min)
             + self.pert_contrast_min
         )
-        brightness = (
-            torch.rand(B, 1, 1, device=device) * 2 - 1
-        ) * self.pert_brightness
+        brightness = (torch.rand(B, 1, 1, device=device) * 2 - 1) * self.pert_brightness
         img = img * contrast + brightness
         if self.pert_noise_std > 0:
             img = img + torch.randn_like(img) * self.pert_noise_std
@@ -1736,17 +1746,13 @@ class HWMv11(nn.Module):
                 * math.pi
                 / 180.0
             )
-            shift_px = (
-                torch.rand(B, device=device) * 2 - 1
-            ) * self.pert_shift_x
+            shift_px = (torch.rand(B, device=device) * 2 - 1) * self.pert_shift_x
             theta = torch.zeros(B, 2, 3, device=device, dtype=img.dtype)
             theta[:, 0, 0] = 1.0
             theta[:, 0, 1] = -torch.tan(shear_rad).to(img.dtype)
             theta[:, 0, 2] = (-2.0 * shift_px / max(W, 1)).to(img.dtype)
             theta[:, 1, 1] = 1.0
-            grid = F.affine_grid(
-                theta, size=(B, 1, H, W), align_corners=False
-            )
+            grid = F.affine_grid(theta, size=(B, 1, H, W), align_corners=False)
             img = F.grid_sample(
                 img.unsqueeze(1),
                 grid,
@@ -1762,26 +1768,18 @@ class HWMv11(nn.Module):
             mask = torch.zeros(B, W, dtype=torch.bool, device=device)
             for b in range(B):
                 eff_w = (
-                    int(input_lengths[b].item() * 8)
-                    if input_lengths is not None
-                    else W
+                    int(input_lengths[b].item() * 8) if input_lengths is not None else W
                 )
                 eff_w = max(eff_w, self.pert_mask_w_min + 1)
                 upper_w = min(self.pert_mask_w_max, eff_w - 1)
                 for _ in range(self.pert_mask_blocks):
                     w_blk = int(
-                        torch.randint(
-                            self.pert_mask_w_min, upper_w + 1, (1,)
-                        ).item()
+                        torch.randint(self.pert_mask_w_min, upper_w + 1, (1,)).item()
                     )
-                    start = int(
-                        torch.randint(0, eff_w - w_blk + 1, (1,)).item()
-                    )
+                    start = int(torch.randint(0, eff_w - w_blk + 1, (1,)).item())
                     mask[b, start : start + w_blk] = True
             mask2d = mask.unsqueeze(1).expand(B, H, W)
-            img = torch.where(
-                mask2d, self.mask_pixel.to(img.dtype).expand_as(img), img
-            )
+            img = torch.where(mask2d, self.mask_pixel.to(img.dtype).expand_as(img), img)
 
         return img
 
@@ -1814,9 +1812,7 @@ class HWMv11(nn.Module):
         ctc_logits = self.ctc_head(z_seq) if self.ctc_head is not None else None
         return None, z_seq, ctc_logits
 
-    def compute_loss(
-        self, img, targets=None, input_lengths=None, target_lengths=None
-    ):
+    def compute_loss(self, img, targets=None, input_lengths=None, target_lengths=None):
         # 1. Clean view: full image through Kraken. With grad — feeds
         # CTC, SIGRegV2, and serves as the (stop-grad) consistency target.
         z_clean = self.encoder(img)
