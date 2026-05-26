@@ -34,6 +34,139 @@ from jepa import sample_jepa_mask, sample_2d_block_mask
 import config
 
 
+class LectaurepClone(nn.Module):
+    """
+    Faithful reproduction of the lectaurep_base model architecture.
+
+    From the official training command:
+      ketos train ... -s '[1,120,0,1 Cr3,13,32 Do0.1,2 Mp2,2 Cr3,13,32 Do0.1,2
+        Mp2,2 Cr3,9,64 Do0.1,2 Mp2,2 Cr3,9,64 Do0.1,2 S1(1x0)1,3
+        Lbx200 Do0.1,2 Lbx200 Do.1,2 Lbx200 Do]'
+
+    Architecture:
+      CNN (4 conv layers, identical to KrakenEncoder's conv stem)
+        → reshape to (B, T, 960)  [64 * (120/8)]
+        → 3 × BiLSTM(hidden=200, bidirectional)
+        → Linear(400, num_classes) + log_softmax
+
+    Total: ~4.0M params (matches the official report).
+
+    This is a CTC-only model — no Transformer, no JEPA, no SIGReg.
+    compute_loss() returns only CTC loss.  The interface (forward returning
+    a 3-tuple, ctc_head attribute, encoder attribute, etc.) is compatible
+    with the existing train.py / recognize.py infrastructure.
+    """
+
+    def __init__(self, img_height=120, num_classes=100, hidden=200,
+                 num_lstm_layers=3, dropout=0.1):
+        super().__init__()
+        self.img_height = img_height
+        self.embedding_dim = 64 * (img_height // 8)  # 960 for h=120
+        self.num_classes = num_classes
+        self.hidden = hidden
+        self.num_lstm_layers = num_lstm_layers
+
+        # --- CNN encoder (identical to KrakenEncoder's conv stem) ---
+        self.encoder = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=(3, 13), padding=(1, 6)),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.MaxPool2d(2, 2),
+
+            nn.Conv2d(32, 32, kernel_size=(3, 13), padding=(1, 6)),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.MaxPool2d(2, 2),
+
+            nn.Conv2d(32, 64, kernel_size=(3, 9), padding=(1, 4)),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.MaxPool2d(2, 2),
+
+            nn.Conv2d(64, 64, kernel_size=(3, 9), padding=(1, 4)),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+
+        # --- 3 × BiLSTM(200) ---
+        # Layer 1: input=960, hidden=200.  Layers 2-3: input=400, hidden=200.
+        self.lstm_layers = nn.ModuleList()
+        for i in range(num_lstm_layers):
+            input_dim = self.embedding_dim if i == 0 else hidden * 2
+            self.lstm_layers.append(
+                nn.LSTM(input_dim, hidden, num_layers=1,
+                        batch_first=True, bidirectional=True)
+            )
+
+        self.lstm_dropouts = nn.ModuleList(
+            [nn.Dropout(dropout) for _ in range(num_lstm_layers)]
+        )
+
+        # --- CTC output head ---
+        # Matches Kraken's LinSoftmax: Linear(400, num_classes) + log_softmax.
+        # We wrap in a thin module with a .proj attribute so that
+        # train.py's checkpoint save (model.ctc_head.proj.out_features) works
+        # without special-casing.
+        self.ctc_head = CTCHead(hidden * 2, num_classes)
+
+        # Placeholder attributes expected by _build_param_groups / _set_encoder_frozen
+        # (encoder is the Sequential above, which is already an attribute)
+        self.ctc_norm = nn.Identity()  # no-op, but train.py passes z through it
+        self.window_size = None
+
+    def _encode(self, img):
+        """CNN forward: (B, H, W) → (B, T, 960)."""
+        x = img.unsqueeze(1)                # (B, 1, H, W)
+        x = self.encoder(x)                 # (B, 64, H/8, W/8)
+        B, C, H, T = x.shape
+        x = x.permute(0, 3, 1, 2)          # (B, T, C, H)
+        x = x.reshape(B, T, C * H)         # (B, T, 960)
+        return x
+
+    def _bilstm(self, z_seq):
+        """3 × BiLSTM(200): (B, T, 960) → (B, T, 400)."""
+        for lstm, do in zip(self.lstm_layers, self.lstm_dropouts):
+            z_seq, _ = lstm(z_seq)
+            z_seq = do(z_seq)
+        return z_seq
+
+    def forward(self, img):
+        """Inference forward.  Returns (None, z_seq, ctc_logits) for compatibility."""
+        z_seq = self._encode(img)
+        z_seq = self._bilstm(z_seq)
+        ctc_logits = self.ctc_head(z_seq)  # CTCHead includes log_softmax
+        return None, z_seq, ctc_logits
+
+    def compute_loss(self, img, targets=None, input_lengths=None,
+                     target_lengths=None, writer_id=None):
+        """CTC-only loss.  Compatible with train.py's _step_full contract."""
+        if input_lengths is not None:
+            input_lengths = input_lengths.to(img.device)
+
+        z_seq = self._encode(img)
+        z_seq = self._bilstm(z_seq)
+        ctc_logits = self.ctc_head(z_seq)  # (B, T, C) log-probs
+
+        B, T, _ = ctc_logits.shape
+        ctc_in = input_lengths.clamp(max=T) if input_lengths is not None else None
+
+        if targets is None or ctc_in is None or target_lengths is None:
+            return None, {}
+
+        ctc_loss = F.ctc_loss(
+            ctc_logits.permute(1, 0, 2),     # (T, B, C)
+            targets,
+            ctc_in,
+            target_lengths,
+            blank=0,
+            zero_infinity=True,
+        )
+        return ctc_loss, {"ctc": ctc_loss.item(), "total": ctc_loss.item()}
+
+    def count_parameters(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
 class HWMv1(nn.Module):
     """
     Handwriting World Model v1

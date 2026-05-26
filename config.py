@@ -509,5 +509,22 @@ SIGREG_KNOTS_V14 = 17
 USE_WRITER_CONTRASTIVE_V14 = False
 
 
+# --- Lectaurep Clone (v15) ---
+# Faithful reproduction of lectaurep_base:
+#   CNN (4 conv, Kraken stem) → 960-dim → 3×BiLSTM(200) → Linear → CTC
+# No Transformer, no JEPA, no SIGReg.  Pure CTC baseline to see if we
+# reproduce Lectaurep's 9.8% CER on their data.
+# Total params: ~4.0M (same as the official model).
+#
+# Training variations planned:
+#   - with / without elastic deformations (augmentation)
+#   - with / without width bucketing (grouping lines by size)
+LECTAUREP_IMG_HEIGHT = 120
+LECTAUREP_HIDDEN = 200
+LECTAUREP_NUM_LSTM = 3
+LECTAUREP_DROPOUT = 0.1
+LECTAUREP_LR = 1e-4        # from the official ketos command: -r 0.0001
+
+
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)

@@ -53,6 +53,7 @@ from model import (
     HWMv10,
     HWMv11,
     HWMv12,
+    LectaurepClone,
 )
 from data_alto import (
     AltoLineDataset,
@@ -472,7 +473,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model-version",
         choices=[
-            "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14",
+            "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15",
         ],
         default="v5",
     )
@@ -636,8 +637,8 @@ if __name__ == "__main__":
 
     if args.data == "alto":
         ver = args.model_version
-        if ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14"):
-            if ver in ("v12", "v13", "v14"):
+        if ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15"):
+            if ver in ("v12", "v13", "v14", "v15"):
                 img_h = config.IMG_HEIGHT_V12
             elif ver == "v11":
                 img_h = config.IMG_HEIGHT_V11
@@ -683,7 +684,7 @@ if __name__ == "__main__":
         _val_base.augment = False
         val_ds = Subset(_val_base, val_ds.indices)
 
-        if ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14"):
+        if ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15"):
             collate = partial(collate_alto_v5_fn, char_to_idx=char_to_idx)
         else:
             collate = partial(
@@ -693,7 +694,7 @@ if __name__ == "__main__":
         # v5+ feeds full-line images (variable width) to the loader, so
         # bucket by width to bound peak VRAM and kill padding waste.
         # v2-v4 pre-extract fixed-size frame columns — plain batching.
-        use_bucketing = ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14")
+        use_bucketing = ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15")
 
         def _make_loader(ds, collate_fn, shuffle):
             common = dict(
@@ -732,7 +733,7 @@ if __name__ == "__main__":
             adapt_ds = UnannotatedLineDataset(
                 unannotated_dirs, img_height=img_h, augment=True
             )
-            if ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14"):
+            if ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15"):
                 adapt_collate = collate_unannotated_v5_fn
             else:
                 adapt_collate = partial(
@@ -1204,6 +1205,23 @@ if __name__ == "__main__":
             use_checkpoint=args.grad_checkpoint,
         ).to(device)
         save_path = "hwm_v14.pt"
+    elif ver == "v15":
+        # Lectaurep clone: pure CTC, no Transformer/JEPA/SIGReg.
+        # CNN → 960-dim → 3×BiLSTM(200) → Linear → CTC
+        # Exact reproduction of the official lectaurep_base architecture.
+        model = LectaurepClone(
+            img_height=config.LECTAUREP_IMG_HEIGHT,
+            num_classes=model_num_classes,
+            hidden=config.LECTAUREP_HIDDEN,
+            num_lstm_layers=config.LECTAUREP_NUM_LSTM,
+            dropout=config.LECTAUREP_DROPOUT,
+        ).to(device)
+        print(
+            f"Lectaurep clone: hidden={config.LECTAUREP_HIDDEN} "
+            f"lstm_layers={config.LECTAUREP_NUM_LSTM} "
+            f"dropout={config.LECTAUREP_DROPOUT}"
+        )
+        save_path = "hwm_lectaurep.pt"
     elif ver == "v4":
         model = HWMv4(
             img_height=config.IMG_HEIGHT_V4,
