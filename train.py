@@ -330,8 +330,9 @@ def train(
     encoder_lr_mult=0.1,
     warmup_epochs=0,
     freeze_encoder_epochs=0,
+    no_amp=False,
 ):
-    use_amp = device.type == "cuda"
+    use_amp = device.type == "cuda" and not no_amp
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     param_groups = _build_param_groups(model, lr, encoder_lr_mult)
@@ -482,6 +483,9 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--no-augment", action="store_true",
                         help="Disable image augmentation (elastic deformations).")
+    parser.add_argument("--no-amp", action="store_true",
+                        help="Disable AMP (float16). Needed for models with large "
+                        "intermediate dims (e.g. Lectaurep clone, 960-dim BiLSTM).")
     parser.add_argument("--no-bucket", action="store_true",
                         help="Disable width bucketing (batch lines of similar width).")
     parser.add_argument("--data", default="alto", choices=["alto", "synthetic"])
@@ -1227,6 +1231,16 @@ if __name__ == "__main__":
             f"lstm_layers={config.LECTAUREP_NUM_LSTM} "
             f"dropout={config.LECTAUREP_DROPOUT}"
         )
+        # Stability: v15's 960-dim BiLSTM input overflows in fp16.
+        # Auto-enable --no-amp and --encoder-lr-mult 1.0 if the user
+        # didn't override them.
+        if not args.no_amp:
+            print("  WARNING: v15 is unstable in fp16. Auto-enabling --no-amp.")
+            args.no_amp = True
+        if args.encoder_lr_mult == 0.1:
+            print("  NOTE: Lectaurep trains all layers at the same LR. "
+                  "Auto-setting --encoder-lr-mult 1.0.")
+            args.encoder_lr_mult = 1.0
         save_path = "hwm_lectaurep.pt"
     elif ver == "v4":
         model = HWMv4(
@@ -1349,4 +1363,5 @@ if __name__ == "__main__":
         encoder_lr_mult=args.encoder_lr_mult,
         warmup_epochs=args.warmup_epochs,
         freeze_encoder_epochs=args.freeze_encoder_epochs,
+        no_amp=args.no_amp,
     )
