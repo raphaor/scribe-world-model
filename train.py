@@ -421,15 +421,22 @@ def train(
 
         loss_str = " | ".join(f"{k}={v:.4f}" for k, v in losses.items())
         print(f"Epoch {epoch}/{num_epochs} (lr {lr_str}) - {loss_str}")
+        parts = []
         dropped = getattr(model, "_ctc_dropped_samples", 0)
         total_b = getattr(model, "_ctc_total_batches", 0)
         if dropped > 0:
-            print(
-                f"  [CTC] {dropped}/{total_b} samples dropped (input_length < target_length)"
-            )
+            parts.append(f"[CTC] {dropped}/{total_b} samples dropped")
         if hasattr(model, "_ctc_dropped_samples"):
             model._ctc_dropped_samples = 0
             model._ctc_total_batches = 0
+        from data_alto import collate_alto_v5_fn as _collate
+
+        collate_dropped = getattr(_collate, "_total_dropped", 0)
+        if collate_dropped > 0:
+            parts.append(f"[collate] {collate_dropped} sample(s) dropped")
+            _collate._total_dropped = 0
+        if parts:
+            print("  " + " | ".join(parts))
 
         current_loss = losses.get("total", float("inf"))
         if current_loss < best_loss:

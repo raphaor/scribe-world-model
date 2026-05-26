@@ -154,7 +154,7 @@ class AltoLineDataset(Dataset):
     def get_alphabet(self):
         # NFD normalisation (matches ketos): decompose combined characters
         # so that é (U+00E9) and e+́ (U+0065+U+0301) map to the same entry.
-        chars = sorted(unicodedata.normalize('NFD', ''.join(self.chars)))
+        chars = sorted(unicodedata.normalize("NFD", "".join(self.chars)))
         # Deduplicate: after NFD some codepoints may appear multiple times
         # if the original set had both composed and decomposed forms.
         seen = set()
@@ -222,7 +222,8 @@ class UnannotatedLineDataset(Dataset):
         xml_files = []
         for d in dirs:
             xml_files.extend(
-                p for p in sorted(glob.glob(os.path.join(d, "*.xml")))
+                p
+                for p in sorted(glob.glob(os.path.join(d, "*.xml")))
                 if os.path.basename(p) != "METS.xml"
             )
 
@@ -320,14 +321,14 @@ def collate_alto_fn(batch, window_size=10, stride=5, char_to_idx=None, max_seq_l
 
 def collate_alto_v5_fn(batch, char_to_idx=None):
     """Collate for v5: full line images padded in width, no frame extraction.
-    
+
     Applies NFD normalisation to match ketos, filters out samples where
     input_length < target_length (impossible CTC alignment), and warns
     when characters are silently dropped.
     """
     # Count OOV characters across the whole batch for a single warning
     _oov_seen = set()
-    
+
     imgs = []
     all_targets = []
     input_lengths = []
@@ -337,8 +338,8 @@ def collate_alto_v5_fn(batch, char_to_idx=None):
 
     for img, text in batch:
         # NFD normalise the text (matches ketos pipeline)
-        text = unicodedata.normalize('NFD', text)
-        
+        text = unicodedata.normalize("NFD", text)
+
         # Encode, tracking dropped characters
         encoded = []
         for c in text:
@@ -346,7 +347,7 @@ def collate_alto_v5_fn(batch, char_to_idx=None):
                 encoded.append(char_to_idx[c])
             else:
                 _oov_seen.add(c)
-        
+
         # Filter: CTC requires input_length >= target_length
         input_len = img.shape[1] // 8
         if len(encoded) == 0 or input_len < len(encoded):
@@ -360,21 +361,26 @@ def collate_alto_v5_fn(batch, char_to_idx=None):
         raw_texts.append(text)
 
     if dropped > 0:
-        print(f"  [collate] Dropped {dropped} sample(s): "
-              f"CTC alignment impossible (input_length < target_length or empty text)")
-    
+        if not hasattr(collate_alto_v5_fn, "_total_dropped"):
+            collate_alto_v5_fn._total_dropped = 0
+        collate_alto_v5_fn._total_dropped += dropped
+
     if _oov_seen:
-        print(f"  [collate] WARNING: {len(_oov_seen)} OOV character(s) not in alphabet: "
-              f"{sorted(_oov_seen)[:20]}{'...' if len(_oov_seen) > 20 else ''}")
+        print(
+            f"  [collate] WARNING: {len(_oov_seen)} OOV character(s) not in alphabet: "
+            f"{sorted(_oov_seen)[:20]}{'...' if len(_oov_seen) > 20 else ''}"
+        )
 
     if not imgs:
         # Edge case: entire batch was filtered out
         B = len(batch)
-        return (torch.zeros(B, batch[0][0].shape[0], 1),
-                torch.tensor([], dtype=torch.long),
-                torch.ones(B, dtype=torch.long),
-                torch.zeros(B, dtype=torch.long),
-                [""] * B)
+        return (
+            torch.zeros(B, batch[0][0].shape[0], 1),
+            torch.tensor([], dtype=torch.long),
+            torch.ones(B, dtype=torch.long),
+            torch.zeros(B, dtype=torch.long),
+            [""] * B,
+        )
 
     B = len(imgs)
     H = imgs[0].shape[0]
@@ -382,7 +388,7 @@ def collate_alto_v5_fn(batch, char_to_idx=None):
 
     padded = torch.zeros(B, H, W_max)
     for i, img in enumerate(imgs):
-        padded[i, :, :img.shape[1]] = img
+        padded[i, :, : img.shape[1]] = img
 
     targets = torch.tensor(all_targets, dtype=torch.long)
     input_lengths = torch.tensor(input_lengths, dtype=torch.long)
@@ -406,7 +412,7 @@ def collate_unannotated_v5_fn(batch):
 
     padded = torch.zeros(B, H, W_max)
     for i, img in enumerate(imgs):
-        padded[i, :, :img.shape[1]] = img
+        padded[i, :, : img.shape[1]] = img
 
     input_lengths = torch.tensor(input_lengths, dtype=torch.long)
     return padded, input_lengths
@@ -450,7 +456,7 @@ def line_widths(ds):
     widths = []
     for i in idxs:
         s = samples[i]
-        arr = s[0] if isinstance(s, tuple) else s   # (arr, text) or bare arr
+        arr = s[0] if isinstance(s, tuple) else s  # (arr, text) or bare arr
         widths.append(int(arr.shape[1]))
     return widths
 
@@ -482,16 +488,26 @@ class LengthBucketBatchSampler:
     appears twice (one original + one extra copy).
     """
 
-    def __init__(self, widths, batch_size, shuffle=True, pool_factor=10,
-                 oversample_factor=1.0, long_threshold_px=800):
+    def __init__(
+        self,
+        widths,
+        batch_size,
+        shuffle=True,
+        pool_factor=10,
+        oversample_factor=1.0,
+        long_threshold_px=800,
+    ):
         self.widths = [int(w) for w in widths]
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.pool_size = max(batch_size, batch_size * pool_factor)
         self.oversample_factor = oversample_factor
         self.long_threshold_px = long_threshold_px
-        self._extra = (math.floor(self.oversample_factor - 1)
-                       if self.oversample_factor > 1.0 else 0)
+        self._extra = (
+            math.floor(self.oversample_factor - 1)
+            if self.oversample_factor > 1.0
+            else 0
+        )
         base_batches = self._build(shuffle=False)
         self._len = self._apply_oversample(base_batches, count_only=True)
 
@@ -502,9 +518,9 @@ class LengthBucketBatchSampler:
             random.shuffle(order)
         batches = []
         for ps in range(0, n, self.pool_size):
-            pool = sorted(order[ps:ps + self.pool_size], key=lambda i: self.widths[i])
+            pool = sorted(order[ps : ps + self.pool_size], key=lambda i: self.widths[i])
             for bs in range(0, len(pool), self.batch_size):
-                batches.append(pool[bs:bs + self.batch_size])
+                batches.append(pool[bs : bs + self.batch_size])
         if shuffle:
             random.shuffle(batches)
         return batches
