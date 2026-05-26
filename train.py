@@ -480,6 +480,10 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--no-augment", action="store_true",
+                        help="Disable image augmentation (elastic deformations).")
+    parser.add_argument("--no-bucket", action="store_true",
+                        help="Disable width bucketing (batch lines of similar width).")
     parser.add_argument("--data", default="alto", choices=["alto", "synthetic"])
     parser.add_argument("--alto-dirs", nargs="+", default=config.ALTO_DIRS)
     parser.add_argument(
@@ -663,7 +667,8 @@ if __name__ == "__main__":
             ws = config.WINDOW_SIZE
             stride = config.STRIDE
 
-        dataset = AltoLineDataset(args.alto_dirs, img_height=img_h, augment=True)
+        dataset = AltoLineDataset(args.alto_dirs, img_height=img_h,
+                                  augment=not args.no_augment)
         char_to_idx, idx_to_char = dataset.get_alphabet()
         print(f"Alphabet: {len(char_to_idx)} characters")
         num_classes = len(char_to_idx) + 1
@@ -694,7 +699,8 @@ if __name__ == "__main__":
         # v5+ feeds full-line images (variable width) to the loader, so
         # bucket by width to bound peak VRAM and kill padding waste.
         # v2-v4 pre-extract fixed-size frame columns — plain batching.
-        use_bucketing = ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15")
+        use_bucketing = ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15") \
+            and not args.no_bucket
 
         def _make_loader(ds, collate_fn, shuffle):
             common = dict(
