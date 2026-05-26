@@ -176,7 +176,8 @@ class LectaurepClone(nn.Module):
             ctc_in,
             target_lengths,
             blank=0,
-            reduction="sum",  # ketos utilise sum, pas mean
+            reduction="sum",  # ketos: reduction='sum'
+            zero_infinity=True,  # ketos: zero_infinity=True aussi
         )
         # Normaliser par B pour rester stable quel que soit le batch size.
         # ketos a Lightning qui gère ça ; ici on le fait explicitement.
