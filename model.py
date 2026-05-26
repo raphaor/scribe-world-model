@@ -153,6 +153,13 @@ class LectaurepClone(nn.Module):
         if targets is None or ctc_in is None or target_lengths is None:
             return None, {}
 
+        # Diagnostic: log how many samples would fail CTC alignment.
+        # ketos filters these upstream; we clamp and warn instead.
+        bad = (ctc_in < target_lengths).sum().item()
+        if bad > 0:
+            print(f"  [CTC] WARNING: {bad}/{B} samples have "
+                  f"input_length < target_length — loss will be 0 for those")
+
         ctc_loss = F.ctc_loss(
             ctc_logits.permute(1, 0, 2),     # (T, B, C)
             targets,

@@ -5,6 +5,7 @@ With pickle cache, parallel loading, and merged alphabet build.
 """
 
 import warnings
+import unicodedata
 
 warnings.filterwarnings("ignore", message="divide by zero", category=RuntimeWarning)
 warnings.filterwarnings("ignore", message="invalid value", category=RuntimeWarning)
@@ -151,7 +152,18 @@ class AltoLineDataset(Dataset):
         print(f"Cache saved to {cache_path}")
 
     def get_alphabet(self):
-        chars = sorted(self.chars)
+        # NFD normalisation (matches ketos): decompose combined characters
+        # so that é (U+00E9) and e+́ (U+0065+U+0301) map to the same entry.
+        chars = sorted(unicodedata.normalize('NFD', ''.join(self.chars)))
+        # Deduplicate: after NFD some codepoints may appear multiple times
+        # if the original set had both composed and decomposed forms.
+        seen = set()
+        unique_chars = []
+        for c in chars:
+            if c not in seen:
+                seen.add(c)
+                unique_chars.append(c)
+        chars = unique_chars
         char_to_idx = {c: i + 1 for i, c in enumerate(chars)}
         idx_to_char = {i + 1: c for i, c in enumerate(chars)}
         idx_to_char[0] = ""
@@ -307,22 +319,62 @@ def collate_alto_fn(batch, window_size=10, stride=5, char_to_idx=None, max_seq_l
 
 
 def collate_alto_v5_fn(batch, char_to_idx=None):
-    """Collate for v5: full line images padded in width, no frame extraction."""
+    """Collate for v5: full line images padded in width, no frame extraction.
+    
+    Applies NFD normalisation to match ketos, filters out samples where
+    input_length < target_length (impossible CTC alignment), and warns
+    when characters are silently dropped.
+    """
+    # Count OOV characters across the whole batch for a single warning
+    _oov_seen = set()
+    
     imgs = []
     all_targets = []
     input_lengths = []
     target_lengths = []
     raw_texts = []
+    dropped = 0
 
     for img, text in batch:
-        imgs.append(img)
-        # Conv reduces width by factor 8 (3 MaxPool(2,2))
-        input_lengths.append(img.shape[1] // 8)
+        # NFD normalise the text (matches ketos pipeline)
+        text = unicodedata.normalize('NFD', text)
+        
+        # Encode, tracking dropped characters
+        encoded = []
+        for c in text:
+            if c in char_to_idx:
+                encoded.append(char_to_idx[c])
+            else:
+                _oov_seen.add(c)
+        
+        # Filter: CTC requires input_length >= target_length
+        input_len = img.shape[1] // 8
+        if len(encoded) == 0 or input_len < len(encoded):
+            dropped += 1
+            continue
 
-        encoded = [char_to_idx[c] for c in text if c in char_to_idx]
+        imgs.append(img)
+        input_lengths.append(input_len)
         all_targets.extend(encoded)
         target_lengths.append(len(encoded))
         raw_texts.append(text)
+
+    if dropped > 0:
+        print(f"  [collate] Dropped {dropped} sample(s): "
+              f"CTC alignment impossible (input_length < target_length or empty text)")
+    
+    if _oov_seen:
+        print(f"  [collate] WARNING: {len(_oov_seen)} OOV character(s) not in alphabet: "
+              f"{sorted(_oov_seen)[:20]}{'...' if len(_oov_seen) > 20 else ''}")
+
+    if not imgs:
+        # Edge case: entire batch was filtered out
+        B = len(batch)
+        return (torch.zeros(B, batch[0][0].shape[0], 1),
+                torch.tensor([], dtype=torch.long),
+                torch.ones(B, dtype=torch.long),
+                torch.zeros(B, dtype=torch.long),
+                [""] * B)
 
     B = len(imgs)
     H = imgs[0].shape[0]

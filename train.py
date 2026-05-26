@@ -285,8 +285,22 @@ def _build_param_groups(model, lr, encoder_lr_mult):
     return groups
 
 
-def _build_scheduler(optimizer, remaining_epochs, warmup_epochs):
-    """Linear warmup (if any) followed by cosine decay over remaining epochs."""
+def _build_scheduler(optimizer, remaining_epochs, warmup_epochs, constant_lr=False):
+    """Linear warmup (if any) followed by cosine decay over remaining epochs.
+    
+    If constant_lr=True, skip the cosine entirely (matches ketos recipe).
+    """
+    if constant_lr and warmup_epochs == 0:
+        # No scheduler at all — constant LR, exactly like ketos.
+        return None
+    if constant_lr and warmup_epochs > 0:
+        # Warmup only, then constant.
+        return optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=0.1,
+            end_factor=1.0,
+            total_iters=warmup_epochs,
+        )
     if warmup_epochs > 0 and remaining_epochs > warmup_epochs:
         warmup = optim.lr_scheduler.LinearLR(
             optimizer,
@@ -331,6 +345,7 @@ def train(
     warmup_epochs=0,
     freeze_encoder_epochs=0,
     no_amp=False,
+    constant_lr=False,
 ):
     use_amp = device.type == "cuda" and not no_amp
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -344,7 +359,8 @@ def train(
     remaining_epochs = max(1, num_epochs - start_epoch + 1)
     # Warmup only makes sense when we're not resuming mid-schedule.
     effective_warmup = warmup_epochs if scheduler_state is None else 0
-    scheduler = _build_scheduler(optimizer, remaining_epochs, effective_warmup)
+    scheduler = _build_scheduler(optimizer, remaining_epochs, effective_warmup,
+                                  constant_lr=constant_lr)
 
     # Resuming an old checkpoint (pre param-groups) would mismatch the new
     # optimizer structure; fall back to a fresh state rather than crashing.
@@ -355,7 +371,7 @@ def train(
             print(f"  Could not restore optimizer state ({e}); using fresh optimizer.")
             optimizer_state = None
             scheduler_state = None
-    if scheduler_state is not None:
+    if scheduler is not None and scheduler_state is not None:
         try:
             scheduler.load_state_dict(scheduler_state)
         except (ValueError, KeyError) as e:
@@ -366,13 +382,14 @@ def train(
         except (ValueError, KeyError):
             pass
 
+    schedule_str = "constant" if constant_lr else f"cosine over {remaining_epochs}ep"
     group_summary = ", ".join(
         f"{g.get('name', i)}={g['lr']:.2e}"
         for i, g in enumerate(optimizer.param_groups)
     )
     print(
         f"Optimizer: AdamW, {len(optimizer.param_groups)} group(s) [{group_summary}], "
-        f"warmup={effective_warmup}ep, cosine over {remaining_epochs}ep"
+        f"warmup={effective_warmup}ep, {schedule_str}"
     )
     if freeze_encoder_epochs > 0:
         print(f"  Encoder+predictor frozen for {freeze_encoder_epochs} epoch(s).")
@@ -398,7 +415,8 @@ def train(
             scaler=scaler,
             adapt_loader=adapt_loader,
         )
-        scheduler.step()
+        if scheduler is not None:
+            scheduler.step()
 
         loss_str = " | ".join(f"{k}={v:.4f}" for k, v in losses.items())
         print(f"Epoch {epoch}/{num_epochs} (lr {lr_str}) - {loss_str}")
@@ -406,27 +424,26 @@ def train(
         current_loss = losses.get("total", float("inf"))
         if current_loss < best_loss:
             best_loss = current_loss
-            torch.save(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict(),
-                    "scaler_state_dict": scaler.state_dict(),
-                    "epoch": epoch,
-                    "loss": current_loss,
-                    "mode": mode,
-                    "config": {
-                        "img_height": model.img_height,
-                        "window_size": getattr(model, "window_size", None),
-                        "embedding_dim": model.embedding_dim,
-                        "num_classes": model.ctc_head.proj.out_features
-                        if model.ctc_head
-                        else None,
-                    },
-                    "char_to_idx": char_to_idx,
+            ckpt_data = {
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scaler_state_dict": scaler.state_dict(),
+                "epoch": epoch,
+                "loss": current_loss,
+                "mode": mode,
+                "config": {
+                    "img_height": model.img_height,
+                    "window_size": getattr(model, "window_size", None),
+                    "embedding_dim": model.embedding_dim,
+                    "num_classes": model.ctc_head.proj.out_features
+                    if model.ctc_head
+                    else None,
                 },
-                save_path,
-            )
+                "char_to_idx": char_to_idx,
+            }
+            if scheduler is not None:
+                ckpt_data["scheduler_state_dict"] = scheduler.state_dict()
+            torch.save(ckpt_data, save_path)
 
         if model.ctc_head and idx_to_char:
             from recognize import evaluate_cer
@@ -576,6 +593,12 @@ if __name__ == "__main__":
         "activations and recompute them in the backward pass. ~30%% more "
         "compute for a large peak-VRAM cut — lets a bigger batch fit "
         "without spilling into shared GPU memory.",
+    )
+    parser.add_argument(
+        "--constant-lr",
+        action="store_true",
+        help="Disable cosine LR decay: use a constant learning rate "
+        "(matches ketos/Lectaurep training recipe).",
     )
     parser.add_argument(
         "--target-norm",
@@ -1364,4 +1387,5 @@ if __name__ == "__main__":
         warmup_epochs=args.warmup_epochs,
         freeze_encoder_epochs=args.freeze_encoder_epochs,
         no_amp=args.no_amp,
+        constant_lr=args.constant_lr,
     )
