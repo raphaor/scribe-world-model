@@ -176,7 +176,7 @@ class LectaurepClone(nn.Module):
             ctc_in,
             target_lengths,
             blank=0,
-            zero_infinity=True,
+            reduction="sum",  # ketos utilise sum, pas mean
         )
         return ctc_loss, {"ctc": ctc_loss.item(), "total": ctc_loss.item()}
 

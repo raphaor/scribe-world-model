@@ -177,6 +177,7 @@ class AltoLineDataset(Dataset):
         if self.augment:
             arr = self._augment(arr)
         img = torch.from_numpy(arr.copy()) / 255.0
+        img = 1.0 - img  # invert: texte blanc sur fond noir (comme ketos)
         return img, text
 
     @staticmethod
@@ -257,6 +258,7 @@ class UnannotatedLineDataset(Dataset):
         if self.augment:
             arr = AltoLineDataset._augment(arr)
         img = torch.from_numpy(arr.copy()) / 255.0
+        img = 1.0 - img  # invert: texte blanc sur fond noir (comme ketos)
         return (img,)
 
 
