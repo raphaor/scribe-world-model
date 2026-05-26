@@ -287,7 +287,7 @@ def _build_param_groups(model, lr, encoder_lr_mult):
 
 def _build_scheduler(optimizer, remaining_epochs, warmup_epochs, constant_lr=False):
     """Linear warmup (if any) followed by cosine decay over remaining epochs.
-    
+
     If constant_lr=True, skip the cosine entirely (matches ketos recipe).
     """
     if constant_lr and warmup_epochs == 0:
@@ -359,8 +359,9 @@ def train(
     remaining_epochs = max(1, num_epochs - start_epoch + 1)
     # Warmup only makes sense when we're not resuming mid-schedule.
     effective_warmup = warmup_epochs if scheduler_state is None else 0
-    scheduler = _build_scheduler(optimizer, remaining_epochs, effective_warmup,
-                                  constant_lr=constant_lr)
+    scheduler = _build_scheduler(
+        optimizer, remaining_epochs, effective_warmup, constant_lr=constant_lr
+    )
 
     # Resuming an old checkpoint (pre param-groups) would mismatch the new
     # optimizer structure; fall back to a fresh state rather than crashing.
@@ -420,6 +421,15 @@ def train(
 
         loss_str = " | ".join(f"{k}={v:.4f}" for k, v in losses.items())
         print(f"Epoch {epoch}/{num_epochs} (lr {lr_str}) - {loss_str}")
+        dropped = getattr(model, "_ctc_dropped_samples", 0)
+        total_b = getattr(model, "_ctc_total_batches", 0)
+        if dropped > 0:
+            print(
+                f"  [CTC] {dropped}/{total_b} samples dropped (input_length < target_length)"
+            )
+        if hasattr(model, "_ctc_dropped_samples"):
+            model._ctc_dropped_samples = 0
+            model._ctc_total_batches = 0
 
         current_loss = losses.get("total", float("inf"))
         if current_loss < best_loss:
@@ -491,20 +501,42 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model-version",
         choices=[
-            "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15",
+            "v2",
+            "v3",
+            "v4",
+            "v5",
+            "v6",
+            "v7",
+            "v8",
+            "v9",
+            "v10",
+            "v11",
+            "v12",
+            "v13",
+            "v14",
+            "v15",
         ],
         default="v5",
     )
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--no-augment", action="store_true",
-                        help="Disable image augmentation (elastic deformations).")
-    parser.add_argument("--no-amp", action="store_true",
-                        help="Disable AMP (float16). Needed for models with large "
-                        "intermediate dims (e.g. Lectaurep clone, 960-dim BiLSTM).")
-    parser.add_argument("--no-bucket", action="store_true",
-                        help="Disable width bucketing (batch lines of similar width).")
+    parser.add_argument(
+        "--no-augment",
+        action="store_true",
+        help="Disable image augmentation (elastic deformations).",
+    )
+    parser.add_argument(
+        "--no-amp",
+        action="store_true",
+        help="Disable AMP (float16). Needed for models with large "
+        "intermediate dims (e.g. Lectaurep clone, 960-dim BiLSTM).",
+    )
+    parser.add_argument(
+        "--no-bucket",
+        action="store_true",
+        help="Disable width bucketing (batch lines of similar width).",
+    )
     parser.add_argument("--data", default="alto", choices=["alto", "synthetic"])
     parser.add_argument("--alto-dirs", nargs="+", default=config.ALTO_DIRS)
     parser.add_argument(
@@ -651,8 +683,7 @@ if __name__ == "__main__":
     if args.exclude_dirs:
         original_dirs = list(args.alto_dirs)
         args.alto_dirs = [
-            d for d in args.alto_dirs
-            if not any(ex in d for ex in args.exclude_dirs)
+            d for d in args.alto_dirs if not any(ex in d for ex in args.exclude_dirs)
         ]
         excluded = [d for d in original_dirs if d not in args.alto_dirs]
         print(f"Excluded {len(excluded)} dir(s) matching {args.exclude_dirs}:")
@@ -662,13 +693,23 @@ if __name__ == "__main__":
         for d in args.alto_dirs:
             print(f"  + {d}")
         if not args.alto_dirs:
-            raise ValueError(
-                "All --alto-dirs were excluded; nothing left to train on."
-            )
+            raise ValueError("All --alto-dirs were excluded; nothing left to train on.")
 
     if args.data == "alto":
         ver = args.model_version
-        if ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15"):
+        if ver in (
+            "v5",
+            "v6",
+            "v7",
+            "v8",
+            "v9",
+            "v10",
+            "v11",
+            "v12",
+            "v13",
+            "v14",
+            "v15",
+        ):
             if ver in ("v12", "v13", "v14", "v15"):
                 img_h = config.IMG_HEIGHT_V12
             elif ver == "v11":
@@ -694,8 +735,9 @@ if __name__ == "__main__":
             ws = config.WINDOW_SIZE
             stride = config.STRIDE
 
-        dataset = AltoLineDataset(args.alto_dirs, img_height=img_h,
-                                  augment=not args.no_augment)
+        dataset = AltoLineDataset(
+            args.alto_dirs, img_height=img_h, augment=not args.no_augment
+        )
         char_to_idx, idx_to_char = dataset.get_alphabet()
         print(f"Alphabet: {len(char_to_idx)} characters")
         num_classes = len(char_to_idx) + 1
@@ -716,7 +758,19 @@ if __name__ == "__main__":
         _val_base.augment = False
         val_ds = Subset(_val_base, val_ds.indices)
 
-        if ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15"):
+        if ver in (
+            "v5",
+            "v6",
+            "v7",
+            "v8",
+            "v9",
+            "v10",
+            "v11",
+            "v12",
+            "v13",
+            "v14",
+            "v15",
+        ):
             collate = partial(collate_alto_v5_fn, char_to_idx=char_to_idx)
         else:
             collate = partial(
@@ -726,8 +780,11 @@ if __name__ == "__main__":
         # v5+ feeds full-line images (variable width) to the loader, so
         # bucket by width to bound peak VRAM and kill padding waste.
         # v2-v4 pre-extract fixed-size frame columns — plain batching.
-        use_bucketing = ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15") \
+        use_bucketing = (
+            ver
+            in ("v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15")
             and not args.no_bucket
+        )
 
         def _make_loader(ds, collate_fn, shuffle):
             common = dict(
@@ -740,15 +797,15 @@ if __name__ == "__main__":
                 return DataLoader(
                     ds,
                     batch_sampler=LengthBucketBatchSampler(
-                        line_widths(ds), args.batch_size, shuffle=shuffle,
+                        line_widths(ds),
+                        args.batch_size,
+                        shuffle=shuffle,
                         oversample_factor=args.oversample_factor,
                         long_threshold_px=args.long_threshold_px,
                     ),
                     **common,
                 )
-            return DataLoader(
-                ds, batch_size=args.batch_size, shuffle=shuffle, **common
-            )
+            return DataLoader(ds, batch_size=args.batch_size, shuffle=shuffle, **common)
 
         train_loader = _make_loader(train_ds, collate, shuffle=True)
         val_loader = _make_loader(val_ds, collate, shuffle=False)
@@ -766,7 +823,19 @@ if __name__ == "__main__":
             adapt_ds = UnannotatedLineDataset(
                 unannotated_dirs, img_height=img_h, augment=True
             )
-            if ver in ("v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15"):
+            if ver in (
+                "v5",
+                "v6",
+                "v7",
+                "v8",
+                "v9",
+                "v10",
+                "v11",
+                "v12",
+                "v13",
+                "v14",
+                "v15",
+            ):
                 adapt_collate = collate_unannotated_v5_fn
             else:
                 adapt_collate = partial(
@@ -1261,8 +1330,10 @@ if __name__ == "__main__":
             print("  WARNING: v15 is unstable in fp16. Auto-enabling --no-amp.")
             args.no_amp = True
         if args.encoder_lr_mult == 0.1:
-            print("  NOTE: Lectaurep trains all layers at the same LR. "
-                  "Auto-setting --encoder-lr-mult 1.0.")
+            print(
+                "  NOTE: Lectaurep trains all layers at the same LR. "
+                "Auto-setting --encoder-lr-mult 1.0."
+            )
             args.encoder_lr_mult = 1.0
         save_path = "hwm_lectaurep.pt"
     elif ver == "v4":

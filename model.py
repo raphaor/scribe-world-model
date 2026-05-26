@@ -121,6 +121,8 @@ class LectaurepClone(nn.Module):
         # (encoder is the Sequential above, which is already an attribute)
         self.ctc_norm = nn.Identity()  # no-op, but train.py passes z through it
         self.window_size = None
+        self._ctc_dropped_samples = 0
+        self._ctc_total_batches = 0
 
     def _encode(self, img):
         """CNN forward: (B, H, W) → (B, T, 960)."""
@@ -165,11 +167,8 @@ class LectaurepClone(nn.Module):
         # Diagnostic: log how many samples would fail CTC alignment.
         # ketos filters these upstream; we clamp and warn instead.
         bad = (ctc_in < target_lengths).sum().item()
-        if bad > 0:
-            print(
-                f"  [CTC] WARNING: {bad}/{B} samples have "
-                f"input_length < target_length — loss will be 0 for those"
-            )
+        self._ctc_dropped_samples += bad
+        self._ctc_total_batches += B
 
         ctc_loss = F.ctc_loss(
             ctc_logits.permute(1, 0, 2),  # (T, B, C)
