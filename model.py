@@ -178,6 +178,9 @@ class LectaurepClone(nn.Module):
             blank=0,
             reduction="sum",  # ketos utilise sum, pas mean
         )
+        # Normaliser par B pour rester stable quel que soit le batch size.
+        # ketos a Lightning qui gère ça ; ici on le fait explicitement.
+        ctc_loss = ctc_loss / B
         return ctc_loss, {"ctc": ctc_loss.item(), "total": ctc_loss.item()}
 
     def adapt(self, img_seqs, input_lengths=None):
