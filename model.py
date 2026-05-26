@@ -8,6 +8,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 from encoder import (
     CNNEncoder,
@@ -124,6 +125,33 @@ class LectaurepClone(nn.Module):
         self._ctc_dropped_samples = 0
         self._ctc_total_batches = 0
 
+        # Initialize weights exactly like ketos (vgsl/model.py init_weights)
+        self.init_weights()
+
+    def init_weights(self):
+        """Weight initialization matching ketos VGSL init_weights().
+        
+        - Conv2d: uniform(-0.1, 0.1)
+        - LSTM: orthogonal for weights, forget gate bias = 1.0 (jozefowicz 2015)
+        - Linear: xavier_uniform + bias = 0
+        """
+        def _wi(m):
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight.data)
+                nn.init.constant_(m.bias.data, 0)
+            elif isinstance(m, nn.LSTM):
+                for p in m.parameters():
+                    if p.data.dim() == 2:
+                        nn.init.orthogonal_(p.data)
+                    else:
+                        # bias: set forget gate to 1.0 (jozefowicz 2015)
+                        nn.init.constant_(p.data, 0)
+                        nn.init.constant_(p.data[len(p) // 4:len(p) // 2], 1.0)
+            elif isinstance(m, nn.Conv2d):
+                for p in m.parameters():
+                    nn.init.uniform_(p.data, -0.1, 0.1)
+        self.apply(_wi)
+
     def _encode(self, img):
         """CNN forward: (B, H, W) → (B, T, 960)."""
         x = img.unsqueeze(1)  # (B, 1, H, W)
@@ -133,17 +161,30 @@ class LectaurepClone(nn.Module):
         x = x.reshape(B, T, C * H)  # (B, T, 960)
         return x
 
-    def _bilstm(self, z_seq):
-        """3 × BiLSTM(200): (B, T, 960) → (B, T, 400)."""
+    def _bilstm(self, z_seq, input_lengths=None):
+        """3 × BiLSTM(200): (B, T, 960) → (B, T, 400).
+        
+        Uses pack_padded_sequence to ignore padding, like ketos.
+        input_lengths: (B,) tensor of actual sequence lengths before padding.
+        """
         for lstm, do in zip(self.lstm_layers, self.lstm_dropouts):
-            z_seq, _ = lstm(z_seq)
+            if input_lengths is not None:
+                # ketos packs sequences so LSTM ignores padding
+                packed = pack_padded_sequence(
+                    z_seq, input_lengths.cpu(),
+                    batch_first=True, enforce_sorted=False
+                )
+                packed_out, _ = lstm(packed)
+                z_seq, _ = pad_packed_sequence(packed_out, batch_first=True)
+            else:
+                z_seq, _ = lstm(z_seq)
             z_seq = do(z_seq)
         return z_seq
 
-    def forward(self, img):
+    def forward(self, img, input_lengths=None):
         """Inference forward.  Returns (None, z_seq, ctc_logits) for compatibility."""
         z_seq = self._encode(img)
-        z_seq = self._bilstm(z_seq)
+        z_seq = self._bilstm(z_seq, input_lengths=input_lengths)
         ctc_logits = self.ctc_head(z_seq)  # CTCHead includes log_softmax
         return None, z_seq, ctc_logits
 
@@ -155,7 +196,7 @@ class LectaurepClone(nn.Module):
             input_lengths = input_lengths.to(img.device)
 
         z_seq = self._encode(img)
-        z_seq = self._bilstm(z_seq)
+        z_seq = self._bilstm(z_seq, input_lengths=input_lengths)
         ctc_logits = self.ctc_head(z_seq)  # (B, T, C) log-probs
 
         B, T, _ = ctc_logits.shape
