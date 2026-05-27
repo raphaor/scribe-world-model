@@ -74,22 +74,23 @@ class LectaurepClone(nn.Module):
         self.num_lstm_layers = num_lstm_layers
 
         # --- CNN encoder (identical to KrakenEncoder's conv stem) ---
+        # Kraken uses Dropout2d (drops entire channels) not Dropout (drops pixels)
         self.encoder = nn.Sequential(
             nn.Conv2d(1, 32, kernel_size=(3, 13), padding=(1, 6)),
             nn.ReLU(),
-            nn.Dropout(dropout),
+            nn.Dropout2d(dropout),
             nn.MaxPool2d(2, 2),
             nn.Conv2d(32, 32, kernel_size=(3, 13), padding=(1, 6)),
             nn.ReLU(),
-            nn.Dropout(dropout),
+            nn.Dropout2d(dropout),
             nn.MaxPool2d(2, 2),
             nn.Conv2d(32, 64, kernel_size=(3, 9), padding=(1, 4)),
             nn.ReLU(),
-            nn.Dropout(dropout),
+            nn.Dropout2d(dropout),
             nn.MaxPool2d(2, 2),
             nn.Conv2d(64, 64, kernel_size=(3, 9), padding=(1, 4)),
             nn.ReLU(),
-            nn.Dropout(dropout),
+            nn.Dropout2d(dropout),
         )
 
         # --- 3 × BiLSTM(200) ---
@@ -108,7 +109,8 @@ class LectaurepClone(nn.Module):
             )
 
         self.lstm_dropouts = nn.ModuleList(
-            [nn.Dropout(dropout) for _ in range(num_lstm_layers)]
+            [nn.Dropout(dropout) for _ in range(num_lstm_layers - 1)]
+            + [nn.Dropout(0.5)]  # Kraken's VGSL 'Do]' = default p=0.5 for last layer
         )
 
         # --- CTC output head ---

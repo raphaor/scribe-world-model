@@ -351,7 +351,7 @@ def train(
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     param_groups = _build_param_groups(model, lr, encoder_lr_mult)
-    optimizer = optim.AdamW(param_groups, weight_decay=1e-4)
+    optimizer = optim.Adam(param_groups)
 
     # T_max covers only the epochs of this invocation. On a phase switch
     # the caller resets start_epoch to 1 so the new phase gets a full
@@ -389,7 +389,7 @@ def train(
         for i, g in enumerate(optimizer.param_groups)
     )
     print(
-        f"Optimizer: AdamW, {len(optimizer.param_groups)} group(s) [{group_summary}], "
+        f"Optimizer: Adam, {len(optimizer.param_groups)} group(s) [{group_summary}], "
         f"warmup={effective_warmup}ep, {schedule_str}"
     )
     if freeze_encoder_epochs > 0:
