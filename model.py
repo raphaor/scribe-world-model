@@ -219,12 +219,13 @@ class LectaurepClone(nn.Module):
             ctc_in,
             target_lengths,
             blank=0,
-            reduction="sum",  # ketos: reduction='sum'
-            zero_infinity=True,  # ketos: zero_infinity=True aussi
+            reduction="sum",  # ketos: reduction='sum', NO division by B
+            zero_infinity=True,  # ketos: zero_infinity=True
         )
-        # Normaliser par B pour rester stable quel que soit le batch size.
-        # ketos a Lightning qui gère ça ; ici on le fait explicitement.
-        ctc_loss = ctc_loss / B
+        # ketos returns raw sum loss to Lightning's training_step.
+        # Do NOT divide by B — matching ketos exactly so Adam sees the
+        # same gradient scale.  The loss value will be batch-size dependent,
+        # but Adam is adaptive and handles this fine.
         return ctc_loss, {"ctc": ctc_loss.item(), "total": ctc_loss.item()}
 
     def adapt(self, img_seqs, input_lengths=None):

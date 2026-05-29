@@ -106,7 +106,7 @@ def _show_fixed_samples(model, loader, device, idx_to_char, use_amp):
     img_seqs, _t, input_lengths, _tl, raw_texts = loader.collate_fn(items)
     img_seqs = img_seqs.to(device, non_blocking=True)
     with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp):
-        _, _, ctc_logits = model(img_seqs)
+        _, _, ctc_logits = model(img_seqs, input_lengths=input_lengths.to(device))
     decoded = ctc_greedy_decode(ctc_logits.cpu(), input_lengths.clone(), idx_to_char)
 
     print(f"\nExamples ({k} fixed random lines, idx {pick}):")
@@ -151,7 +151,9 @@ def evaluate_cer(model, loader, device, idx_to_char, max_samples=None, verbose=T
             input_lengths_cpu = input_lengths.clone()
 
             with torch.amp.autocast("cuda", enabled=use_amp):
-                _, z_seq, ctc_logits = model(img_seqs)
+                _, z_seq, ctc_logits = model(
+                    img_seqs, input_lengths=input_lengths.to(device)
+                )
 
             decoded = ctc_greedy_decode(
                 ctc_logits.cpu(), input_lengths_cpu, idx_to_char
