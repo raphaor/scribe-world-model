@@ -249,6 +249,8 @@ def _set_encoder_frozen(model, frozen):
         "jepa_predictor",
         "proj_head",
         "context_transformer",
+        "lstm_layers",      # v15 (LectaurepClone)
+        "lstm_dropouts",    # v15 (LectaurepClone)
     ):
         sub = getattr(model, name, None)
         if sub is not None:
@@ -273,6 +275,8 @@ def _build_param_groups(model, lr, encoder_lr_mult):
         "jepa_predictor",
         "proj_head",
         "context_transformer",
+        "lstm_layers",      # v15 (LectaurepClone)
+        "lstm_dropouts",    # v15 (LectaurepClone)
     ):
         sub = getattr(model, name, None)
         if sub is not None:
