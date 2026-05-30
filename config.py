@@ -526,5 +526,41 @@ LECTAUREP_DROPOUT = 0.1
 LECTAUREP_LR = 1e-4        # from the official ketos command: -r 0.0001
 
 
+# --- v16: v15 training recipe + v14 encoder (Transformer + JEPA + SIGReg) ---
+# CNN v15 → Projection(960→256) + LayerNorm → Transformer 3L pre-LN 256-dim 4 heads
+# → 2× BiLSTM(128) → CTC Head
+# ~3.6M params total. Adam, cosine+warmup, no AMP, single param group.
+EMBEDDING_DIM_V16 = 256
+NUM_LAYERS_V16 = 3              # Transformer depth
+NUM_HEADS_V16 = 4               # 256/4 = 64 per head
+FF_DIM_V16 = 1024               # 4× embedding_dim
+DROPOUT_V16 = 0.1               # Transformer / conv stem dropout
+
+LSTM_HIDDEN_V16 = 128           # BiLSTM hidden (output=256 bidir)
+NUM_LSTM_V16 = 2                # 2 layers (Transformer already does sequential)
+LSTM_DROPOUT_MID_V16 = 0.1      # Dropout between LSTM layers
+LSTM_DROPOUT_LAST_V16 = 0.3     # Dropout on last LSTM (less aggressive than v15's 0.5)
+
+LAMBDA_CTC_V16 = 1.0
+LAMBDA_JEPA_V16 = 0.5
+LAMBDA_SIGREG_V16 = 0.1
+LAMBDA_WC_V16 = 0.2
+
+INFONCE_TEMP_V16 = 0.1
+SUPCON_TEMP_V16 = 0.1
+
+PROJ_DIM_V16 = 128
+PROJ_HIDDEN_V16 = 256
+
+JEPA_NUM_TARGETS_V16 = 4
+JEPA_MIN_SIZE_V16 = 8
+JEPA_MAX_SIZE_V16 = 20
+
+SIGREG_PROJECTIONS_V16 = 256
+SIGREG_KNOTS_V16 = 17
+
+USE_WRITER_CONTRASTIVE_V16 = False
+
+
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)

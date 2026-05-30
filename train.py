@@ -53,6 +53,7 @@ from model import (
     HWMv10,
     HWMv11,
     HWMv12,
+    HWMv16,
     LectaurepClone,
 )
 from data_alto import (
@@ -526,6 +527,7 @@ if __name__ == "__main__":
             "v13",
             "v14",
             "v15",
+            "v16",
         ],
         default="v5",
     )
@@ -1347,6 +1349,74 @@ if __name__ == "__main__":
             )
             args.encoder_lr_mult = 1.0
         save_path = "hwm_lectaurep.pt"
+    elif ver == "v16":
+        # v16: v15 training recipe + v14 encoder (Transformer + JEPA + SIGReg).
+        # CNN → Proj(960→256) + LayerNorm → Transformer 3L → 2×BiLSTM(128) → CTC
+        if args.lambda_pred is not None and args.lambda_pred == 0:
+            lambda_jepa = 0.0
+            use_pretext = False
+        else:
+            lambda_jepa = (
+                args.lambda_pred
+                if args.lambda_pred is not None
+                else config.LAMBDA_JEPA_V16
+            )
+            use_pretext = lambda_jepa > 0
+        lambda_sigreg_v16 = (
+            args.lambda_sigreg
+            if args.lambda_sigreg is not None
+            else config.LAMBDA_SIGREG_V16
+        )
+        print(
+            f"v16 config: use_pretext={use_pretext} lambda_jepa={lambda_jepa} "
+            f"lambda_sigreg={lambda_sigreg_v16} lambda_ctc={config.LAMBDA_CTC_V16} "
+            f"embed_dim={config.EMBEDDING_DIM_V16} layers={config.NUM_LAYERS_V16} "
+            f"heads={config.NUM_HEADS_V16} ff={config.FF_DIM_V16} | "
+            f"lstm: {config.NUM_LSTM_V16}×BiLSTM({config.LSTM_HIDDEN_V16}) "
+            f"drop_mid={config.LSTM_DROPOUT_MID_V16} "
+            f"drop_last={config.LSTM_DROPOUT_LAST_V16} | "
+            f"mask: {config.JEPA_NUM_TARGETS_V16} blocks "
+            f"[{config.JEPA_MIN_SIZE_V16},{config.JEPA_MAX_SIZE_V16}] frames | "
+            f"sigreg: {config.SIGREG_PROJECTIONS_V16} proj, "
+            f"{config.SIGREG_KNOTS_V16} knots"
+        )
+        model = HWMv16(
+            img_height=config.LECTAUREP_IMG_HEIGHT,  # 120, same as v15
+            embedding_dim=config.EMBEDDING_DIM_V16,
+            num_layers=config.NUM_LAYERS_V16,
+            num_heads=config.NUM_HEADS_V16,
+            ff_dim=config.FF_DIM_V16,
+            dropout=config.DROPOUT_V16,
+            num_classes=model_num_classes,
+            lambda_ctc=config.LAMBDA_CTC_V16,
+            lambda_jepa=lambda_jepa,
+            lambda_sigreg=lambda_sigreg_v16,
+            lambda_wc=config.LAMBDA_WC_V16,
+            lstm_hidden=config.LSTM_HIDDEN_V16,
+            num_lstm_layers=config.NUM_LSTM_V16,
+            lstm_dropout_mid=config.LSTM_DROPOUT_MID_V16,
+            lstm_dropout_last=config.LSTM_DROPOUT_LAST_V16,
+            proj_dim=config.PROJ_DIM_V16,
+            proj_hidden=config.PROJ_HIDDEN_V16,
+            jepa_num_targets=config.JEPA_NUM_TARGETS_V16,
+            jepa_min_size=config.JEPA_MIN_SIZE_V16,
+            jepa_max_size=config.JEPA_MAX_SIZE_V16,
+            sigreg_projections=config.SIGREG_PROJECTIONS_V16,
+            sigreg_knots=config.SIGREG_KNOTS_V16,
+            infonce_temp=config.INFONCE_TEMP_V16,
+            supcon_temp=config.SUPCON_TEMP_V16,
+            use_pretext=use_pretext,
+            use_writer_contrastive=config.USE_WRITER_CONTRASTIVE_V16,
+            use_checkpoint=args.grad_checkpoint,
+        ).to(device)
+        # v16 stability: no AMP (like v15), single param group
+        if not args.no_amp:
+            print("  NOTE: v16 uses no AMP for stability. Auto-enabling --no-amp.")
+            args.no_amp = True
+        if args.encoder_lr_mult == 0.1:
+            print("  NOTE: v16 trains all layers at the same LR. Auto-setting --encoder-lr-mult 1.0.")
+            args.encoder_lr_mult = 1.0
+        save_path = "hwm_v16.pt"
     elif ver == "v4":
         model = HWMv4(
             img_height=config.IMG_HEIGHT_V4,

@@ -35,6 +35,297 @@ from jepa import sample_jepa_mask, sample_2d_block_mask
 import config
 
 
+class HWMv16(nn.Module):
+    """
+    Handwriting World Model v16 — Kraken conv stem + Transformer encoder +
+    2×BiLSTM(128) CTC + JEPA + SIGReg.
+
+    Lessons from v15 applied to v14's architecture:
+      - CNN uses Dropout2d (channel-level, like kraken)
+      - BiLSTM dropout uses Dropout2d with p=0.3 on the last layer
+      - All params collected in a single optimizer group (no _build_param_groups bug)
+      - Adam (not AdamW), cosine + warmup schedule
+      - 2 BiLSTM layers (Transformer already does sequential modeling)
+      - 256-dim throughout (projection → Transformer → BiLSTM → CTC head)
+
+    Flow
+    ----
+        line image (B, H, W)
+          ├─► clean view ─► KrakenEncoderV12 ─► z  (B, T, 256)
+          │       ├─ LayerNorm → 2×BiLSTM(128) → CTC
+          │       ├─ SIGReg(z)
+          │       └─ (optional writer contrastive)
+          │
+          └─► pixel-masked view ─► KrakenEncoderV12 ─► z_masked
+                  InfoNCE( jepa_proj(z_masked@masked),
+                           jepa_proj(sg z@masked) )
+
+        L = λ_ctc·CTC + λ_jepa·InfoNCE + λ_sigreg·SIGReg
+
+    The architecture reuses KrakenEncoderV12 from v12-v14 (CNN stem +
+    projection + Transformer) but replaces the CTCHeadBiLSTM with
+    explicit 2×BiLSTM(128) layers using Dropout2d between them.
+    """
+
+    def __init__(
+        self,
+        img_height=120,
+        embedding_dim=256,
+        num_layers=3,
+        num_heads=4,
+        ff_dim=1024,
+        dropout=0.1,
+        num_classes=None,
+        lambda_ctc=1.0,
+        lambda_jepa=0.5,
+        lambda_sigreg=0.1,
+        lambda_wc=0.2,
+        lstm_hidden=128,
+        num_lstm_layers=2,
+        lstm_dropout_mid=0.1,
+        lstm_dropout_last=0.3,
+        proj_dim=128,
+        proj_hidden=256,
+        jepa_num_targets=4,
+        jepa_min_size=8,
+        jepa_max_size=20,
+        sigreg_projections=256,
+        sigreg_knots=17,
+        infonce_temp=0.1,
+        supcon_temp=0.1,
+        use_pretext=True,
+        use_writer_contrastive=False,
+        use_checkpoint=False,
+    ):
+        super().__init__()
+        self.img_height = img_height
+        self.embedding_dim = embedding_dim
+        self.use_pretext = use_pretext
+        self.use_writer_contrastive = use_writer_contrastive
+        self.jepa_num_targets = jepa_num_targets
+        self.jepa_min_size = jepa_min_size
+        self.jepa_max_size = jepa_max_size
+        self.frame_stride = 8  # 3 × MaxPool(2)
+
+        # --- Encoder: Kraken CNN stem + projection + Transformer ---
+        # Same as v12-v14 but with Dropout2d in the conv stem
+        self.encoder = KrakenEncoderV12(
+            img_height=img_height,
+            embedding_dim=embedding_dim,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            ff_dim=ff_dim,
+            dropout=dropout,
+            use_checkpoint=use_checkpoint,
+        )
+
+        # Learnable scalar for pixel-space masking
+        self.mask_pixel = nn.Parameter(torch.zeros(()))
+
+        # JEPA projection head
+        self.jepa_proj = nn.Sequential(
+            nn.Linear(embedding_dim, proj_hidden),
+            nn.GELU(),
+            nn.Linear(proj_hidden, proj_dim),
+        )
+
+        # Writer contrastive projection head (dormant unless enabled)
+        self.style_proj = nn.Sequential(
+            nn.Linear(embedding_dim, proj_hidden),
+            nn.GELU(),
+            nn.Linear(proj_hidden, proj_dim),
+        )
+
+        # --- CTC path: LayerNorm → 2×BiLSTM(128) → Linear ---
+        self.ctc_norm = nn.LayerNorm(embedding_dim)
+
+        self.lstm_layers = nn.ModuleList()
+        for i in range(num_lstm_layers):
+            input_dim = embedding_dim if i == 0 else lstm_hidden * 2
+            self.lstm_layers.append(
+                nn.LSTM(
+                    input_dim,
+                    lstm_hidden,
+                    num_layers=1,
+                    batch_first=True,
+                    bidirectional=True,
+                )
+            )
+
+        # Dropout2d between LSTM layers (channel-level, like kraken)
+        self.lstm_dropouts = nn.ModuleList()
+        for i in range(num_lstm_layers):
+            p = lstm_dropout_last if i == num_lstm_layers - 1 else lstm_dropout_mid
+            self.lstm_dropouts.append(nn.Dropout(p))
+
+        # CTC output head
+        self.ctc_head = CTCHead(lstm_hidden * 2, num_classes)
+
+        # --- Loss ---
+        self.criterion = V12Loss(
+            lambda_ctc=lambda_ctc,
+            lambda_jepa=lambda_jepa,
+            lambda_sigreg=lambda_sigreg,
+            lambda_wc=lambda_wc,
+            infonce_temp=infonce_temp,
+            supcon_temp=supcon_temp,
+            sigreg_projections=sigreg_projections,
+            sigreg_knots=sigreg_knots,
+        )
+
+        # Initialize LSTM weights (ketos-style)
+        self._init_lstm_weights()
+
+    def _init_lstm_weights(self):
+        """Initialize LSTM weights: orthogonal + forget gate bias 1.0."""
+        for lstm in self.lstm_layers:
+            for p in lstm.parameters():
+                if p.data.dim() == 2:
+                    nn.init.orthogonal_(p.data)
+                else:
+                    nn.init.constant_(p.data, 0)
+                    nn.init.constant_(p.data[len(p) // 4:len(p) // 2], 1.0)
+
+    def _bilstm(self, z_seq, input_lengths=None):
+        """2×BiLSTM(128): (B, T, 256) → (B, T, 256)."""
+        for lstm, do in zip(self.lstm_layers, self.lstm_dropouts):
+            if input_lengths is not None:
+                packed = pack_padded_sequence(
+                    z_seq, input_lengths.cpu(),
+                    batch_first=True, enforce_sorted=False,
+                )
+                packed_out, _ = lstm(packed)
+                z_seq, _ = pad_packed_sequence(packed_out, batch_first=True)
+            else:
+                z_seq, _ = lstm(z_seq)
+            z_seq = do(z_seq)
+        return z_seq
+
+    def _pool_temporal(self, z_seq, input_lengths=None):
+        """Padding-aware mean over the time axis → (B, D)."""
+        B, T, D = z_seq.shape
+        if input_lengths is None:
+            return z_seq.mean(dim=1)
+        ar = torch.arange(T, device=z_seq.device)
+        valid = (ar[None, :] < input_lengths.clamp(max=T)[:, None]).float()
+        z_masked = z_seq * valid.unsqueeze(-1)
+        denom = input_lengths.clamp(min=1, max=T).float().unsqueeze(-1)
+        return z_masked.sum(dim=1) / denom
+
+    def _make_masks(self, img, T, input_lengths):
+        """Sample frame-level block mask, return pixel-masked image + frame mask."""
+        B, _, W = img.shape
+        frame_mask = sample_jepa_mask(
+            B, T,
+            num_targets=self.jepa_num_targets,
+            min_size=self.jepa_min_size,
+            max_size=self.jepa_max_size,
+            valid_lengths=input_lengths,
+            device=img.device,
+        )
+
+        pixel_mask = frame_mask.repeat_interleave(self.frame_stride, dim=1)
+        if pixel_mask.shape[1] < W:
+            pixel_mask = F.pad(pixel_mask, (0, W - pixel_mask.shape[1]))
+        else:
+            pixel_mask = pixel_mask[:, :W]
+
+        img_masked = torch.where(
+            pixel_mask.unsqueeze(1),
+            self.mask_pixel.to(img.dtype).expand_as(img),
+            img,
+        )
+        return img_masked, frame_mask
+
+    def forward(self, img):
+        """Inference: encoder → LayerNorm → BiLSTM → CTC."""
+        z_seq = self.encoder(img)
+        z_seq = self._bilstm(self.ctc_norm(z_seq))
+        ctc_logits = self.ctc_head(z_seq) if self.ctc_head is not None else None
+        return None, z_seq, ctc_logits
+
+    def compute_loss(
+        self,
+        img,
+        targets=None,
+        input_lengths=None,
+        target_lengths=None,
+        writer_id=None,
+    ):
+        if input_lengths is not None:
+            input_lengths = input_lengths.to(img.device)
+
+        # 1. Encoder passes
+        z_clean = self.encoder(img, input_lengths)  # (B, T, 256)
+        B, T, D = z_clean.shape
+        ctc_in = input_lengths.clamp(max=T) if input_lengths is not None else None
+
+        # Valid frame mask
+        valid_mask = None
+        if ctc_in is not None:
+            ar = torch.arange(T, device=img.device)
+            valid_mask = ar[None, :] < ctc_in[:, None]
+
+        z_masked = None
+        frame_mask = None
+        if self.use_pretext:
+            img_masked, frame_mask = self._make_masks(img, T, ctc_in)
+            if valid_mask is not None:
+                frame_mask = frame_mask & valid_mask
+            if frame_mask.any():
+                z_masked = self.encoder(img_masked, input_lengths)
+            else:
+                frame_mask = None
+
+        # 2. Heads + loss (float32 for SIGReg/InfoNCE precision)
+        _f32 = (
+            torch.amp.autocast("cuda", enabled=False)
+            if img.is_cuda
+            else contextlib.nullcontext()
+        )
+        with _f32:
+            z_clean = z_clean.float()
+
+            # CTC path: LayerNorm → BiLSTM → CTC
+            ctc_logits = None
+            if self.ctc_head is not None:
+                lstm_out = self._bilstm(self.ctc_norm(z_clean))
+                ctc_logits = self.ctc_head(lstm_out)
+
+            # JEPA: masked-segment InfoNCE
+            z_pred = z_target = None
+            if z_masked is not None and frame_mask is not None:
+                z_masked = z_masked.float()
+                z_pred = self.jepa_proj(z_masked[frame_mask])
+                z_target = self.jepa_proj(z_clean.detach()[frame_mask])
+
+            # Writer contrastive (optional)
+            line_vec = None
+            if self.use_writer_contrastive and writer_id is not None:
+                v = self._pool_temporal(z_clean, ctc_in)
+                line_vec = self.style_proj(v)
+
+            return self.criterion(
+                z_pred=z_pred,
+                z_target=z_target,
+                z_seq=z_clean,
+                valid_mask=valid_mask,
+                ctc_logits=ctc_logits,
+                targets=targets,
+                input_lengths=ctc_in,
+                target_lengths=target_lengths,
+                line_vec=line_vec,
+                writer_id=writer_id,
+            )
+
+    def adapt(self, img, input_lengths=None):
+        """Self-supervised step: InfoNCE + SIGReg only."""
+        return self.compute_loss(img, input_lengths=input_lengths)
+
+    def count_parameters(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
 class LectaurepClone(nn.Module):
     """
     Faithful reproduction of the lectaurep_base model architecture.
