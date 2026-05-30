@@ -741,3 +741,25 @@ def get_spec(version: str) -> ModelSpec:
 def known_versions() -> list[str]:
     """Insertion-order list, used by argparse choices."""
     return list(REGISTRY)
+
+
+def default_train_args():
+    """Namespace with the same defaults as ``train.py`` argparse.
+
+    Builders read these attributes to drive lambda weights and SSL flags.
+    Inference scripts only need them to satisfy the builder signature —
+    the training-time options don't affect ``forward()``.
+    """
+    import argparse
+    return argparse.Namespace(
+        no_jepa=False,
+        no_amp=False,
+        no_augment=False,
+        no_bucket=False,
+        lambda_pred=None,
+        lambda_sigreg=None,
+        target_norm=None,
+        pred_loss=None,
+        encoder_lr_mult=0.1,
+        grad_checkpoint=False,
+    )

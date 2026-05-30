@@ -178,14 +178,14 @@ if __name__ == "__main__":
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
     import config
-    from model import HWMv2, HWMv3, HWMv4, HWMv5
+    from model_registry import get_spec, known_versions, default_train_args
     from data_alto import AltoLineDataset, build_alphabet, collate_alto_fn, collate_alto_v5_fn
     from functools import partial
     from torch.utils.data import DataLoader, random_split
 
     parser = argparse.ArgumentParser(description="Evaluate HWM CER")
     parser.add_argument("--model", default="hwm_v4.pt", help="Model checkpoint")
-    parser.add_argument("--model-version", choices=["v2", "v3", "v4", "v5"], default="v5")
+    parser.add_argument("--model-version", choices=known_versions(), default="v5")
     parser.add_argument("--alto-dirs", nargs="+", default=config.ALTO_DIRS)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--split", choices=["all", "val", "train"], default="val",
@@ -210,54 +210,12 @@ if __name__ == "__main__":
     num_classes = ckpt_num_classes if ckpt_num_classes else len(char_to_idx) + 1
 
     ver = args.model_version
-    if ver == "v5":
-        model = HWMv5(
-            img_height=saved_config.get("img_height", config.IMG_HEIGHT_V5),
-            embedding_dim=saved_config.get("embedding_dim", config.EMBEDDING_DIM_V5),
-            num_layers=config.NUM_LAYERS_V5,
-            num_heads=config.NUM_HEADS_V5,
-            ff_dim=config.FF_DIM_V5,
-            num_classes=num_classes,
-            ctc_hidden=config.CTC_HIDDEN_V5,
-            ctc_num_lstm=config.CTC_NUM_LSTM_V5,
-        ).to(device)
-    elif ver == "v4":
-        model = HWMv4(
-            img_height=saved_config.get("img_height", config.IMG_HEIGHT_V4),
-            window_size=saved_config.get("window_size", config.WINDOW_SIZE_V4),
-            embedding_dim=saved_config.get("embedding_dim", config.EMBEDDING_DIM_V4),
-            num_layers=config.NUM_LAYERS_V4,
-            num_heads=config.NUM_HEADS_V4,
-            ff_dim=config.FF_DIM_V4,
-            num_classes=num_classes,
-            ctc_hidden=config.CTC_HIDDEN_V4,
-        ).to(device)
-        ws = config.WINDOW_SIZE_V4
-        stride = config.STRIDE_V4
-    elif ver == "v3":
-        model = HWMv3(
-            img_height=saved_config.get("img_height", config.IMG_HEIGHT_V3),
-            window_size=saved_config.get("window_size", config.WINDOW_SIZE_V3),
-            embedding_dim=saved_config.get("embedding_dim", config.EMBEDDING_DIM_V3),
-            num_layers=config.NUM_LAYERS_V3,
-            num_heads=config.NUM_HEADS_V3,
-            ff_dim=config.FF_DIM_V3,
-            num_classes=num_classes,
-        ).to(device)
-        ws = config.WINDOW_SIZE_V3
-        stride = config.STRIDE_V3
-    else:
-        model = HWMv2(
-            img_height=saved_config.get("img_height", config.IMG_HEIGHT_V2),
-            window_size=saved_config.get("window_size", config.WINDOW_SIZE),
-            embedding_dim=saved_config.get("embedding_dim", config.EMBEDDING_DIM_V2),
-            num_layers=config.NUM_LAYERS,
-            num_heads=config.NUM_HEADS,
-            ff_dim=saved_config.get("ff_dim", config.FF_DIM_V2),
-            num_classes=num_classes,
-        ).to(device)
-        ws = config.WINDOW_SIZE
-        stride = config.STRIDE
+    spec = get_spec(ver)
+    # The builder consumes a train-style Namespace; we synthesise the
+    # argparse defaults since training-time knobs (lambdas, SSL flags) do
+    # not affect ``forward()`` — only the architecture matters for the
+    # state-dict load below.
+    model = spec.builder(default_train_args(), num_classes).to(device)
 
     result = model.load_state_dict(ckpt["model_state_dict"], strict=False)
     if result.missing_keys:
@@ -267,7 +225,7 @@ if __name__ == "__main__":
     model.eval()
     print(f"Model {ver}: {model.count_parameters():,} params")
 
-    img_h = saved_config.get("img_height", config.IMG_HEIGHT_V5 if ver == "v5" else config.IMG_HEIGHT_V4)
+    img_h = saved_config.get("img_height", spec.img_height)
     dataset = AltoLineDataset(args.alto_dirs, img_height=img_h)
 
     # Same split as train.py (seed=42, 80/20)
@@ -285,10 +243,15 @@ if __name__ == "__main__":
         eval_ds = dataset
         print(f"Evaluating on all data: {len(eval_ds)} lines")
 
-    if ver == "v5":
+    if spec.collate_style == "v5":
         collate = partial(collate_alto_v5_fn, char_to_idx=char_to_idx)
     else:
-        collate = partial(collate_alto_fn, window_size=ws, stride=stride, char_to_idx=char_to_idx)
+        collate = partial(
+            collate_alto_fn,
+            window_size=spec.window_size,
+            stride=spec.stride,
+            char_to_idx=char_to_idx,
+        )
     loader = DataLoader(
         eval_ds,
         batch_size=args.batch_size,

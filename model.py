@@ -32,6 +32,7 @@ from loss import (
 )
 from ctc_head import CTCHead, CTCHeadBiLSTM
 from jepa import sample_jepa_mask, sample_2d_block_mask
+from loss_bundle import make_v12_bundle
 import config
 
 
@@ -162,7 +163,10 @@ class HWMv16(nn.Module):
         self.ctc_head = CTCHead(lstm_hidden * 2, num_classes)
 
         # --- Loss ---
-        self.criterion = V12Loss(
+        # Composable bundle (see loss_bundle.py). Bit-for-bit equivalent
+        # to the historical V12Loss aggregator but adding a new term means
+        # registering a single LossTerm rather than editing the aggregator.
+        self.criterion = make_v12_bundle(
             lambda_ctc=lambda_ctc,
             lambda_jepa=lambda_jepa,
             lambda_sigreg=lambda_sigreg,
