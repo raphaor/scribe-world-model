@@ -722,8 +722,9 @@ if __name__ == "__main__":
             "v13",
             "v14",
             "v15",
+            "v16",
         ):
-            if ver in ("v12", "v13", "v14", "v15"):
+            if ver in ("v12", "v13", "v14", "v15", "v16"):
                 img_h = config.IMG_HEIGHT_V12
             elif ver == "v11":
                 img_h = config.IMG_HEIGHT_V11
@@ -783,6 +784,7 @@ if __name__ == "__main__":
             "v13",
             "v14",
             "v15",
+            "v16",
         ):
             collate = partial(collate_alto_v5_fn, char_to_idx=char_to_idx)
         else:
@@ -795,7 +797,7 @@ if __name__ == "__main__":
         # v2-v4 pre-extract fixed-size frame columns — plain batching.
         use_bucketing = (
             ver
-            in ("v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15")
+            in ("v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16")
             and not args.no_bucket
         )
 
@@ -848,6 +850,7 @@ if __name__ == "__main__":
                 "v13",
                 "v14",
                 "v15",
+                "v16",
             ):
                 adapt_collate = collate_unannotated_v5_fn
             else:

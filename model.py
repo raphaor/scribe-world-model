@@ -237,9 +237,9 @@ class HWMv16(nn.Module):
         )
         return img_masked, frame_mask
 
-    def forward(self, img):
+    def forward(self, img, input_lengths=None):
         """Inference: encoder → LayerNorm → BiLSTM → CTC."""
-        z_seq = self.encoder(img)
+        z_seq = self.encoder(img, input_lengths)
         z_seq = self._bilstm(self.ctc_norm(z_seq))
         ctc_logits = self.ctc_head(z_seq) if self.ctc_head is not None else None
         return None, z_seq, ctc_logits
