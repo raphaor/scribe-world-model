@@ -924,6 +924,7 @@ class HWMv18(nn.Module):
             if frame_mask.any():
                 z_cnn_m, _ = self._run_encoder(img_masked)
                 z_jepa_masked = self.cnn_to_jepa(z_cnn_m)  # (B, T, 384)
+                del z_cnn_m, img_masked
             else:
                 frame_mask = None
                 z_jepa_masked = None
