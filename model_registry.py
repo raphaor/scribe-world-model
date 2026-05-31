@@ -38,6 +38,7 @@ from model import (
     HWMv11,
     HWMv12,
     HWMv16,
+    HWMv17,
     LectaurepClone,
 )
 
@@ -617,6 +618,57 @@ def _build_v16(args, num_classes):
     )
 
 
+def _build_v17(args, num_classes):
+    # v17: retour BiLSTM + JEPA + SIGReg. Pas de Transformer.
+    if args.lambda_pred is not None and args.lambda_pred == 0:
+        lambda_jepa = 0.0
+        use_pretext = False
+    else:
+        lambda_jepa = (
+            args.lambda_pred if args.lambda_pred is not None else config.LAMBDA_JEPA_V17
+        )
+        use_pretext = lambda_jepa > 0
+    lambda_sigreg_v17 = (
+        args.lambda_sigreg
+        if args.lambda_sigreg is not None
+        else config.LAMBDA_SIGREG_V17
+    )
+    print(
+        f"v17 config: use_pretext={use_pretext} lambda_jepa={lambda_jepa} "
+        f"lambda_sigreg={lambda_sigreg_v17} lambda_ctc={config.LAMBDA_CTC_V17} "
+        f"lstm: {config.NUM_LSTM_V17}×BiLSTM({config.LSTM_HIDDEN_V17}) "
+        f"drop_mid={config.LSTM_DROPOUT_MID_V17} "
+        f"drop_last={config.LSTM_DROPOUT_LAST_V17} | "
+        f"mask: {config.JEPA_NUM_TARGETS_V17} blocks "
+        f"[{config.JEPA_MIN_SIZE_V17},{config.JEPA_MAX_SIZE_V17}] frames | "
+        f"sigreg: {config.SIGREG_PROJECTIONS_V17} proj, "
+        f"{config.SIGREG_KNOTS_V17} knots"
+    )
+    return HWMv17(
+        img_height=config.LECTAUREP_IMG_HEIGHT,  # 120, meme CNN que v15
+        num_classes=num_classes,
+        lambda_ctc=config.LAMBDA_CTC_V17,
+        lambda_jepa=lambda_jepa,
+        lambda_sigreg=lambda_sigreg_v17,
+        lambda_wc=config.LAMBDA_WC_V17,
+        lstm_hidden=config.LSTM_HIDDEN_V17,
+        num_lstm_layers=config.NUM_LSTM_V17,
+        lstm_dropout_mid=config.LSTM_DROPOUT_MID_V17,
+        lstm_dropout_last=config.LSTM_DROPOUT_LAST_V17,
+        proj_dim=config.PROJ_DIM_V17,
+        proj_hidden=config.PROJ_HIDDEN_V17,
+        jepa_num_targets=config.JEPA_NUM_TARGETS_V17,
+        jepa_min_size=config.JEPA_MIN_SIZE_V17,
+        jepa_max_size=config.JEPA_MAX_SIZE_V17,
+        sigreg_projections=config.SIGREG_PROJECTIONS_V17,
+        sigreg_knots=config.SIGREG_KNOTS_V17,
+        infonce_temp=config.INFONCE_TEMP_V17,
+        supcon_temp=config.SUPCON_TEMP_V17,
+        use_pretext=use_pretext,
+        use_writer_contrastive=config.USE_WRITER_CONTRASTIVE_V17,
+    )
+
+
 # =============================================================================
 # Registry. Insertion order = --model-version --help display order.
 # =============================================================================
@@ -724,6 +776,14 @@ REGISTRY: dict[str, ModelSpec] = {
         force_no_amp=True,
         force_encoder_lr_mult=1.0,
         builder=_build_v16,
+    ),
+    "v17": ModelSpec(
+        img_height=config.IMG_HEIGHT_V12,  # 120
+        collate_style="v5",
+        save_path="hwm_v17.pt",
+        force_no_amp=True,
+        force_encoder_lr_mult=1.0,
+        builder=_build_v17,
     ),
 }
 

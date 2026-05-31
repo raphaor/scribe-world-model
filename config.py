@@ -562,5 +562,46 @@ SIGREG_KNOTS_V16 = 17
 USE_WRITER_CONTRASTIVE_V16 = False
 
 
+# --- v17: retour BiLSTM (v15 recipe) + JEPA + SIGReg, sans Transformer ---
+# CNN → 3×BiLSTM(128) → CTC. Premier BiLSTM mange 960 directement.
+# Pas de Linear(960→256), pas de Transformer.
+# SIGReg debrayable (--lambda-sigreg 0). JEPA debrayable (--no-jepa).
+# Pas de LayerNorm avant SIGReg (LeWorldModel paper: la normalisation
+# avant SIGReg empeche la cible gaussienne de matcher la distribution).
+# ~3.7M params. Adam, cosine, no AMP, single param group.
+
+# LSTM
+LSTM_HIDDEN_V17 = 128             # BiLSTM hidden (output=256 bidir)
+NUM_LSTM_V17 = 3                  # 3 couches comme v15
+LSTM_DROPOUT_MID_V17 = 0.1        # Dropout entre couches LSTM
+LSTM_DROPOUT_LAST_V17 = 0.3       # Dropout derniere couche (modere vs v15's 0.5)
+
+# Loss weights
+LAMBDA_CTC_V17 = 1.0
+LAMBDA_JEPA_V17 = 0.5
+LAMBDA_SIGREG_V17 = 0.1           # Debrayable: --lambda-sigreg 0
+LAMBDA_WC_V17 = 0.2
+
+# JEPA
+JEPA_NUM_TARGETS_V17 = 4
+JEPA_MIN_SIZE_V17 = 8
+JEPA_MAX_SIZE_V17 = 20
+
+# Projection heads
+PROJ_DIM_V17 = 128
+PROJ_HIDDEN_V17 = 256
+
+# SIGReg
+SIGREG_PROJECTIONS_V17 = 256
+SIGREG_KNOTS_V17 = 17
+
+# InfoNCE / SupCon temperatures
+INFONCE_TEMP_V17 = 0.1
+SUPCON_TEMP_V17 = 0.1
+
+# Writer contrastive (off by default)
+USE_WRITER_CONTRASTIVE_V17 = False
+
+
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
