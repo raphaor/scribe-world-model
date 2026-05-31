@@ -484,6 +484,8 @@ class HWMv17(nn.Module):
         self.ctc_norm = nn.Identity()
 
         # --- Loss bundle (CTC + JEPA + SIGReg) ---
+        # ctc_reduction="sum" matches ketos/LectaurepClone: CTC gradient
+        # must dominate JEPA/SIGReg (mean CTC is ~80x weaker than sum).
         self.criterion = make_v12_bundle(
             lambda_ctc=lambda_ctc,
             lambda_jepa=lambda_jepa,
@@ -493,6 +495,7 @@ class HWMv17(nn.Module):
             supcon_temp=supcon_temp,
             sigreg_projections=sigreg_projections,
             sigreg_knots=sigreg_knots,
+            ctc_reduction="sum",
         )
 
         # Initialize LSTM weights (ketos-style)
