@@ -578,7 +578,7 @@ LSTM_DROPOUT_LAST_V17 = 0.3       # Dropout derniere couche (modere vs v15's 0.5
 
 # Loss weights
 LAMBDA_CTC_V17 = 1.0
-LAMBDA_JEPA_V17 = 0.5
+LAMBDA_JEPA_V17 = 0.2            # 0.5 donnait 26% du gradient a JEPA, trop. 0.2 → ~7%.
 LAMBDA_SIGREG_V17 = 0.1           # Debrayable: --lambda-sigreg 0
 LAMBDA_WC_V17 = 0.2
 

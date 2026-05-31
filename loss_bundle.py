@@ -148,7 +148,6 @@ def make_v12_bundle(
     supcon_temp: float = 0.1,
     sigreg_projections: int = 256,
     sigreg_knots: int = 17,
-    ctc_reduction: str = "mean",
 ) -> LossBundle:
     """Drop-in replacement for ``V12Loss`` as a ``LossBundle``.
 
@@ -160,17 +159,12 @@ def make_v12_bundle(
     ``SupConLoss``, ``nn.CTCLoss``) are held in module attributes via a
     private ``nn.Module`` carrier so their parameters / buffers are
     registered with the owning model.
-
-    ``ctc_reduction``: "mean" (default, preserves v12-v16 behaviour) or
-    "sum" (matches ketos/LectaurepClone, needed so CTC gradients aren't
-    dwarfed by JEPA/SIGReg).
     """
     carrier = _V12Carrier(
         infonce_temp=infonce_temp,
         supcon_temp=supcon_temp,
         sigreg_projections=sigreg_projections,
         sigreg_knots=sigreg_knots,
-        ctc_reduction=ctc_reduction,
     )
 
     def _jepa(ctx):
@@ -227,7 +221,6 @@ class _V12Carrier(nn.Module):
         supcon_temp: float,
         sigreg_projections: int,
         sigreg_knots: int,
-        ctc_reduction: str = "mean",
     ):
         super().__init__()
         self.infonce = InfoNCELoss(temperature=infonce_temp)
@@ -235,4 +228,4 @@ class _V12Carrier(nn.Module):
             num_projections=sigreg_projections, num_knots=sigreg_knots
         )
         self.supcon = SupConLoss(temperature=supcon_temp)
-        self.ctc = nn.CTCLoss(blank=0, reduction=ctc_reduction, zero_infinity=True)
+        self.ctc = nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
