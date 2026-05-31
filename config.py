@@ -603,5 +603,48 @@ SUPCON_TEMP_V17 = 0.1
 USE_WRITER_CONTRASTIVE_V17 = False
 
 
+# --- HWM-v18 ---
+# Decoupled JEPA / CTC branches: CNN partagee, JEPA via Linear(960->384)
+# sans LayerNorm, BiLSTM uniquement sur le chemin CTC. SIGReg sur la
+# sortie JEPA (z_jepa_clean), pas sur z_seq (BiLSTM).
+#
+# Motivation: v17 voyait JEPA polluer le gradient des BiLSTM et etouffer
+# CTC (CTC bloque a ~3.5 nats/char = quasi random). v18 isole les deux
+# branches au-dela du CNN partage.
+
+JEPA_DIM_V18 = 384
+
+# LSTM (identique a v17)
+LSTM_HIDDEN_V18 = 128
+NUM_LSTM_V18 = 3
+LSTM_DROPOUT_MID_V18 = 0.1
+LSTM_DROPOUT_LAST_V18 = 0.3
+
+# Loss weights — lambda_jepa garde 0.2 (le decouplage devrait suffire).
+LAMBDA_CTC_V18 = 1.0
+LAMBDA_JEPA_V18 = 0.2
+LAMBDA_SIGREG_V18 = 0.1
+LAMBDA_WC_V18 = 0.2
+
+# JEPA masking (identique a v17)
+JEPA_NUM_TARGETS_V18 = 4
+JEPA_MIN_SIZE_V18 = 8
+JEPA_MAX_SIZE_V18 = 20
+
+# Projection heads (input dim = JEPA_DIM_V18, sortie 128)
+PROJ_DIM_V18 = 128
+PROJ_HIDDEN_V18 = 256
+
+# SIGReg Epps-Pulley
+SIGREG_PROJECTIONS_V18 = 256
+SIGREG_KNOTS_V18 = 17
+
+# InfoNCE / SupCon temperatures
+INFONCE_TEMP_V18 = 0.1
+SUPCON_TEMP_V18 = 0.1
+
+USE_WRITER_CONTRASTIVE_V18 = False
+
+
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)

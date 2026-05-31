@@ -39,6 +39,7 @@ from model import (
     HWMv12,
     HWMv16,
     HWMv17,
+    HWMv18,
     LectaurepClone,
 )
 
@@ -669,6 +670,61 @@ def _build_v17(args, num_classes):
     )
 
 
+def _build_v18(args, num_classes):
+    # v18: branches CTC / JEPA decouplees apres le CNN partage.
+    # BiLSTM ne voit que CTC; JEPA passe par Linear(960->384) sans LayerNorm;
+    # SIGReg sur la sortie JEPA, pas sur z_seq.
+    if args.lambda_pred is not None and args.lambda_pred == 0:
+        lambda_jepa = 0.0
+        use_pretext = False
+    else:
+        lambda_jepa = (
+            args.lambda_pred if args.lambda_pred is not None else config.LAMBDA_JEPA_V18
+        )
+        use_pretext = lambda_jepa > 0
+    lambda_sigreg_v18 = (
+        args.lambda_sigreg
+        if args.lambda_sigreg is not None
+        else config.LAMBDA_SIGREG_V18
+    )
+    print(
+        f"v18 config: use_pretext={use_pretext} lambda_jepa={lambda_jepa} "
+        f"lambda_sigreg={lambda_sigreg_v18} lambda_ctc={config.LAMBDA_CTC_V18} "
+        f"jepa_dim={config.JEPA_DIM_V18} (Linear 960->{config.JEPA_DIM_V18}, no LN) | "
+        f"lstm: {config.NUM_LSTM_V18}×BiLSTM({config.LSTM_HIDDEN_V18}) "
+        f"drop_mid={config.LSTM_DROPOUT_MID_V18} "
+        f"drop_last={config.LSTM_DROPOUT_LAST_V18} | "
+        f"mask: {config.JEPA_NUM_TARGETS_V18} blocks "
+        f"[{config.JEPA_MIN_SIZE_V18},{config.JEPA_MAX_SIZE_V18}] frames | "
+        f"sigreg(on z_jepa): {config.SIGREG_PROJECTIONS_V18} proj, "
+        f"{config.SIGREG_KNOTS_V18} knots"
+    )
+    return HWMv18(
+        img_height=config.LECTAUREP_IMG_HEIGHT,  # 120
+        num_classes=num_classes,
+        lambda_ctc=config.LAMBDA_CTC_V18,
+        lambda_jepa=lambda_jepa,
+        lambda_sigreg=lambda_sigreg_v18,
+        lambda_wc=config.LAMBDA_WC_V18,
+        jepa_dim=config.JEPA_DIM_V18,
+        lstm_hidden=config.LSTM_HIDDEN_V18,
+        num_lstm_layers=config.NUM_LSTM_V18,
+        lstm_dropout_mid=config.LSTM_DROPOUT_MID_V18,
+        lstm_dropout_last=config.LSTM_DROPOUT_LAST_V18,
+        proj_dim=config.PROJ_DIM_V18,
+        proj_hidden=config.PROJ_HIDDEN_V18,
+        jepa_num_targets=config.JEPA_NUM_TARGETS_V18,
+        jepa_min_size=config.JEPA_MIN_SIZE_V18,
+        jepa_max_size=config.JEPA_MAX_SIZE_V18,
+        sigreg_projections=config.SIGREG_PROJECTIONS_V18,
+        sigreg_knots=config.SIGREG_KNOTS_V18,
+        infonce_temp=config.INFONCE_TEMP_V18,
+        supcon_temp=config.SUPCON_TEMP_V18,
+        use_pretext=use_pretext,
+        use_writer_contrastive=config.USE_WRITER_CONTRASTIVE_V18,
+    )
+
+
 # =============================================================================
 # Registry. Insertion order = --model-version --help display order.
 # =============================================================================
@@ -784,6 +840,14 @@ REGISTRY: dict[str, ModelSpec] = {
         force_no_amp=True,
         force_encoder_lr_mult=1.0,
         builder=_build_v17,
+    ),
+    "v18": ModelSpec(
+        img_height=config.IMG_HEIGHT_V12,  # 120
+        collate_style="v5",
+        save_path="hwm_v18.pt",
+        force_no_amp=True,
+        force_encoder_lr_mult=1.0,
+        builder=_build_v18,
     ),
 }
 
