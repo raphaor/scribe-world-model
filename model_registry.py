@@ -621,7 +621,7 @@ def _build_v16(args, num_classes):
 
 def _build_v17(args, num_classes):
     # v17: retour BiLSTM + JEPA + SIGReg. Pas de Transformer.
-    if args.lambda_pred is not None and args.lambda_pred == 0:
+    if args.no_jepa or (args.lambda_pred is not None and args.lambda_pred == 0):
         lambda_jepa = 0.0
         use_pretext = False
     else:
@@ -674,7 +674,7 @@ def _build_v18(args, num_classes):
     # v18: branches CTC / JEPA decouplees apres le CNN partage.
     # BiLSTM ne voit que CTC; JEPA passe par Linear(960->384) sans LayerNorm;
     # SIGReg sur la sortie JEPA, pas sur z_seq.
-    if args.lambda_pred is not None and args.lambda_pred == 0:
+    if args.no_jepa or (args.lambda_pred is not None and args.lambda_pred == 0):
         lambda_jepa = 0.0
         use_pretext = False
     else:
