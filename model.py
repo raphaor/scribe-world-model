@@ -756,28 +756,30 @@ class HWMv18(nn.Module):
         )
         self.cnn_out_dim = 64 * (img_height // 8)  # 960 for h=120
 
-        # Learnable scalar for pixel-space masking
-        self.mask_pixel = nn.Parameter(torch.zeros(()))
+        # --- JEPA branch (uniquement si use_pretext) ---
+        if self.use_pretext:
+            # Learnable scalar for pixel-space masking
+            self.mask_pixel = nn.Parameter(torch.zeros(()))
 
-        # --- JEPA branch: Linear(960 → jepa_dim), no LayerNorm ---
-        # SIGReg on this output is the anti-collapse regulariser; LayerNorm
-        # here would prevent SIGReg's Gaussian target from being matchable.
-        self.cnn_to_jepa = nn.Linear(self.cnn_out_dim, jepa_dim)
+            # Linear(960 → jepa_dim), no LayerNorm
+            # SIGReg on this output is the anti-collapse regulariser; LayerNorm
+            # here would prevent SIGReg's Gaussian target from being matchable.
+            self.cnn_to_jepa = nn.Linear(self.cnn_out_dim, jepa_dim)
 
-        # JEPA projection head — input dim = jepa_dim (NOT BiLSTM out).
-        self.jepa_proj = nn.Sequential(
-            nn.Linear(jepa_dim, proj_hidden),
-            nn.GELU(),
-            nn.Linear(proj_hidden, proj_dim),
-        )
+            # JEPA projection head — input dim = jepa_dim (NOT BiLSTM out).
+            self.jepa_proj = nn.Sequential(
+                nn.Linear(jepa_dim, proj_hidden),
+                nn.GELU(),
+                nn.Linear(proj_hidden, proj_dim),
+            )
 
-        # Writer contrastive head (dormant unless enabled) — sourced from
-        # BiLSTM output like v17, since that's the "recognition" feature.
-        self.style_proj = nn.Sequential(
-            nn.Linear(self.embedding_dim, proj_hidden),
-            nn.GELU(),
-            nn.Linear(proj_hidden, proj_dim),
-        )
+        # Writer contrastive head (uniquement si active)
+        if self.use_writer_contrastive:
+            self.style_proj = nn.Sequential(
+                nn.Linear(self.embedding_dim, proj_hidden),
+                nn.GELU(),
+                nn.Linear(proj_hidden, proj_dim),
+            )
 
         # --- 3×BiLSTM(128) — CTC path only ---
         self.lstm_layers = nn.ModuleList()
@@ -905,15 +907,15 @@ class HWMv18(nn.Module):
         ctc_in = input_lengths.clamp(max=T_seq) if input_lengths is not None else None
 
         # 3. JEPA branch (clean view): Linear(960 → 384) on z_cnn
-        z_jepa_clean = self.cnn_to_jepa(z_cnn)             # (B, T, 384)
-
-        # Valid mask on the CNN time axis (for SIGReg + JEPA frame_mask).
+        z_jepa_clean = None
         valid_mask_cnn = None
         cnn_lengths = None
-        if input_lengths is not None:
-            cnn_lengths = input_lengths.clamp(max=T)
-            ar = torch.arange(T, device=img.device)
-            valid_mask_cnn = ar[None, :] < cnn_lengths[:, None]
+        if self.use_pretext:
+            z_jepa_clean = self.cnn_to_jepa(z_cnn)             # (B, T, 384)
+            if input_lengths is not None:
+                cnn_lengths = input_lengths.clamp(max=T)
+                ar = torch.arange(T, device=img.device)
+                valid_mask_cnn = ar[None, :] < cnn_lengths[:, None]
 
         # 4. Masked view: CNN + Linear ONLY (skip BiLSTM)
         z_pred = z_target = None
@@ -940,13 +942,14 @@ class HWMv18(nn.Module):
         )
         with _f32:
             z_seq = z_seq.float()
-            z_jepa_clean = z_jepa_clean.float()
+            if z_jepa_clean is not None:
+                z_jepa_clean = z_jepa_clean.float()
 
             ctc_logits = None
             if self.ctc_head is not None:
                 ctc_logits = self.ctc_head(z_seq)
 
-            if z_jepa_masked is not None and frame_mask is not None:
+            if z_jepa_masked is not None and frame_mask is not None and z_jepa_clean is not None:
                 z_jepa_masked = z_jepa_masked.float()
                 z_pred = self.jepa_proj(z_jepa_masked[frame_mask])
                 z_target = self.jepa_proj(z_jepa_clean.detach()[frame_mask])
