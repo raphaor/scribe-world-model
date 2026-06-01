@@ -677,16 +677,17 @@ def _build_v18(args, num_classes):
     if args.no_jepa or (args.lambda_pred is not None and args.lambda_pred == 0):
         lambda_jepa = 0.0
         use_pretext = False
+        lambda_sigreg_v18 = 0.0
     else:
         lambda_jepa = (
             args.lambda_pred if args.lambda_pred is not None else config.LAMBDA_JEPA_V18
         )
         use_pretext = lambda_jepa > 0
-    lambda_sigreg_v18 = (
-        args.lambda_sigreg
-        if args.lambda_sigreg is not None
-        else config.LAMBDA_SIGREG_V18
-    )
+        lambda_sigreg_v18 = (
+            args.lambda_sigreg
+            if args.lambda_sigreg is not None
+            else config.LAMBDA_SIGREG_V18
+        )
     print(
         f"v18 config: use_pretext={use_pretext} lambda_jepa={lambda_jepa} "
         f"lambda_sigreg={lambda_sigreg_v18} lambda_ctc={config.LAMBDA_CTC_V18} "
