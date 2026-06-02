@@ -618,7 +618,7 @@ JEPA_DIM_V18 = 384
 LSTM_HIDDEN_V18 = 320
 NUM_LSTM_V18 = 3
 LSTM_DROPOUT_MID_V18 = 0.2
-LSTM_DROPOUT_LAST_V18 = 0.4
+LSTM_DROPOUT_LAST_V18 = 0.5
 
 # Loss weights — lambda_jepa garde 0.2 (le decouplage devrait suffire).
 LAMBDA_CTC_V18 = 1.0
