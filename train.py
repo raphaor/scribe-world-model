@@ -507,7 +507,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--no-augment",
         action="store_true",
-        help="Disable image augmentation (elastic deformations).",
+        help="Disable image augmentation (rotation, shear, h-stretch, "
+        "stroke width, blur, contrast, elastic deformation, noise).",
     )
     parser.add_argument(
         "--no-amp",

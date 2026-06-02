@@ -10,7 +10,8 @@ import unicodedata
 warnings.filterwarnings("ignore", message="divide by zero", category=RuntimeWarning)
 warnings.filterwarnings("ignore", message="invalid value", category=RuntimeWarning)
 
-from PIL import Image, ImageEnhance
+from PIL import Image, ImageEnhance, ImageFilter
+from scipy.ndimage import gaussian_filter, map_coordinates
 from kraken.lib.xml import XMLPage
 from kraken.lib.segmentation import extract_polygons
 import torch
@@ -181,15 +182,72 @@ class AltoLineDataset(Dataset):
         return img, text
 
     @staticmethod
+    def _elastic_transform(arr, alpha, sigma):
+        """Deformation elastique (Simard et al. 2003) : champ de deplacement
+        aleatoire lisse par un filtre gaussien. Simule la variabilite locale
+        du trace manuscrit. `alpha` = amplitude (px), `sigma` = lissage."""
+        h, w = arr.shape
+        dx = gaussian_filter(np.random.rand(h, w) * 2 - 1, sigma, mode="constant") * alpha
+        dy = gaussian_filter(np.random.rand(h, w) * 2 - 1, sigma, mode="constant") * alpha
+        yy, xx = np.meshgrid(np.arange(h), np.arange(w), indexing="ij")
+        coords = (np.reshape(yy + dy, (-1,)), np.reshape(xx + dx, (-1,)))
+        distorted = map_coordinates(arr, coords, order=1, mode="constant", cval=255.0)
+        return distorted.reshape(h, w)
+
+    @staticmethod
     def _augment(arr):
         img = Image.fromarray(arr.astype(np.uint8), mode="L")
+
+        # --- Geometrie ---
         if random.random() < 0.5:
             angle = random.uniform(-3, 3)
             img = img.rotate(angle, fillcolor=255, expand=False)
+
+        # Cisaillement horizontal : variation de l'inclinaison de l'ecriture.
+        if random.random() < 0.3:
+            w, h = img.size
+            shear = random.uniform(-0.25, 0.25)
+            img = img.transform(
+                (w, h),
+                Image.AFFINE,
+                (1, shear, -shear * h / 2, 0, 1, 0),
+                resample=Image.BILINEAR,
+                fillcolor=255,
+            )
+
+        # Etirement / compression horizontale : la largeur de caractere ne doit
+        # pas etre memorisee (clef pour la generalisation sur lignes longues).
+        if random.random() < 0.4:
+            w, h = img.size
+            factor = random.uniform(0.8, 1.2)
+            img = img.resize((max(1, round(w * factor)), h), resample=Image.BILINEAR)
+
+        # Epaisseur du trait (plume / encre) : MinFilter epaissit le texte
+        # sombre, MaxFilter l'affine.
+        if random.random() < 0.25:
+            img = img.filter(
+                ImageFilter.MinFilter(3)
+                if random.random() < 0.5
+                else ImageFilter.MaxFilter(3)
+            )
+
+        # Flou leger (mise au point / qualite de numerisation).
+        if random.random() < 0.2:
+            img = img.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.3, 0.8)))
+
+        # --- Photometrie ---
         if random.random() < 0.5:
             factor = random.uniform(0.85, 1.15)
             img = ImageEnhance.Contrast(img).enhance(factor)
+
         arr = np.array(img, dtype=np.float32)
+
+        # Deformation elastique : amplitude relative a la hauteur de ligne.
+        if random.random() < 0.3:
+            sigma = random.uniform(4.0, 6.0)
+            alpha = random.uniform(0.06, 0.10) * arr.shape[0]
+            arr = AltoLineDataset._elastic_transform(arr, alpha, sigma)
+
         if random.random() < 0.5:
             noise = np.random.normal(0, 0.02 * 255, arr.shape).astype(np.float32)
             arr = np.clip(arr + noise, 0, 255)

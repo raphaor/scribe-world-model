@@ -39,3 +39,5 @@ Thumbs.db
 !DEVELOPMENT_LOG.md
 !SUMMARY.md
 
+model/checkpoint_abort.ckpt
+output/lectaurep_dataset.arrow
