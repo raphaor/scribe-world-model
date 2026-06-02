@@ -170,6 +170,36 @@ class AltoLineDataset(Dataset):
         idx_to_char[0] = ""
         return char_to_idx, idx_to_char
 
+    def filter_unlearnable(self, char_to_idx, width_stride=8, min_frames_per_char=1.0):
+        """Prune samples the CTC head cannot align.
+
+        Replicates the per-batch drop already done in ``collate_alto_v5_fn``
+        (NFD normalisation + OOV filtering, then ``T = W // width_stride``),
+        but at the dataset level so the LengthBucketBatchSampler's uniform
+        batch count is real instead of silently eroded at collate time.
+
+        A sample is kept iff it has at least one encodable character and
+        ``T >= min_frames_per_char * L``. ``min_frames_per_char=1.0``
+        reproduces CTC's hard ``T >= L`` constraint exactly; values >1.0
+        additionally drop cramped-but-legal lines (a data-quality choice).
+
+        Mutates ``self.samples`` in place. Call BEFORE the train/val split so
+        both partitions are pruned. Returns ``(removed, kept)``.
+        """
+        kept = []
+        for arr, text in self.samples:
+            encoded_len = sum(
+                1 for c in unicodedata.normalize("NFD", text) if c in char_to_idx
+            )
+            if encoded_len == 0:
+                continue
+            frames = arr.shape[1] // width_stride
+            if frames >= min_frames_per_char * encoded_len:
+                kept.append((arr, text))
+        removed = len(self.samples) - len(kept)
+        self.samples = kept
+        return removed, len(kept)
+
     def __len__(self):
         return len(self.samples)
 
@@ -521,6 +551,28 @@ def line_widths(ds):
     return widths
 
 
+def line_lengths(ds):
+    """
+    Return the text length (character count) of every sample of ``ds``, in
+    dataset order — positional, mirroring :func:`line_widths`.
+
+    Unannotated samples carry no text; their length is reported as 0 so a
+    caller can detect a labelless dataset (all zeros) and skip length-aware
+    weighting.
+    """
+    if isinstance(ds, torch.utils.data.Subset):
+        base, idxs = ds.dataset, ds.indices
+    else:
+        base, idxs = ds, range(len(ds))
+    samples = base.samples
+    lengths = []
+    for i in idxs:
+        s = samples[i]
+        text = s[1] if isinstance(s, tuple) and len(s) > 1 else ""
+        lengths.append(len(text) if isinstance(text, str) else 0)
+    return lengths
+
+
 class LengthBucketBatchSampler:
     """
     Width-homogeneous, fixed-count batch sampler.
@@ -546,6 +598,15 @@ class LengthBucketBatchSampler:
     line wider than ``long_threshold_px``, so the model sees long lines
     more often per epoch.  oversample_factor=2.0 means each such batch
     appears twice (one original + one extra copy).
+
+    ``length_weight_power`` (with ``lengths``) is the complementary, finer
+    lever: each epoch draws ``n`` indices *with replacement* with
+    probability proportional to ``max(L, 1) ** power`` (L = text length in
+    characters). Because the CER is character-weighted but plain sampling
+    is per-line, this realigns the two — power=0.5 (∝ √L) is a prudent
+    middle ground, power=1.0 matches the CER distribution exactly. The
+    pool-sort-by-width step is unchanged, so width-homogeneous batching
+    (the VRAM guarantee) is preserved. power=0.0 disables it (default).
     """
 
     def __init__(
@@ -556,6 +617,8 @@ class LengthBucketBatchSampler:
         pool_factor=10,
         oversample_factor=1.0,
         long_threshold_px=800,
+        lengths=None,
+        length_weight_power=0.0,
     ):
         self.widths = [int(w) for w in widths]
         self.batch_size = batch_size
@@ -568,14 +631,31 @@ class LengthBucketBatchSampler:
             if self.oversample_factor > 1.0
             else 0
         )
+        # Per-sample length weighting (disabled unless power>0 and the
+        # dataset actually carries text — all-zero lengths => labelless
+        # adapt set => leave uniform).
+        self._sample_probs = None
+        if length_weight_power > 0.0 and lengths is not None:
+            L = np.asarray([max(int(x), 1) for x in lengths], dtype=np.float64)
+            if len(L) == len(self.widths) and L.sum() > len(L):
+                w = L**length_weight_power
+                self._sample_probs = w / w.sum()
         base_batches = self._build(shuffle=False)
         self._len = self._apply_oversample(base_batches, count_only=True)
 
     def _build(self, shuffle):
         n = len(self.widths)
-        order = list(range(n))
-        if shuffle:
-            random.shuffle(order)
+        if shuffle and self._sample_probs is not None:
+            # Length-weighted draw with replacement: longer lines get more
+            # gradient steps. Width-homogeneity is restored by the pool sort
+            # below, so peak VRAM is unchanged.
+            order = list(
+                np.random.choice(n, size=n, replace=True, p=self._sample_probs)
+            )
+        else:
+            order = list(range(n))
+            if shuffle:
+                random.shuffle(order)
         batches = []
         for ps in range(0, n, self.pool_size):
             pool = sorted(order[ps : ps + self.pool_size], key=lambda i: self.widths[i])

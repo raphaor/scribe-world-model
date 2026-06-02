@@ -190,6 +190,14 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--split", choices=["all", "val", "train"], default="val",
                         help="Which split to evaluate (default: val)")
+    parser.add_argument(
+        "--min-frames-per-char",
+        type=float,
+        default=0.0,
+        help="Must match the value used at training time: prunes the same "
+        "unlearnable lines before the split so the seeded train/val "
+        "partition stays identical. 0.0 = disabled (default).",
+    )
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -227,6 +235,15 @@ if __name__ == "__main__":
 
     img_h = saved_config.get("img_height", spec.img_height)
     dataset = AltoLineDataset(args.alto_dirs, img_height=img_h)
+
+    # Mirror train.py's pre-split pruning so the seeded partition matches.
+    if args.min_frames_per_char > 0.0:
+        removed, kept = dataset.filter_unlearnable(
+            char_to_idx,
+            width_stride=spec.cnn_width_stride,
+            min_frames_per_char=args.min_frames_per_char,
+        )
+        print(f"Filtered {removed} unlearnable lines; {kept} remain")
 
     # Same split as train.py (seed=42, 80/20)
     if args.split != "all":

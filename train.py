@@ -50,6 +50,7 @@ from data_alto import (
     collate_alto_v5_fn,
     collate_unannotated_v5_fn,
     line_widths,
+    line_lengths,
     LengthBucketBatchSampler,
 )
 
@@ -562,6 +563,24 @@ if __name__ == "__main__":
         help="Width threshold (px) for oversampling long-line batches.",
     )
     parser.add_argument(
+        "--min-frames-per-char",
+        type=float,
+        default=0.0,
+        help="If >0, prune training/val lines where T=W//cnn_stride < this * "
+        "encoded_length before the split. 1.0 = remove only CTC-impossible "
+        "lines (restores uniform batch counts the collate otherwise erodes); "
+        ">1.0 also drops cramped lines. 0.0 = disabled (default).",
+    )
+    parser.add_argument(
+        "--length-weight-power",
+        type=float,
+        default=0.0,
+        help="If >0, the bucket sampler draws lines with probability ∝ "
+        "len(text)**power, realigning per-line sampling with the "
+        "character-weighted CER. 0.5 (∝√L) is prudent, 1.0 matches CER "
+        "exactly. 0.0 = uniform (default).",
+    )
+    parser.add_argument(
         "--num-workers",
         type=int,
         default=0,
@@ -693,6 +712,21 @@ if __name__ == "__main__":
         print(f"Alphabet: {len(char_to_idx)} characters")
         num_classes = len(char_to_idx) + 1
 
+        # Prune CTC-unalignable lines before the split (opt-in). The alphabet
+        # is built from the full set first, so a char that only appears on a
+        # pruned line keeps a stable index (just unused).
+        if args.min_frames_per_char > 0.0:
+            removed, kept = dataset.filter_unlearnable(
+                char_to_idx,
+                width_stride=spec.cnn_width_stride,
+                min_frames_per_char=args.min_frames_per_char,
+            )
+            print(
+                f"Filtered {removed} unlearnable lines "
+                f"(T < {args.min_frames_per_char:g}*L, stride={spec.cnn_width_stride}); "
+                f"{kept} remain"
+            )
+
         train_size = int(0.8 * len(dataset))
         val_size = len(dataset) - train_size
         train_ds, val_ds = random_split(
@@ -737,6 +771,8 @@ if __name__ == "__main__":
                         shuffle=shuffle,
                         oversample_factor=args.oversample_factor,
                         long_threshold_px=args.long_threshold_px,
+                        lengths=line_lengths(ds),
+                        length_weight_power=args.length_weight_power,
                     ),
                     **common,
                 )

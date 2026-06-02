@@ -54,6 +54,7 @@ class ModelSpec:
     window_size: Optional[int] = None           # required when collate_style == "windowed"
     stride: Optional[int] = None
     use_bucketing: bool = True
+    cnn_width_stride: int = 8                    # CNN horizontal downsample (3x MaxPool(2)=8 for v5+); used by --min-frames-per-char
 
     # --- checkpoint ---
     save_path: str = ""
