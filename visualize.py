@@ -1,0 +1,393 @@
+"""
+Visualisation interactive des predictions HWM.
+
+Affiche pour chaque echantillon : l'image originale, le texte ground truth,
+le texte predit par le modele, et le CER individuel. Navigation page par page
+avec fleches ou boutons Prev/Next.
+
+Usage:
+    # Mode validation (split seedé, comme recognize.py)
+    python visualize.py --model hwm_v17.pt --model-version v17
+    python visualize.py --model hwm_v17.pt --model-version v17 --sort-by-cer --top-n 20
+
+    # Mode fichier : fichier .xml unique ou répertoire de .xml
+    python visualize.py --model hwm_v17.pt --model-version v17 --alto-file page.xml
+    python visualize.py --model hwm_v17.pt --model-version v17 --alto-file D:/OCR/alto_dir
+"""
+
+import sys
+import os
+import argparse
+import glob
+import random
+
+import torch
+from torch.utils.data import DataLoader, random_split, Dataset
+from functools import partial
+
+import matplotlib
+import matplotlib.pyplot as plt
+from matplotlib.widgets import Button
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import config
+from model_registry import get_spec, known_versions, default_train_args
+from data_alto import (
+    AltoLineDataset, _parse_page, build_alphabet,
+    collate_alto_fn, collate_alto_v5_fn,
+)
+from recognize import ctc_greedy_decode, levenshtein
+
+
+class _DirectDataset(Dataset):
+    """Dataset léger construit à partir de samples déjà parsés (pas de cache)."""
+
+    def __init__(self, samples, img_height):
+        self.samples = samples
+        self.img_height = img_height
+        self.augment = False
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        arr, text = self.samples[idx]
+        img = torch.from_numpy(arr.copy()) / 255.0
+        img = 1.0 - img
+        return img, text
+
+
+def _load_model(args, device):
+    """Charge le checkpoint, construit le modele, retourne (model, char_to_idx, idx_to_char, spec, saved_config)."""
+    ckpt = torch.load(args.model, map_location=device, weights_only=False)
+    saved_config = ckpt.get("config", {})
+
+    ckpt_char_to_idx = ckpt.get("char_to_idx")
+    if ckpt_char_to_idx:
+        char_to_idx = ckpt_char_to_idx
+        idx_to_char = {v: k for k, v in char_to_idx.items()}
+        print(f"Alphabet from checkpoint: {len(char_to_idx)} characters")
+    else:
+        char_to_idx, idx_to_char = build_alphabet(args.alto_dirs)
+        print(f"Alphabet from data: {len(char_to_idx)} characters")
+
+    ckpt_num_classes = saved_config.get("num_classes")
+    num_classes = ckpt_num_classes if ckpt_num_classes else len(char_to_idx) + 1
+
+    ver = args.model_version
+    spec = get_spec(ver)
+    model = spec.builder(default_train_args(), num_classes).to(device)
+
+    result = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    if result.missing_keys:
+        print(f"  Warning: missing keys: {result.missing_keys}")
+    if result.unexpected_keys:
+        print(f"  Warning: unexpected keys: {result.unexpected_keys}")
+    model.eval()
+    print(f"Model {ver}: {model.count_parameters():,} params")
+
+    return model, char_to_idx, idx_to_char, spec, saved_config
+
+
+def _build_collate(spec, char_to_idx):
+    return (
+        partial(collate_alto_v5_fn, char_to_idx=char_to_idx)
+        if spec.collate_style == "v5"
+        else partial(
+            collate_alto_fn,
+            window_size=spec.window_size,
+            stride=spec.stride,
+            char_to_idx=char_to_idx,
+        )
+    )
+
+
+def _load_val_split(args):
+    """Mode validation : meme pipeline que recognize.py (split seedé)."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model, char_to_idx, idx_to_char, spec, saved_config = _load_model(args, device)
+
+    img_h = saved_config.get("img_height", spec.img_height)
+    dataset = AltoLineDataset(args.alto_dirs, img_height=img_h)
+
+    if args.min_frames_per_char > 0.0:
+        removed, kept = dataset.filter_unlearnable(
+            char_to_idx,
+            width_stride=spec.cnn_width_stride,
+            min_frames_per_char=args.min_frames_per_char,
+        )
+        print(f"Filtered {removed} unlearnable lines; {kept} remain")
+
+    train_size = int(0.8 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_ds, val_ds = random_split(
+        dataset,
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(42),
+    )
+    eval_ds = val_ds if args.split == "val" else train_ds
+    print(f"Split: {args.split} ({len(eval_ds)} lines)")
+
+    collate = _build_collate(spec, char_to_idx)
+    return model, eval_ds, collate, idx_to_char, device, spec
+
+
+def _load_alto_file(args):
+    """Mode fichier : parse un fichier .xml ou tous les .xml d'un répertoire."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model, char_to_idx, idx_to_char, spec, saved_config = _load_model(args, device)
+
+    img_h = saved_config.get("img_height", spec.img_height)
+
+    path = args.alto_file
+    if os.path.isfile(path):
+        xml_files = [path]
+    elif os.path.isdir(path):
+        xml_files = sorted(
+            f for f in glob.glob(os.path.join(path, "*.xml"))
+            if os.path.basename(f) != "METS.xml"
+        )
+    else:
+        print(f"Error: {path} is neither a file nor a directory")
+        sys.exit(1)
+
+    all_samples = []
+    for xml_path in xml_files:
+        page_samples, _chars = _parse_page((xml_path, img_h, 4000))
+        all_samples.extend(page_samples)
+        print(f"  {os.path.basename(xml_path)}: {len(page_samples)} lines")
+
+    if not all_samples:
+        print("No lines found")
+        sys.exit(1)
+
+    dataset = _DirectDataset(all_samples, img_h)
+    print(f"Total: {len(dataset)} lines from {len(xml_files)} file(s)")
+
+    collate = _build_collate(spec, char_to_idx)
+    return model, dataset, collate, idx_to_char, device, spec
+
+
+def _predict_all(model, eval_ds, collate, idx_to_char, device, spec):
+    """Forward pass sur tout le split, retourne (images, gt, pred, cer) par echantillon.
+
+    Les images sont extraites directement du tensor du batch (apres collate),
+    ce qui garantit l'alignement 1:1 avec les predictions meme si le collate
+    a filtre des echantillons (OOV, CTC impossible).
+    """
+    loader = DataLoader(
+        eval_ds,
+        batch_size=32,
+        collate_fn=collate,
+        pin_memory=device.type == "cuda",
+    )
+    use_amp = device.type == "cuda"
+    width_stride = spec.cnn_width_stride
+
+    samples = []
+
+    with torch.no_grad():
+        for batch in loader:
+            img_seqs, targets, input_lengths, target_lengths, raw_texts = batch
+            img_seqs_dev = img_seqs.to(device, non_blocking=True)
+            input_lengths_cpu = input_lengths.clone()
+
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                _, _, ctc_logits = model(
+                    img_seqs_dev, input_lengths=input_lengths.to(device)
+                )
+
+            decoded = ctc_greedy_decode(
+                ctc_logits.cpu(), input_lengths_cpu, idx_to_char
+            )
+
+            img_seqs_cpu = img_seqs.cpu()
+            for i, (pred, gt) in enumerate(zip(decoded, raw_texts)):
+                gt_len = max(len(gt), 1)
+                cer = levenshtein(pred, gt) / gt_len
+
+                real_w = input_lengths_cpu[i].item() * width_stride
+                img_t = img_seqs_cpu[i, :, :real_w]
+                img_arr = ((1.0 - img_t) * 255).numpy().astype("uint8")
+
+                samples.append({
+                    "image": img_arr,
+                    "gt": gt,
+                    "pred": pred,
+                    "cer": cer,
+                })
+
+    torch.cuda.empty_cache()
+    return samples
+
+
+def _select_samples(samples, args):
+    """Sous-echantillonne et/ou trie les resultats selon les options CLI."""
+    n = len(samples)
+
+    if args.max_samples < n:
+        rng = random.Random(args.seed)
+        indices = sorted(rng.sample(range(n), args.max_samples))
+        samples = [samples[i] for i in indices]
+
+    if args.sort_by_cer:
+        samples.sort(key=lambda s: s["cer"], reverse=True)
+
+    if args.top_n is not None:
+        samples = samples[: args.top_n]
+
+    return samples
+
+
+_PER_PAGE = 8
+
+
+class _Viewer:
+    """Navigateur matplotlib page par page."""
+
+    def __init__(self, samples, per_page=_PER_PAGE):
+        self.samples = samples
+        self.per_page = per_page
+        self.page = 0
+        self.total_pages = max(1, -(-len(samples) // per_page))
+
+        self.fig, self.axes = plt.subplots(
+            per_page, 1, figsize=(16, per_page * 2.5)
+        )
+        if per_page == 1:
+            self.axes = [self.axes]
+        plt.subplots_adjust(bottom=0.08, top=0.93, hspace=0.9)
+
+        ax_prev = self.fig.add_axes([0.15, 0.01, 0.15, 0.04])
+        ax_next = self.fig.add_axes([0.70, 0.01, 0.15, 0.04])
+        self.btn_prev = Button(ax_prev, "\u2190 Prev")
+        self.btn_next = Button(ax_next, "Next \u2192")
+        self.btn_prev.on_clicked(self._prev)
+        self.btn_next.on_clicked(self._next)
+
+        self.fig.canvas.mpl_connect("key_press_event", self._on_key)
+
+        self._draw()
+
+    def _draw(self):
+        start = self.page * self.per_page
+        page_samples = self.samples[start : start + self.per_page]
+
+        mean_cer = sum(s["cer"] for s in page_samples) / max(len(page_samples), 1)
+        title = (
+            f"Page {self.page + 1}/{self.total_pages}  |  "
+            f"Samples {start + 1}\u2013{min(start + self.per_page, len(self.samples))}"
+            f"/{len(self.samples)}  |  "
+            f"Page CER: {mean_cer:.1%}"
+        )
+        self.fig.suptitle(title, fontsize=13, fontweight="bold")
+
+        for i, ax in enumerate(self.axes):
+            ax.clear()
+            if i < len(page_samples):
+                s = page_samples[i]
+                img = s["image"]
+                ax.imshow(img, cmap="gray", aspect="equal", vmin=0, vmax=255,
+                          interpolation="nearest")
+
+                ok = s["cer"] == 0.0
+                color_gt = "#2e7d32" if ok else "#c62828"
+                color_pred = "#2e7d32" if ok else "#e65100"
+
+                ax.text(0, -0.02, f"GT:   {s['gt']}", transform=ax.transAxes,
+                        fontsize=10, color=color_gt, fontfamily="monospace",
+                        va="top", ha="left", clip_on=False)
+                ax.text(0, -0.28, f"PRED: {s['pred']}   (CER {s['cer']:.1%})",
+                        transform=ax.transAxes,
+                        fontsize=10, color=color_pred, fontfamily="monospace",
+                        va="top", ha="left", clip_on=False)
+                ax.set_xticks([])
+                ax.set_yticks([])
+                for spine in ax.spines.values():
+                    spine.set_visible(False)
+            else:
+                ax.axis("off")
+
+        self.fig.canvas.draw_idle()
+
+    def _prev(self, _event=None):
+        if self.page > 0:
+            self.page -= 1
+            self._draw()
+
+    def _next(self, _event=None):
+        if self.page < self.total_pages - 1:
+            self.page += 1
+            self._draw()
+
+    def _on_key(self, event):
+        if event.key in ("right", "n"):
+            self._next()
+        elif event.key in ("left", "p"):
+            self._prev()
+
+    def show(self):
+        plt.show()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Visualisation interactive des predictions HWM"
+    )
+    parser.add_argument("--model", default="hwm_v17.pt", help="Model checkpoint")
+    parser.add_argument("--model-version", choices=known_versions(), default="v17")
+    parser.add_argument(
+        "--alto-dirs", nargs="+", default=config.ALTO_DIRS,
+        help="Repertoires ALTO (mode validation, avec split)",
+    )
+    parser.add_argument(
+        "--alto-file", default=None,
+        help="Fichier .xml ALTO unique ou répertoire de .xml "
+             "(pas de split, toutes les lignes sont affichees)",
+    )
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument(
+        "--split", choices=["val", "train"], default="val",
+        help="Split a evaluer en mode validation (default: val)",
+    )
+    parser.add_argument(
+        "--max-samples", type=int, default=50,
+        help="Nombre d'echantillons a afficher (default: 50)",
+    )
+    parser.add_argument(
+        "--sort-by-cer", action="store_true",
+        help="Trier par CER descendant (pires cas d'abord)",
+    )
+    parser.add_argument(
+        "--top-n", type=int, default=None,
+        help="Avec --sort-by-cer, n'afficher que les N pires",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Seed pour le sous-echantillonnage (default: 42)",
+    )
+    parser.add_argument(
+        "--min-frames-per-char", type=float, default=0.0,
+        help="Doit correspondre a la valeur utilisee a l'entrainement (default: 0.0)",
+    )
+    args = parser.parse_args()
+
+    if args.alto_file:
+        model, eval_ds, collate, idx_to_char, device, spec = _load_alto_file(args)
+        args.max_samples = len(eval_ds)
+    else:
+        model, eval_ds, collate, idx_to_char, device, spec = _load_val_split(args)
+
+    print("Running predictions...")
+    samples = _predict_all(model, eval_ds, collate, idx_to_char, device, spec)
+    print(f"Collected {len(samples)} predictions")
+
+    samples = _select_samples(samples, args)
+    print(f"Displaying {len(samples)} samples ({'sorted by CER' if args.sort_by_cer else 'random order'})")
+
+    overall_cer = sum(s["cer"] for s in samples) / max(len(samples), 1)
+    print(f"Subset CER: {overall_cer:.1%}")
+
+    viewer = _Viewer(samples)
+    viewer.show()
