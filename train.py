@@ -729,17 +729,32 @@ if __name__ == "__main__":
         dataset = AltoLineDataset(
             args.alto_dirs, img_height=img_h, augment=not args.no_augment
         )
-        # Checkpoint alphabet wins over dataset alphabet (consistent with
-        # recognize.py). Characters in the new data that are absent from the
-        # checkpoint alphabet will be silently dropped by the collate (with
-        # a warning) — expected behavior for transfer learning.
+        # Build the dataset alphabet to discover new characters.
+        ds_char_to_idx, _ = dataset.get_alphabet()
         if ckpt_char_to_idx:
-            char_to_idx = ckpt_char_to_idx
+            # Merge: preserve checkpoint char→idx mappings (so pretrained CTC
+            # head weights stay valid), append new characters from the dataset
+            # at the end of the index range.
+            new_chars = sorted(set(ds_char_to_idx) - set(ckpt_char_to_idx))
+            char_to_idx = dict(ckpt_char_to_idx)
+            if new_chars:
+                next_idx = max(char_to_idx.values()) + 1
+                for c in new_chars:
+                    char_to_idx[c] = next_idx
+                    next_idx += 1
+                print(
+                    f"Checkpoint alphabet extended: {len(ckpt_char_to_idx)} "
+                    f"+ {len(new_chars)} new = {len(char_to_idx)} chars"
+                )
+                print(f"  New characters: {repr(''.join(new_chars[:50]))}")
+            else:
+                print(f"Checkpoint alphabet: {len(char_to_idx)} characters")
             idx_to_char = {v: k for k, v in char_to_idx.items()}
         else:
-            char_to_idx, idx_to_char = dataset.get_alphabet()
+            char_to_idx = ds_char_to_idx
+            idx_to_char = {v: k for k, v in char_to_idx.items()}
             print(f"Alphabet from data: {len(char_to_idx)} characters")
-        num_classes = ckpt_ctc_classes if ckpt_ctc_classes else len(char_to_idx) + 1
+        num_classes = len(char_to_idx) + 1  # +1 for CTC blank at index 0
 
         # Prune CTC-unalignable lines before the split (opt-in). The alphabet
         # is built from the full set first, so a char that only appears on a
@@ -843,10 +858,8 @@ if __name__ == "__main__":
     # ckpt and ckpt_ctc_classes already loaded early (before dataset).
 
     # Preserve CTC head from checkpoint even in adapt mode
-    if need_ctc:
+    if need_ctc or ckpt is not None:
         model_num_classes = num_classes
-    elif ckpt_ctc_classes:
-        model_num_classes = ckpt_ctc_classes
     else:
         model_num_classes = None
 
@@ -890,6 +903,31 @@ if __name__ == "__main__":
         if new_keys:
             print(f"  Warning: new layers not in checkpoint: {new_keys}")
         model.load_state_dict(filtered, strict=False)
+
+        # Expand CTC head if the alphabet was extended beyond the checkpoint.
+        # The proj weight/bias have shape (num_classes, D) / (num_classes,).
+        # Old rows are copied from the checkpoint; new rows are Xavier-init.
+        if ckpt_ctc_classes is not None and num_classes > ckpt_ctc_classes:
+            ckpt_state = ckpt["model_state_dict"]
+            ckpt_w = ckpt_state.get("ctc_head.proj.weight")
+            ckpt_b = ckpt_state.get("ctc_head.proj.bias")
+            if ckpt_w is not None and ckpt_b is not None:
+                old_n = ckpt_w.shape[0]
+                with torch.no_grad():
+                    model.ctc_head.proj.weight.data[:old_n] = ckpt_w
+                    model.ctc_head.proj.bias.data[:old_n] = ckpt_b
+                    # New output neurons: Xavier for reasonable starting logits,
+                    # zero bias so new classes start uninformative.
+                    torch.nn.init.xavier_uniform_(
+                        model.ctc_head.proj.weight.data[old_n:]
+                    )
+                    torch.nn.init.zeros_(model.ctc_head.proj.bias.data[old_n:])
+                print(
+                    f"  Expanded CTC head: {old_n} → {num_classes} classes "
+                    f"(pretrained weights preserved, "
+                    f"{num_classes - old_n} new rows Xavier-init)"
+                )
+
         start_epoch = ckpt.get("epoch", 0) + 1
 
         # Restore optimizer/scheduler only if model architecture matches exactly
