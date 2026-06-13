@@ -7,7 +7,10 @@ la pr\u00e9diction du mod\u00e8le comme texte \u00e0 valider/\u00e9diter.
 
 Mode review : affiche les lignes AVEC ground truth existante pour correction.
 
-Les lignes valid\u00e9es/\u00e9dit\u00e9es sont \u00e9crites dans un nouveau fichier *_gt.xml.
+Les *_gt.xml sont la source de v\u00e9rit\u00e9 : ils sont charg\u00e9s automatiquement
+si pr\u00e9sents. Aucun flag n\'est n\u00e9cessaire pour reprendre une session.
+\u00c0 la sauvegarde, un *_gt.xml est cr\u00e9\u00e9 pour chaque fichier source,
+contenant la GT initiale + les ajustements de la session.
 
 Usage:
     python annotate.py --model hwm_v17.pt --model-version v17 \\
@@ -120,15 +123,40 @@ def save_progress(progress_path, accepted, last_page):
 
 # ─── \u00c9criture XML ───────────────────────────────────────────────────────
 
+def _read_gt_texts(gt_path):
+    """Lit {line_id: text} depuis un fichier *_gt.xml.
+
+    Retourne un dict vide si le fichier n'existe pas.
+    """
+    if not os.path.exists(gt_path):
+        return {}
+    tree = etree.parse(gt_path)
+    texts = {}
+    for tl in tree.iter():
+        if not isinstance(tl.tag, str):
+            continue
+        if tl.tag.split('}')[-1] != 'TextLine':
+            continue
+        line_id = tl.get('ID')
+        for child in tl:
+            if not isinstance(child.tag, str):
+                continue
+            if child.tag.split('}')[-1] == 'String':
+                texts[line_id] = child.get('CONTENT', '')
+                break
+    return texts
+
+
 def write_gt_xml(samples, accepted, xml_files):
-    """\u00c9crit les textes accept\u00e9s dans des fichiers *_gt.xml.
+    """\u00c9crit un *_gt.xml complet pour chaque fichier source.
 
-    R\u00e9g\u00e9n\u00e8re chaque fichier *_gt.xml depuis l'original, en n'\u00e9crivant
-    que les lignes actuellement accept\u00e9es. Les lignes non accept\u00e9es
-    (d\u00e9coch\u00e9es ou jamais coch\u00e9es) reviennent \u00e0 leur \u00e9tat original.
+    Chaque *_gt.xml est construit depuis le *_gt.xml existant s'il est
+    pr\u00e9sent (pr\u00e9serve le travail des sessions pr\u00e9c\u00e9dentes), sinon depuis
+    l'original. Seules les lignes accept\u00e9es (modifi\u00e9es) sont mises \u00e0 jour ;
+    les autres conservent leur texte source (GT pr\u00e9c\u00e9dent ou original).
 
-    Si aucune ligne n'est accept\u00e9e pour un fichier, son *_gt.xml est
-    supprim\u00e9 s'il existait (\u00e9vite les donn\u00e9es obsol\u00e8tes).
+    Tous les fichiers de xml_files re\u00e7oivent un *_gt.xml, m\u00eame ceux
+    sans aucune ligne accept\u00e9e, pour garantir un jeu coh\u00e9rent.
     """
     by_file = {}
     for idx, text in accepted.items():
@@ -139,15 +167,14 @@ def write_gt_xml(samples, accepted, xml_files):
 
     for xml_path in xml_files:
         output_path = _derive_output_path(xml_path)
+        original_path = _derive_original_path(xml_path)
         line_texts = by_file.get(xml_path, {})
 
-        if not line_texts:
-            if os.path.exists(output_path):
-                os.remove(output_path)
-                print(f"  {os.path.basename(output_path)}: supprim\u00e9 (aucune ligne accept\u00e9e)")
-            continue
+        # Source : _gt.xml existant (préserve les sessions précédentes),
+        # sinon l'original.
+        source_path = output_path if os.path.exists(output_path) else original_path
 
-        tree = etree.parse(_derive_original_path(xml_path))
+        tree = etree.parse(source_path)
         root = tree.getroot()
 
         modified = 0
@@ -491,9 +518,6 @@ def main():
     parser.add_argument("--lm-weight", type=float, default=0.3)
     parser.add_argument("--workers", type=int, default=0,
                         help="Worker processes pour le beam search (0=séquentiel)")
-    parser.add_argument("--from-gt", action="store_true",
-                        help="Charger uniquement les fichiers *_gt.xml deja generes "
-                             "(pour revoir/corriger la GT existante)")
     args = parser.parse_args()
 
     args.alto_dirs = config.ALTO_DIRS
@@ -511,17 +535,14 @@ def main():
 
     path = args.alto
     if os.path.isfile(path):
-        xml_files = [path]
+        xml_files = [_derive_original_path(path)]
     elif os.path.isdir(path):
-        from_gt = getattr(args, "from_gt", False)
         all_xmls = sorted(
             f for f in glob.glob(os.path.join(path, "*.xml"))
             if os.path.basename(f) != "METS.xml"
         )
-        if from_gt:
-            xml_files = [f for f in all_xmls if os.path.splitext(f)[0].endswith("_gt")]
-        else:
-            xml_files = [f for f in all_xmls if not os.path.splitext(f)[0].endswith("_gt")]
+        xml_files = [f for f in all_xmls
+                     if not os.path.splitext(f)[0].endswith("_gt")]
     else:
         print(f"Error: {path} is neither a file nor a directory")
         sys.exit(1)
@@ -531,9 +552,24 @@ def main():
     for xml_path in xml_files:
         samples, _chars, metas = _parse_page(
             (xml_path, img_h, 4000, True), return_meta=True)
+
+        gt_path = _derive_output_path(xml_path)
+        if os.path.exists(gt_path):
+            gt_texts = _read_gt_texts(gt_path)
+            n_gt = 0
+            for i, meta in enumerate(metas):
+                lid = meta["line_id"]
+                if lid in gt_texts:
+                    arr, _ = samples[i]
+                    samples[i] = (arr, gt_texts[lid])
+                    n_gt += 1
+            print(f"  {os.path.basename(xml_path)}: {len(samples)} lignes "
+                  f"({n_gt} depuis GT existant)")
+        else:
+            print(f"  {os.path.basename(xml_path)}: {len(samples)} lignes")
+
         all_samples.extend(samples)
         all_metas.extend(metas)
-        print(f"  {os.path.basename(xml_path)}: {len(samples)} lignes")
 
     if not all_samples:
         print("Aucune ligne trouv\u00e9e")
