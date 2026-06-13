@@ -155,6 +155,7 @@ def ctc_beam_search_decode(
     prune_topk=15,
     blank_id=0,
     is_log_probs=True,
+    num_workers=0,
 ):
     """
     CTC prefix beam search with optional character n-gram LM.
@@ -169,6 +170,8 @@ def ctc_beam_search_decode(
         prune_topk: only consider the top-k characters per frame.
         blank_id: CTC blank index (default 0).
         is_log_probs: if True, *logits* are already log-softmax'd.
+        num_workers: if > 0, use that many processes (multiprocessing).
+                     0 = sequential (default).
 
     Returns:
         list[str], one decoded string per batch element.
@@ -185,14 +188,78 @@ def ctc_beam_search_decode(
     n_chars = log_probs_np.shape[-1]
     chars = [idx_to_char.get(i, "") for i in range(n_chars)]
 
+    n_samples = log_probs_np.shape[0]
+
+    # --- Multiprocessing path ---
+    if num_workers > 1 and n_samples >= 4:
+        return _decode_parallel(
+            log_probs_np, lengths, chars, lm,
+            beam_width, lm_weight, prune_topk, blank_id, num_workers,
+        )
+
+    # --- Sequential path ---
     results = []
-    for b in range(log_probs_np.shape[0]):
+    for b in range(n_samples):
         L = int(lengths[b])
         seq = log_probs_np[b, :L, :]
         text = _beam_search_single(
             seq, chars, lm, beam_width, lm_weight, prune_topk, blank_id
         )
         results.append(text)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Multiprocessing workers (module-level for Windows 'spawn')
+# ---------------------------------------------------------------------------
+
+# Globals set by _init_worker — one LM copy per process, not per task.
+_w_lm = None
+_w_chars = None
+_w_params = None
+
+
+def _init_worker(lm, chars, beam_width, lm_weight, prune_topk, blank_id):
+    global _w_lm, _w_chars, _w_params
+    _w_lm = lm
+    _w_chars = chars
+    _w_params = (beam_width, lm_weight, prune_topk, blank_id)
+
+
+def _worker_single(args):
+    """Decode one sample — runs in a worker process."""
+    seq, length = args
+    bw, lmw, ptk, bid = _w_params
+    return _beam_search_single(
+        seq[:length], _w_chars, _w_lm, bw, lmw, ptk, bid
+    )
+
+
+def _decode_parallel(
+    log_probs_np, lengths, chars, lm,
+    beam_width, lm_weight, prune_topk, blank_id, num_workers,
+):
+    """Run beam search across samples using a process pool."""
+    import multiprocessing as mp
+
+    n_samples = log_probs_np.shape[0]
+    n_procs = min(num_workers, n_samples)
+
+    # Pack args: each worker gets (seq_array, length)
+    tasks = [
+        (log_probs_np[b], int(lengths[b]))
+        for b in range(n_samples)
+    ]
+
+    chunksize = max(1, n_samples // (n_procs * 4))
+
+    with mp.Pool(
+        n_procs,
+        initializer=_init_worker,
+        initargs=(lm, chars, beam_width, lm_weight, prune_topk, blank_id),
+    ) as pool:
+        results = pool.map(_worker_single, tasks, chunksize=chunksize)
 
     return results
 

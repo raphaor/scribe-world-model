@@ -206,6 +206,7 @@ def evaluate_cer(
     model, loader, device, idx_to_char,
     max_samples=None, verbose=True,
     use_beam=False, lm=None, beam_width=20, lm_weight=0.3,
+    num_workers=0,
 ):
     """
     Run CTC evaluation on a DataLoader.
@@ -240,35 +241,67 @@ def evaluate_cer(
 
     all_preds = []
     all_gts = []
-    num_batches = len(eval_loader)
-    with torch.no_grad():
-        for bi, batch in enumerate(eval_loader):
-            img_seqs, targets, input_lengths, target_lengths, raw_texts = batch
-            img_seqs = img_seqs.to(device, non_blocking=True)
-            input_lengths_cpu = input_lengths.clone()
 
-            with torch.amp.autocast("cuda", enabled=use_amp):
-                _, z_seq, ctc_logits = model(
-                    img_seqs, input_lengths=input_lengths.to(device)
-                )
+    # When using multiprocessing beam search, collect all logits first,
+    # then decode in one pool call (avoids recreating Pool per batch).
+    if use_beam and num_workers > 1:
+        all_logits = []
+        all_lengths = []
+        all_raw_texts = []
+        with torch.no_grad():
+            for bi, batch in enumerate(loader if max_samples is None else eval_loader):
+                img_seqs, targets, input_lengths, target_lengths, raw_texts = batch
+                img_seqs = img_seqs.to(device, non_blocking=True)
+                with torch.amp.autocast("cuda", enabled=use_amp):
+                    _, _, ctc_logits = model(
+                        img_seqs, input_lengths=input_lengths.to(device)
+                    )
+                all_logits.append(ctc_logits.cpu())
+                all_lengths.append(input_lengths.clone())
+                all_raw_texts.extend(raw_texts)
 
-            if use_beam:
-                decoded = ctc_beam_search_decode(
-                    ctc_logits.cpu(),
-                    input_lengths_cpu,
-                    idx_to_char,
-                    lm=lm,
-                    beam_width=beam_width,
-                    lm_weight=lm_weight,
-                )
-                if num_batches > 5 and (bi % 5 == 0 or bi == num_batches - 1):
-                    print(f"  beam: batch {bi+1}/{num_batches}", flush=True)
-            else:
-                decoded = ctc_greedy_decode(
-                    ctc_logits.cpu(), input_lengths_cpu, idx_to_char
-                )
-            all_preds.extend(decoded)
-            all_gts.extend(raw_texts)
+        import torch as _torch
+        all_logits_cat = _torch.cat(all_logits, dim=0)
+        all_lengths_cat = _torch.cat(all_lengths, dim=0)
+
+        decoded = ctc_beam_search_decode(
+            all_logits_cat, all_lengths_cat, idx_to_char,
+            lm=lm, beam_width=beam_width, lm_weight=lm_weight,
+            num_workers=num_workers,
+        )
+        all_preds = decoded
+        all_gts = all_raw_texts
+
+    else:
+        num_batches = len(eval_loader)
+        with torch.no_grad():
+            for bi, batch in enumerate(eval_loader):
+                img_seqs, targets, input_lengths, target_lengths, raw_texts = batch
+                img_seqs = img_seqs.to(device, non_blocking=True)
+                input_lengths_cpu = input_lengths.clone()
+
+                with torch.amp.autocast("cuda", enabled=use_amp):
+                    _, z_seq, ctc_logits = model(
+                        img_seqs, input_lengths=input_lengths.to(device)
+                    )
+
+                if use_beam:
+                    decoded = ctc_beam_search_decode(
+                        ctc_logits.cpu(),
+                        input_lengths_cpu,
+                        idx_to_char,
+                        lm=lm,
+                        beam_width=beam_width,
+                        lm_weight=lm_weight,
+                    )
+                    if num_batches > 5 and (bi % 5 == 0 or bi == num_batches - 1):
+                        print(f"  beam: batch {bi+1}/{num_batches}", flush=True)
+                else:
+                    decoded = ctc_greedy_decode(
+                        ctc_logits.cpu(), input_lengths_cpu, idx_to_char
+                    )
+                all_preds.extend(decoded)
+                all_gts.extend(raw_texts)
 
     cer = compute_cer(all_preds, all_gts)
 
@@ -332,6 +365,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--compare", action="store_true",
         help="Run both greedy AND beam search, print both CERs for comparison.",
+    )
+    parser.add_argument(
+        "--workers", type=int, default=0,
+        help="Number of worker processes for beam search (0=sequential). "
+        "Set to CPU core count for max speed.",
     )
     args = parser.parse_args()
 
@@ -436,6 +474,7 @@ if __name__ == "__main__":
             max_samples=args.max_samples,
             use_beam=True, lm=lm,
             beam_width=args.beam_width, lm_weight=args.lm_weight,
+            num_workers=args.workers,
         )
         delta = cer_greedy - cer_beam
         pct = (delta / cer_greedy * 100) if cer_greedy > 0 else 0
@@ -450,6 +489,7 @@ if __name__ == "__main__":
             max_samples=args.max_samples,
             use_beam=True, lm=lm,
             beam_width=args.beam_width, lm_weight=args.lm_weight,
+            num_workers=args.workers,
         )
         print(f"\nCER: {cer:.1%}")
     else:
