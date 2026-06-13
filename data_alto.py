@@ -104,7 +104,8 @@ def _cache_key(alto_dirs, img_height, max_width):
 
 class AltoLineDataset(Dataset):
     def __init__(
-        self, alto_dirs, img_height=48, max_width=2000, augment=False, max_workers=4
+        self, alto_dirs, img_height=48, max_width=2000, augment=False,
+        max_workers=4, keep_empty=False
     ):
         self.samples = []
         self.img_height = img_height
@@ -115,7 +116,7 @@ class AltoLineDataset(Dataset):
         key = _cache_key(alto_dirs, img_height, max_width)
         cache_path = os.path.join(CACHE_DIR, f"dataset_{key}.pkl")
 
-        if os.path.exists(cache_path):
+        if not keep_empty and os.path.exists(cache_path):
             print(f"Loading cached dataset from {cache_path} ...")
             with open(cache_path, "rb") as f:
                 cached = pickle.load(f)
@@ -138,6 +139,7 @@ class AltoLineDataset(Dataset):
         # directly would make the list order — and hence the seeded
         # random_split train/val partition — depend on thread timing.
         # Index the results to keep the split a pure function of the data.
+        tasks = [(xml_path, img_height, max_width, keep_empty) for xml_path in xml_files]
         results = [None] * len(tasks)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(_parse_page, t): i for i, t in enumerate(tasks)}
@@ -154,9 +156,10 @@ class AltoLineDataset(Dataset):
         sys.stdout.write("\n")
         print(f"Loaded {len(self.samples)} lines from {len(alto_dirs)} dirs")
 
-        with open(cache_path, "wb") as f:
-            pickle.dump({"samples": self.samples, "chars": self.chars}, f)
-        print(f"Cache saved to {cache_path}")
+        if not keep_empty:
+            with open(cache_path, "wb") as f:
+                pickle.dump({"samples": self.samples, "chars": self.chars}, f)
+            print(f"Cache saved to {cache_path}")
 
     def get_alphabet(self):
         # NFD normalisation (matches ketos): decompose combined characters

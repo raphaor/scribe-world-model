@@ -132,8 +132,49 @@ def _load_val_split(args):
     model, char_to_idx, idx_to_char, spec, saved_config = _load_model(args, device)
 
     img_h = saved_config.get("img_height", spec.img_height)
-    dataset = AltoLineDataset(args.alto_dirs, img_height=img_h)
+    no_gt = getattr(args, "no_gt", False)
+    dataset = AltoLineDataset(
+        args.alto_dirs, img_height=img_h, keep_empty=no_gt)
 
+    if no_gt:
+        # Séparer GT et no-GT, splitter les GT comme train.py, garder toutes les no-GT
+        gt_samples = [(a, t) for a, t in dataset.samples if t and t.strip()]
+        no_gt_samples = [(a, t) for a, t in dataset.samples
+                         if not t or not t.strip()]
+
+        # filter_unlearnable sur GT seulement
+        if args.min_frames_per_char > 0.0 and gt_samples:
+            gt_ds = _DirectDataset(gt_samples, img_h)
+            removed, kept = gt_ds.filter_unlearnable(
+                char_to_idx, width_stride=spec.cnn_width_stride,
+                min_frames_per_char=args.min_frames_per_char)
+            gt_samples = gt_ds.samples
+            print(f"Filtered {removed} unlearnable GT lines; {kept} GT remain")
+
+        n_gt = len(gt_samples)
+        if n_gt > 0:
+            train_size = int(0.8 * n_gt)
+            val_size = n_gt - train_size
+            _train_split, val_split = random_split(
+                range(n_gt), [train_size, val_size],
+                generator=torch.Generator().manual_seed(42),
+            )
+            if args.split == "val":
+                shown = [gt_samples[i] for i in val_split.indices] + no_gt_samples
+            else:
+                shown = gt_samples + no_gt_samples
+        else:
+            shown = no_gt_samples
+
+        eval_ds = _DirectDataset(shown, img_h)
+        n_val_gt = (len(val_split.indices) if (n_gt > 0 and args.split == "val")
+                    else n_gt)
+        print(f"  --no-gt: {len(no_gt_samples)} unannotated + "
+              f"{n_val_gt} {args.split} GT = {len(shown)} shown")
+        collate = _collate_no_gt_fn
+        return model, eval_ds, collate, idx_to_char, device, spec
+
+    # Chemin normal (avec GT)
     if args.min_frames_per_char > 0.0:
         removed, kept = dataset.filter_unlearnable(
             char_to_idx,
