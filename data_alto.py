@@ -31,7 +31,11 @@ CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache_alt
 
 
 def _parse_page(args):
-    xml_path, img_height, max_width = args
+    if len(args) == 4:
+        xml_path, img_height, max_width, keep_empty = args
+    else:
+        xml_path, img_height, max_width = args
+        keep_empty = False
     jpg_path = xml_path.replace(".xml", ".jpg")
     if not os.path.exists(jpg_path):
         return [], set()
@@ -61,7 +65,9 @@ def _parse_page(args):
         except (ValueError, RuntimeError):
             continue
         if not text or not text.strip():
-            continue
+            if not keep_empty:
+                continue
+            text = ""
 
         w, h = line_img.size
         if w == 0 or h == 0:

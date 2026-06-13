@@ -139,6 +139,29 @@ def _load_val_split(args):
     return model, eval_ds, collate, idx_to_char, device, spec
 
 
+def _collate_no_gt_fn(batch):
+    """Collate pour mode sans GT : pad images, targets factices vides.
+    Retourne le meme 5-tuple que collate_alto_v5_fn pour compatibilité."""
+    imgs = []
+    input_lengths = []
+    for img, text in batch:
+        imgs.append(img)
+        input_lengths.append(img.shape[1] // 8)
+
+    B = len(imgs)
+    H = imgs[0].shape[0]
+    W_max = max(img.shape[1] for img in imgs)
+
+    padded = torch.zeros(B, H, W_max)
+    for i, img in enumerate(imgs):
+        padded[i, :, :img.shape[1]] = img
+
+    input_lengths = torch.tensor(input_lengths, dtype=torch.long)
+    raw_texts = [""] * B
+    return padded, torch.tensor([], dtype=torch.long), input_lengths, \
+        torch.zeros(B, dtype=torch.long), raw_texts
+
+
 def _load_alto_file(args):
     """Mode fichier : parse un fichier .xml ou tous les .xml d'un répertoire."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -159,8 +182,9 @@ def _load_alto_file(args):
         sys.exit(1)
 
     all_samples = []
+    keep_empty = getattr(args, "no_gt", False)
     for xml_path in xml_files:
-        page_samples, _chars = _parse_page((xml_path, img_h, 4000))
+        page_samples, _chars = _parse_page((xml_path, img_h, 4000, keep_empty))
         all_samples.extend(page_samples)
         print(f"  {os.path.basename(xml_path)}: {len(page_samples)} lines")
 
@@ -171,7 +195,10 @@ def _load_alto_file(args):
     dataset = _DirectDataset(all_samples, img_h)
     print(f"Total: {len(dataset)} lines from {len(xml_files)} file(s)")
 
-    collate = _build_collate(spec, char_to_idx)
+    if keep_empty:
+        collate = _collate_no_gt_fn
+    else:
+        collate = _build_collate(spec, char_to_idx)
     return model, dataset, collate, idx_to_char, device, spec
 
 
@@ -235,9 +262,15 @@ def _predict_all(model, eval_ds, collate, idx_to_char, device, spec,
             img_seqs_cpu = img_seqs.cpu()
             for i, (dec, gt) in enumerate(zip(decoded, raw_texts)):
                 pred = dec["text"]
-                gt_len = max(len(gt), 1)
-                cer = levenshtein(pred, gt) / gt_len
-                wrong = align_pred_gt(pred, gt)
+                has_gt = bool(gt)
+                if has_gt:
+                    gt_len = max(len(gt), 1)
+                    cer = levenshtein(pred, gt) / gt_len
+                    wrong = align_pred_gt(pred, gt)
+                else:
+                    gt_len = 1
+                    cer = None
+                    wrong = []
 
                 real_w = input_lengths_cpu[i].item() * width_stride
                 img_t = img_seqs_cpu[i, :, :real_w]
@@ -245,7 +278,7 @@ def _predict_all(model, eval_ds, collate, idx_to_char, device, spec,
 
                 if use_beam and beam_texts is not None:
                     bt = beam_texts[i]
-                    beam_cer = levenshtein(bt, gt) / gt_len
+                    beam_cer = levenshtein(bt, gt) / gt_len if has_gt else None
                 else:
                     bt = None
                     beam_cer = None
@@ -285,7 +318,10 @@ def _predict_all(model, eval_ds, collate, idx_to_char, device, spec,
         # Assign beam results back to samples (order preserved)
         for s, bt in zip(samples, beam_results):
             s["beam"] = bt
-            s["beam_cer"] = levenshtein(bt, s["gt"]) / max(len(s["gt"]), 1)
+            if s["gt"]:
+                s["beam_cer"] = levenshtein(bt, s["gt"]) / max(len(s["gt"]), 1)
+            else:
+                s["beam_cer"] = None
 
     torch.cuda.empty_cache()
     return samples
@@ -301,7 +337,8 @@ def _select_samples(samples, args):
         samples = [samples[i] for i in indices]
 
     if args.sort_by_cer:
-        samples.sort(key=lambda s: s["cer"], reverse=True)
+        samples.sort(key=lambda s: s["cer"] if s["cer"] is not None else 1.0,
+                     reverse=True)
 
     if args.top_n is not None:
         samples = samples[: args.top_n]
@@ -425,18 +462,27 @@ class _Viewer:
 
         # --- passe 2 : texte (GT + PRED colore) sur des boites finalisees ---
         for ax, s in drawn:
-            # vert si la ligne est integralement reconnue (CER nul), rouge sinon
-            gt_color = "#2e7d32" if s["cer"] == 0.0 else "#c62828"
-            ax.text(0.0, -0.07, f"GT:   {s['gt']}", transform=ax.transAxes,
-                    fontsize=_FONTSIZE, color=gt_color, fontfamily="monospace",
-                    va="top", ha="left", clip_on=False)
+            if s["gt"]:
+                gt_color = "#2e7d32" if s["cer"] == 0.0 else "#c62828"
+                ax.text(0.0, -0.07, f"GT:   {s['gt']}", transform=ax.transAxes,
+                        fontsize=_FONTSIZE, color=gt_color, fontfamily="monospace",
+                        va="top", ha="left", clip_on=False)
+            else:
+                ax.text(0.0, -0.07, "GT:   [pas de transcription]", transform=ax.transAxes,
+                        fontsize=_FONTSIZE, color="#90a4ae", fontfamily="monospace",
+                        va="top", ha="left", clip_on=False)
             self._draw_pred_line(ax, -0.27, s, _FONTSIZE,
                                  show_errors=not self.has_beam)
 
             if s.get("beam") is not None:
-                beam_color = "#2e7d32" if s["beam_cer"] == 0.0 else "#c62828"
+                if s["beam_cer"] is not None:
+                    beam_color = "#2e7d32" if s["beam_cer"] == 0.0 else "#c62828"
+                    suffix = f"   (CER {s['beam_cer']:.0%})"
+                else:
+                    beam_color = "#37474f"
+                    suffix = ""
                 ax.text(0.0, -0.47,
-                        f"BEAM: {s['beam']}   (CER {s['beam_cer']:.0%})",
+                        f"BEAM: {s['beam']}{suffix}",
                         transform=ax.transAxes, fontsize=_FONTSIZE,
                         color=beam_color, fontfamily="monospace",
                         va="top", ha="left", clip_on=False)
@@ -489,7 +535,10 @@ class _Viewer:
 
         # score de confiance + CER en fin de ligne (ne perturbe pas l'alignement)
         conf_txt = f"{s['line_conf']:.0%}" if s["char_confs"] else "--"
-        suffix = f"   (conf {conf_txt} | CER {s['cer']:.0%})"
+        if s["cer"] is not None:
+            suffix = f"   (conf {conf_txt} | CER {s['cer']:.0%})"
+        else:
+            suffix = f"   (conf {conf_txt})"
         ax.text(0.0, y_ax, suffix, transform=at(prefix_pts + len(s["pred"]) * adv_pts),
                 color="#90a4ae", fontfamily="monospace", fontsize=fontsize,
                 va="top", ha="left", clip_on=False)
@@ -575,6 +624,11 @@ if __name__ == "__main__":
         help="Worker processes pour le beam search (0=sequentiel). "
              "Au-dela de 1, utilise un Pool multiprocessing comme recognize.py.",
     )
+    parser.add_argument(
+        "--no-gt", action="store_true",
+        help="Mode sans ground truth : predit toutes les lignes meme sans "
+             "transcription. Necessite --alto-file.",
+    )
     args = parser.parse_args()
 
     lm = None
@@ -601,11 +655,17 @@ if __name__ == "__main__":
     samples = _select_samples(samples, args)
     print(f"Displaying {len(samples)} samples ({'sorted by CER' if args.sort_by_cer else 'random order'})")
 
-    overall_cer = sum(s["cer"] for s in samples) / max(len(samples), 1)
-    print(f"Subset CER: {overall_cer:.1%}")
+    cer_vals = [s["cer"] for s in samples if s["cer"] is not None]
+    if cer_vals:
+        overall_cer = sum(cer_vals) / len(cer_vals)
+        print(f"Subset CER: {overall_cer:.1%} ({len(cer_vals)} with GT)")
+    else:
+        print(f"No GT available for {len(samples)} samples (no CER computed)")
     if args.beam_search:
-        beam_cer = sum(s["beam_cer"] for s in samples) / max(len(samples), 1)
-        print(f"Subset beam CER: {beam_cer:.1%} (greedy: {overall_cer:.1%})")
+        beam_vals = [s["beam_cer"] for s in samples if s["beam_cer"] is not None]
+        if beam_vals and cer_vals:
+            beam_cer = sum(beam_vals) / len(beam_vals)
+            print(f"Subset beam CER: {beam_cer:.1%} (greedy: {sum(cer_vals)/len(cer_vals):.1%})")
 
     viewer = _Viewer(samples, has_beam=args.beam_search)
     viewer.show()
