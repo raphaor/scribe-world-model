@@ -19,6 +19,7 @@ import math
 import pickle
 from collections import defaultdict
 
+import numpy as np
 import torch
 
 
@@ -35,68 +36,101 @@ class CharNgramLM:
         total_chars: int
         vocab_size: int
         order: int
-
-    Scoring: P(w | context) uses stupid backoff with discount 0.4.
-    Probabilities are NOT normalised (stupid backoff), but this is fine
-    for ranking in beam search.
     """
 
     def __init__(self, pkl_path, discount=0.4):
         with open(pkl_path, "rb") as f:
             data = pickle.load(f)
-        self.counts = data["counts"]          # {1: {(c,): n, ...}, 2: {...}}
+        self.counts = {k: dict(v) for k, v in data["counts"].items()}
         self.total_chars = data["total_chars"]
         self.vocab_size = data["vocab_size"]
-        self.order = data["order"]
+        self._order = data["order"]
         self.discount = discount
         self._log_discount = math.log(discount)
+
+        # Precompute log counts for unigrams (most common lookup path)
+        self._log_unigram = {}
+        uni = self.counts.get(1, {})
+        log_total = math.log(self.total_chars) if self.total_chars > 0 else 0.0
+        for char, cnt in uni.items():
+            self._log_unigram[char] = math.log(cnt) - log_total
+
+        # Smoothing fallback for OOV unigrams
+        self._log_oov = math.log(
+            0.5 / (self.total_chars + 0.5 * self.vocab_size)
+        )
+
+        # Cache: (context_tuple, char) -> log_prob
+        self._cache = {}
+        self._cache_hits = 0
+        self._cache_misses = 0
+
+    @property
+    def order(self):
+        return self._order
 
     def log_prob(self, context, char):
         """
         Stupid-backoff log-probability of *char* given *context*.
 
         Args:
-            context: list of character strings (history, oldest first,
-                     most recent last).
+            context: tuple of character strings (history, most recent last).
+                     Only the last (order-1) chars are used.
             char: candidate character string.
         Returns:
             Natural-log probability (unnormalised — fine for ranking).
         """
-        max_k = min(len(context), self.order - 1)
+        # --- Cache check ---
+        key = (context, char)
+        cached = self._cache.get(key)
+        if cached is not None:
+            self._cache_hits += 1
+            return cached
 
+        self._cache_misses += 1
+
+        # Truncate context to order-1
+        max_k = min(len(context), self._order - 1)
+
+        result = self._compute_lp(context, char, max_k)
+
+        # Store in cache (limit size to avoid memory blowup)
+        if len(self._cache) < 2_000_000:
+            self._cache[key] = result
+
+        return result
+
+    def _compute_lp(self, context, char, max_k):
+        """Core stupid-backoff computation (no cache)."""
         for k in range(max_k, -1, -1):
-            ctx = tuple(context[-k:]) if k > 0 else ()
-            ngram = ctx + (char,)
+            ctx = context[len(context) - k:] if k > 0 else ()
             order = k + 1
 
-            c_ngram = self.counts.get(order, {}).get(ngram, 0)
-            if c_ngram > 0:
-                if k > 0:
-                    c_ctx = self.counts.get(k, {}).get(ctx, 0)
-                else:
-                    c_ctx = self.total_chars
-                if c_ctx > 0:
-                    backoffs = max_k - k
-                    return math.log(c_ngram / c_ctx) + backoffs * self._log_discount
-
-            # k == 0 and unigram not found → smoothed fallback
             if k == 0:
-                c_uni = self.counts.get(1, {}).get((char,), 0)
-                backoffs = max_k
-                return (
-                    math.log((c_uni + 0.5) / (self.total_chars + 0.5 * self.vocab_size))
-                    + backoffs * self._log_discount
-                )
+                # Unigram with smoothing
+                return self._log_unigram.get(
+                    (char,), self._log_oov
+                ) + max_k * self._log_discount
 
-        return math.log(1.0 / self.vocab_size)  # unreachable safety net
+            ngram = ctx + (char,)
+            order_counts = self.counts.get(order)
+            if order_counts:
+                c_ngram = order_counts.get(ngram, 0)
+                if c_ngram > 0:
+                    c_ctx = self.counts.get(k, {}).get(ctx, 0)
+                    if c_ctx > 0:
+                        backoffs = max_k - k
+                        return (
+                            math.log(c_ngram) - math.log(c_ctx)
+                            + backoffs * self._log_discount
+                        )
 
-    @property
-    def order(self):
-        return self._order
+        return self._log_oov + max_k * self._log_discount
 
-    @order.setter
-    def order(self, v):
-        self._order = v
+    def clear_cache(self):
+        self._cache.clear()
+        self._cache_hits = 0
+        self._cache_misses = 0
 
 
 # ---------------------------------------------------------------------------
@@ -104,17 +138,7 @@ class CharNgramLM:
 # ---------------------------------------------------------------------------
 
 _NEG_INF = float("-inf")
-
-
-def _logsumexp(a, b):
-    """Numerically stable log(exp(a) + exp(b))."""
-    if a == _NEG_INF:
-        return b
-    if b == _NEG_INF:
-        return a
-    if a > b:
-        return a + math.log1p(math.exp(b - a))
-    return b + math.log1p(math.exp(a - b))
+_LOG0P5 = math.log(0.5)
 
 
 # ---------------------------------------------------------------------------
@@ -135,31 +159,20 @@ def ctc_beam_search_decode(
     """
     CTC prefix beam search with optional character n-gram LM.
 
-    Implements the algorithm from Hannun et al. (2014), "First-Pass
-    Large Vocabulary Continuous Speech Recognition using Bi-Directional
-    Recurrent DNNs." The LM score is added incrementally when a new
-    character label is appended to a beam prefix.
-
     Args:
         logits: (B, T, C) tensor — CTC log-probabilities or raw logits.
         lengths: (B,) tensor — valid frame count per sample.
         idx_to_char: dict mapping CTC class index → character string.
-        lm: optional CharNgramLM. If None, pure CTC beam search (no LM).
+        lm: optional CharNgramLM. If None, pure CTC beam search.
         beam_width: number of beams to keep after each frame.
-        lm_weight: LM interpolation weight (0 = no LM influence).
-        prune_topk: only consider the top-k characters per frame
-                    (drastically reduces computation; 15 is enough for
-                    a 107-class alphabet).
+        lm_weight: LM interpolation weight.
+        prune_topk: only consider the top-k characters per frame.
         blank_id: CTC blank index (default 0).
-        is_log_probs: if True, *logits* are already log-softmax'd
-                      (model CTC head output). If False, log_softmax
-                      is applied internally.
+        is_log_probs: if True, *logits* are already log-softmax'd.
 
     Returns:
         list[str], one decoded string per batch element.
     """
-    import numpy as np
-
     if logits.dim() != 3:
         raise ValueError(f"Expected (B, T, C) tensor, got {logits.shape}")
 
@@ -168,12 +181,16 @@ def ctc_beam_search_decode(
     else:
         log_probs_np = torch.log_softmax(logits.float(), dim=-1).numpy()
 
+    # Precompute char strings for all indices (avoid dict lookups in hot loop)
+    n_chars = log_probs_np.shape[-1]
+    chars = [idx_to_char.get(i, "") for i in range(n_chars)]
+
     results = []
     for b in range(log_probs_np.shape[0]):
         L = int(lengths[b])
-        seq = log_probs_np[b, :L, :]  # (L, C)
+        seq = log_probs_np[b, :L, :]
         text = _beam_search_single(
-            seq, idx_to_char, lm, beam_width, lm_weight, prune_topk, blank_id
+            seq, chars, lm, beam_width, lm_weight, prune_topk, blank_id
         )
         results.append(text)
 
@@ -181,85 +198,147 @@ def ctc_beam_search_decode(
 
 
 def _beam_search_single(
-    log_probs, idx_to_char, lm, beam_width, lm_weight, prune_topk, blank_id
+    log_probs, chars, lm, beam_width, lm_weight, prune_topk, blank_id
 ):
     """
-    Beam search for a single sequence.
+    Beam search for a single sequence (optimized).
 
     log_probs: (T, C) numpy array of log-probabilities.
+    chars: list[str] — precomputed index→char mapping.
     Returns decoded text string.
     """
-    import numpy as np
-
     T, C = log_probs.shape
+    lm_ctx_len = (lm.order - 1) if lm else 0
+    _log_d = lm._log_discount if lm else 0.0
 
-    # Each beam: (prefix_tuple, lp_blank, lp_non_blank)
-    # prefix_tuple: tuple of CTC class indices (the label sequence)
-    # lp_blank:     log-prob that the best path for this prefix ends with blank
-    # lp_non_blank: log-prob that the best path ends with a non-blank label
-    #
-    # We use dicts keyed by prefix_tuple → (lp_blank, lp_non_blank).
-
-    beams = {(): (0.0, _NEG_INF)}  # start: all mass in blank
+    # Each beam: prefix_tuple → (lp_blank, lp_non_blank)
+    beams = {(): (0.0, _NEG_INF)}
 
     for t in range(T):
-        new_beams = defaultdict(lambda: (_NEG_INF, _NEG_INF))
+        new_beams = {}
 
-        # Pre-select top-k character candidates for this frame
+        # Top-k candidates for this frame
         topk = min(prune_topk, C)
-        # Always include blank in candidates
-        top_indices = set(np.argpartition(log_probs[t], -topk)[-topk:].tolist())
-        top_indices.add(blank_id)
+        top_indices = np.argpartition(log_probs[t], -topk)[-topk:]
+
+        frame_lp = log_probs[t]  # (C,) — avoid repeated indexing
+
+        # Fast path: if blank dominates (>0.95), just boost all blank probs
+        # without exploring extensions — saves the full beam × topk loop.
+        if frame_lp[blank_id] > -0.05:  # exp(-0.05) ≈ 0.95
+            lp_c = float(frame_lp[blank_id])
+            for prefix, (lp_b, lp_nb) in beams.items():
+                merged = _beam_score((lp_b, lp_nb)) + lp_c
+                cur = new_beams.get(prefix)
+                if cur is None:
+                    new_beams[prefix] = (merged, _NEG_INF)
+                else:
+                    new_beams[prefix] = (
+                        merged if cur[0] == _NEG_INF
+                        else merged + math.log1p(math.exp(cur[0] - merged))
+                        if merged > cur[0]
+                        else cur[0] + math.log1p(math.exp(merged - cur[0])),
+                        cur[1],
+                    )
+            beams = new_beams
+            continue
+
+        if blank_id not in top_indices:
+            top_indices = np.append(top_indices, blank_id)
 
         for prefix, (lp_b, lp_nb) in beams.items():
+            # Precompute LM context for this prefix (truncated to order-1)
+            if lm and prefix:
+                # Only last (order-1) chars matter
+                if len(prefix) <= lm_ctx_len:
+                    lm_ctx = tuple(chars[i] for i in prefix)
+                else:
+                    lm_ctx = tuple(chars[i] for i in prefix[-lm_ctx_len:])
+            elif lm:
+                lm_ctx = ()
+            else:
+                lm_ctx = None
+
             for c in top_indices:
-                lp_c = float(log_probs[t, c])
+                lp_c = float(frame_lp[c])
 
                 if c == blank_id:
-                    # Blank: prefix unchanged, accumulate to blank prob
-                    cur_b, cur_nb = new_beams[prefix]
-                    merged = _logsumexp(lp_b, lp_nb) + lp_c
-                    new_beams[prefix] = (_logsumexp(cur_b, merged), cur_nb)
+                    # Blank: prefix unchanged
+                    cur = new_beams.get(prefix)
+                    if cur is None:
+                        cur = (_NEG_INF, _NEG_INF)
+                    merged = (lp_b if lp_b > lp_nb
+                              else lp_nb + math.log1p(math.exp(lp_b - lp_nb))) + lp_c
+                    new_b = (cur[0] if cur[0] > merged
+                             else merged + math.log1p(math.exp(cur[0] - merged)))
+                    new_beams[prefix] = (new_b, cur[1])
 
                 elif len(prefix) > 0 and prefix[-1] == c:
-                    # Same label as last in prefix — two sub-cases:
+                    # Same label repeat
+                    # (a) Collapse: stays same prefix
+                    cur = new_beams.get(prefix)
+                    if cur is None:
+                        cur = (_NEG_INF, _NEG_INF)
+                    val = lp_nb + lp_c
+                    new_nb = (cur[1] if cur[1] > val
+                              else val + math.log1p(math.exp(cur[1] - val)))
+                    new_beams[prefix] = (cur[0], new_nb)
 
-                    # (a) Collapse: repeat without intervening blank.
-                    #     Prefix stays the same, accumulate to non-blank.
-                    cur_b, cur_nb = new_beams[prefix]
-                    new_beams[prefix] = (cur_b, _logsumexp(cur_nb, lp_nb + lp_c))
-
-                    # (b) Extend: blank-separated repeat → new label.
+                    # (b) Extend: blank-separated repeat
                     new_prefix = prefix + (c,)
-                    cur_b2, cur_nb2 = new_beams[new_prefix]
                     score = lp_b + lp_c
-                    if lm:
-                        ctx_chars = [idx_to_char.get(i, "") for i in prefix]
-                        ch = idx_to_char.get(c, "")
-                        score += lm_weight * lm.log_prob(ctx_chars, ch)
-                    new_beams[new_prefix] = (cur_b2, _logsumexp(cur_nb2, score))
+                    if lm and lm_ctx is not None:
+                        ch = chars[c]
+                        score += lm_weight * lm.log_prob(lm_ctx, ch)
+                    cur2 = new_beams.get(new_prefix)
+                    if cur2 is None:
+                        cur2 = (_NEG_INF, _NEG_INF)
+                    new_nb2 = (cur2[1] if cur2[1] > score
+                               else score + math.log1p(math.exp(cur2[1] - score)))
+                    new_beams[new_prefix] = (cur2[0], new_nb2)
 
                 else:
-                    # Different label: always extend prefix.
+                    # Different label: extend
                     new_prefix = prefix + (c,)
-                    cur_b, cur_nb = new_beams[new_prefix]
-                    score = _logsumexp(lp_b, lp_nb) + lp_c
-                    if lm:
-                        ctx_chars = [idx_to_char.get(i, "") for i in prefix]
-                        ch = idx_to_char.get(c, "")
-                        score += lm_weight * lm.log_prob(ctx_chars, ch)
-                    new_beams[new_prefix] = (cur_b, _logsumexp(cur_nb, score))
+                    if lp_b > lp_nb:
+                        total = lp_b
+                    elif lp_nb == _NEG_INF:
+                        total = lp_b
+                    else:
+                        total = lp_nb + math.log1p(math.exp(lp_b - lp_nb))
+                    score = total + lp_c
+                    if lm and lm_ctx is not None:
+                        ch = chars[c]
+                        score += lm_weight * lm.log_prob(lm_ctx, ch)
+                    cur = new_beams.get(new_prefix)
+                    if cur is None:
+                        cur = (_NEG_INF, _NEG_INF)
+                    new_nb = (cur[1] if cur[1] > score
+                              else score + math.log1p(math.exp(cur[1] - score)))
+                    new_beams[new_prefix] = (cur[0], new_nb)
 
         # Prune: keep top beam_width beams by total log-prob
         scored = [
-            (pfx, _logsumexp(lb, lnb)) for pfx, (lb, lnb) in new_beams.items()
+            (pfx, lb if lb > lnb
+             else (lnb + math.log1p(math.exp(lb - lnb)) if lb != _NEG_INF else lnb))
+            for pfx, (lb, lnb) in new_beams.items()
         ]
         scored.sort(key=lambda x: x[1], reverse=True)
         beams = {pfx: new_beams[pfx] for pfx, _ in scored[:beam_width]}
 
     # Select best beam
-    best_prefix = max(
-        beams, key=lambda p: _logsumexp(*beams[p])
-    )
+    best_prefix = max(beams, key=lambda p: _beam_score(beams[p]))
 
-    return "".join(idx_to_char.get(c, "?") for c in best_prefix)
+    return "".join(chars[c] for c in best_prefix)
+
+
+def _beam_score(pair):
+    """Total log-prob of a beam (lp_blank, lp_non_blank)."""
+    lb, lnb = pair
+    if lb == _NEG_INF:
+        return lnb
+    if lnb == _NEG_INF:
+        return lb
+    if lb > lnb:
+        return lb + math.log1p(math.exp(lnb - lb))
+    return lnb + math.log1p(math.exp(lb - lnb))
