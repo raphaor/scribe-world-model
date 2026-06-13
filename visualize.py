@@ -25,8 +25,11 @@ import torch
 from torch.utils.data import DataLoader, random_split, Dataset
 from functools import partial
 
+import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib.transforms import offset_copy
 from matplotlib.widgets import Button
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -37,7 +40,10 @@ from data_alto import (
     AltoLineDataset, _parse_page, build_alphabet,
     collate_alto_fn, collate_alto_v5_fn,
 )
-from recognize import ctc_greedy_decode, levenshtein
+from recognize import ctc_greedy_decode_conf, align_pred_gt, levenshtein
+
+# Colormap commune (rouge = faible confiance, vert = haute confiance)
+_CONF_CMAP = plt.get_cmap("RdYlGn")
 
 
 class _DirectDataset(Dataset):
@@ -198,14 +204,16 @@ def _predict_all(model, eval_ds, collate, idx_to_char, device, spec):
                     img_seqs_dev, input_lengths=input_lengths.to(device)
                 )
 
-            decoded = ctc_greedy_decode(
-                ctc_logits.cpu(), input_lengths_cpu, idx_to_char
+            decoded = ctc_greedy_decode_conf(
+                ctc_logits.cpu().float(), input_lengths_cpu, idx_to_char
             )
 
             img_seqs_cpu = img_seqs.cpu()
-            for i, (pred, gt) in enumerate(zip(decoded, raw_texts)):
+            for i, (dec, gt) in enumerate(zip(decoded, raw_texts)):
+                pred = dec["text"]
                 gt_len = max(len(gt), 1)
                 cer = levenshtein(pred, gt) / gt_len
+                wrong = align_pred_gt(pred, gt)
 
                 real_w = input_lengths_cpu[i].item() * width_stride
                 img_t = img_seqs_cpu[i, :, :real_w]
@@ -216,6 +224,10 @@ def _predict_all(model, eval_ds, collate, idx_to_char, device, spec):
                     "gt": gt,
                     "pred": pred,
                     "cer": cer,
+                    "char_confs": dec["char_confs"],
+                    "frame_conf": dec["frame_conf"],
+                    "line_conf": dec["line_conf"],
+                    "wrong": wrong,
                 })
 
     torch.cuda.empty_cache()
@@ -240,7 +252,15 @@ def _select_samples(samples, args):
     return samples
 
 
-_PER_PAGE = 8
+_PER_PAGE = 6
+_FONTSIZE = 9
+
+
+def _conf_color(conf):
+    """Couleur RdYlGn assombrie pour rester lisible sur fond blanc."""
+    r, g, b, _ = _CONF_CMAP(float(conf))
+    f = 0.82
+    return (r * f, g * f, b * f)
 
 
 class _Viewer:
@@ -253,63 +273,156 @@ class _Viewer:
         self.total_pages = max(1, -(-len(samples) // per_page))
 
         self.fig, self.axes = plt.subplots(
-            per_page, 1, figsize=(16, per_page * 2.5)
+            per_page, 1, figsize=(16, per_page * 2.9)
         )
         if per_page == 1:
             self.axes = [self.axes]
-        plt.subplots_adjust(bottom=0.08, top=0.93, hspace=0.9)
+        plt.subplots_adjust(bottom=0.10, top=0.93, hspace=1.0)
 
-        ax_prev = self.fig.add_axes([0.15, 0.01, 0.15, 0.04])
-        ax_next = self.fig.add_axes([0.70, 0.01, 0.15, 0.04])
+        ax_prev = self.fig.add_axes([0.15, 0.01, 0.15, 0.035])
+        ax_next = self.fig.add_axes([0.70, 0.01, 0.15, 0.035])
         self.btn_prev = Button(ax_prev, "\u2190 Prev")
         self.btn_next = Button(ax_next, "Next \u2192")
         self.btn_prev.on_clicked(self._prev)
         self.btn_next.on_clicked(self._next)
 
         self.fig.canvas.mpl_connect("key_press_event", self._on_key)
+        # Le texte PRED est positionne en pixels/points ; un redimensionnement de
+        # la fenetre deplace les boites d'axes, donc on retrace pour rester aligne.
+        self.fig.canvas.mpl_connect("resize_event", self._on_resize)
+        self._drawing = False
 
         self._draw()
 
+    def _on_resize(self, _event=None):
+        if self._drawing:
+            return
+        self._draw()
+
     def _draw(self):
+        self._drawing = True
+        try:
+            self._draw_impl()
+        finally:
+            self._drawing = False
+
+    def _draw_impl(self):
         start = self.page * self.per_page
         page_samples = self.samples[start : start + self.per_page]
 
         mean_cer = sum(s["cer"] for s in page_samples) / max(len(page_samples), 1)
+        mean_conf = sum(s["line_conf"] for s in page_samples) / max(len(page_samples), 1)
         title = (
             f"Page {self.page + 1}/{self.total_pages}  |  "
             f"Samples {start + 1}\u2013{min(start + self.per_page, len(self.samples))}"
             f"/{len(self.samples)}  |  "
-            f"Page CER: {mean_cer:.1%}"
+            f"Page CER: {mean_cer:.1%}  |  Page conf: {mean_conf:.1%}  |  "
+            f"confiance: rouge=faible \u2192 vert=haute"
         )
-        self.fig.suptitle(title, fontsize=13, fontweight="bold")
+        self.fig.suptitle(title, fontsize=12, fontweight="bold")
 
+        # --- passe 1 : images + frises (sans texte) ---
+        drawn = []
         for i, ax in enumerate(self.axes):
             ax.clear()
-            if i < len(page_samples):
-                s = page_samples[i]
-                img = s["image"]
-                ax.imshow(img, cmap="gray", aspect="equal", vmin=0, vmax=255,
-                          interpolation="nearest")
-
-                ok = s["cer"] == 0.0
-                color_gt = "#2e7d32" if ok else "#c62828"
-                color_pred = "#2e7d32" if ok else "#e65100"
-
-                ax.text(0, -0.02, f"GT:   {s['gt']}", transform=ax.transAxes,
-                        fontsize=10, color=color_gt, fontfamily="monospace",
-                        va="top", ha="left", clip_on=False)
-                ax.text(0, -0.28, f"PRED: {s['pred']}   (CER {s['cer']:.1%})",
-                        transform=ax.transAxes,
-                        fontsize=10, color=color_pred, fontfamily="monospace",
-                        va="top", ha="left", clip_on=False)
-                ax.set_xticks([])
-                ax.set_yticks([])
-                for spine in ax.spines.values():
-                    spine.set_visible(False)
-            else:
+            if i >= len(page_samples):
                 ax.axis("off")
+                continue
+
+            s = page_samples[i]
+            img = s["image"]
+            H, real_w = img.shape[0], img.shape[1]
+
+            # image de la ligne (en haut)
+            ax.imshow(img, cmap="gray", aspect="equal", vmin=0, vmax=255,
+                      interpolation="nearest", extent=(0, real_w, H, 0))
+
+            # frise de confiance par frame (juste en dessous)
+            fc = np.asarray(s["frame_conf"], dtype=float)
+            if fc.size > 0:
+                fh = max(6.0, H * 0.18)
+                gap = max(2.0, H * 0.05)
+                ax.imshow(fc[None, :], cmap=_CONF_CMAP, vmin=0.0, vmax=1.0,
+                          aspect="equal", interpolation="nearest",
+                          extent=(0, real_w, H + gap + fh, H + gap))
+                total_h = H + gap + fh
+            else:
+                total_h = H
+
+            ax.set_xlim(0, max(real_w, 1))
+            ax.set_ylim(total_h, 0)
+            # ratio pixel preserve (pas d'etirement), boite ancree en haut a gauche
+            ax.set_aspect("equal", adjustable="box", anchor="NW")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            for spine in ax.spines.values():
+                spine.set_visible(False)
+            drawn.append((ax, s))
+
+        # Fige la mise en page : avec aspect='equal' la boite de chaque axe est
+        # redimensionnee au trace. On force ce calcul avant de mesurer/placer le
+        # texte, sinon les largeurs de caracteres seraient fausses (chevauchement).
+        self.fig.canvas.draw()
+
+        # --- passe 2 : texte (GT + PRED colore) sur des boites finalisees ---
+        for ax, s in drawn:
+            # vert si la ligne est integralement reconnue (CER nul), rouge sinon
+            gt_color = "#2e7d32" if s["cer"] == 0.0 else "#c62828"
+            ax.text(0.0, -0.07, f"GT:   {s['gt']}", transform=ax.transAxes,
+                    fontsize=_FONTSIZE, color=gt_color, fontfamily="monospace",
+                    va="top", ha="left", clip_on=False)
+            self._draw_pred_line(ax, -0.27, s, _FONTSIZE)
 
         self.fig.canvas.draw_idle()
+
+    def _draw_pred_line(self, ax, y_ax, s, fontsize):
+        """Affiche la ligne PRED : chaque caractere colore selon sa confiance,
+        les caracteres faux (vs GT) soulignes en rouge, et un score de ligne.
+
+        Chaque lettre est avancee en POINTS depuis le bord gauche de l'axe via
+        offset_copy(..., units='points', fig=...), qui recalcule l'offset au
+        moment du trace. L'espacement reproduit donc exactement celui d'une
+        chaine monospace normale (alignement avec la GT, pas de chevauchement)
+        quelle que soit la taille de la fenetre ou le DPI."""
+        renderer = self.fig.canvas.get_renderer()
+        dpi = self.fig.dpi
+
+        prefix = "PRED: "  # meme largeur que "GT:   " -> texte aligne
+        t = ax.text(0.0, y_ax, prefix, transform=ax.transAxes, color="#37474f",
+                    fontfamily="monospace", fontsize=fontsize, va="top", ha="left",
+                    clip_on=False)
+        t.draw(renderer)
+        e0 = t.get_window_extent(renderer=renderer)
+        ax_bb = ax.get_window_extent(renderer=renderer)
+
+        adv_px = e0.width / max(len(prefix), 1)         # avance / caractere (px)
+        adv_pts = adv_px * 72.0 / dpi                   # ... en points
+        prefix_pts = e0.width * 72.0 / dpi
+        lh = e0.height / ax_bb.height                   # hauteur de ligne (fraction)
+        y_ul = y_ax - lh * 1.5                          # souligne juste sous le texte
+        adv_frac = adv_px / ax_bb.width                 # longueur du souligne (fraction)
+
+        def at(off_pts):
+            return offset_copy(ax.transAxes, fig=self.fig, x=off_pts, y=0.0,
+                               units="points")
+
+        for j, (ch, conf, wr) in enumerate(zip(s["pred"], s["char_confs"], s["wrong"])):
+            tr = at(prefix_pts + j * adv_pts)
+            ax.text(0.0, y_ax, ch, transform=tr, color=_conf_color(conf),
+                    fontfamily="monospace", fontsize=fontsize, va="top", ha="left",
+                    clip_on=False)
+            if wr:
+                ln = Line2D([0.0, adv_frac], [y_ul, y_ul], transform=tr,
+                            color="#d50000", lw=1.6, clip_on=False,
+                            solid_capstyle="butt")
+                ax.add_line(ln)
+
+        # score de confiance + CER en fin de ligne (ne perturbe pas l'alignement)
+        conf_txt = f"{s['line_conf']:.0%}" if s["char_confs"] else "--"
+        suffix = f"   (conf {conf_txt} | CER {s['cer']:.0%})"
+        ax.text(0.0, y_ax, suffix, transform=at(prefix_pts + len(s["pred"]) * adv_pts),
+                color="#90a4ae", fontfamily="monospace", fontsize=fontsize,
+                va="top", ha="left", clip_on=False)
 
     def _prev(self, _event=None):
         if self.page > 0:

@@ -41,6 +41,92 @@ def ctc_greedy_decode(log_probs, lengths, idx_to_char):
     return results
 
 
+def ctc_greedy_decode_conf(log_probs, lengths, idx_to_char):
+    """Greedy CTC decoding qui renvoie aussi les confiances.
+
+    Args:
+        log_probs: (B, T, C) log-probabilites (sortie du CTC head, deja log_softmax)
+        lengths: (B,) longueurs reelles (nombre de frames valides)
+        idx_to_char: dict index -> caractere
+    Returns:
+        list de dicts, un par echantillon :
+          - "text":       str decode
+          - "char_confs": list[float] proba de chaque caractere emis (la frame "pic")
+          - "frame_conf": list[float] proba max a chaque frame (len = lengths[i])
+          - "line_conf":  float moyenne geometrique des char_confs (0.0 si vide)
+    """
+    probs = log_probs.exp()                     # (B, T, C)
+    preds = log_probs.argmax(dim=-1)            # (B, T)
+    max_p = probs.max(dim=-1).values            # (B, T) confiance par frame
+
+    results = []
+    for i in range(preds.size(0)):
+        L = int(lengths[i])
+        seq = preds[i, :L].tolist()
+        frame_conf = max_p[i, :L].tolist()
+
+        chars, confs = [], []
+        prev = None
+        for t, idx in enumerate(seq):
+            if idx != 0 and idx != prev:
+                chars.append(idx_to_char.get(idx, "?"))
+                confs.append(float(probs[i, t, idx]))
+            prev = idx
+
+        if confs:
+            log_mean = sum(torch.log(torch.tensor(confs))).item() / len(confs)
+            line_conf = float(torch.exp(torch.tensor(log_mean)))
+        else:
+            line_conf = 0.0
+
+        results.append({
+            "text": "".join(chars),
+            "char_confs": confs,
+            "frame_conf": frame_conf,
+            "line_conf": line_conf,
+        })
+
+    return results
+
+
+def align_pred_gt(pred, gt):
+    """Aligne pred sur gt (edit distance) et marque les caracteres errones de pred.
+
+    Renvoie une liste de bool de longueur len(pred) : True si le caractere predit
+    est une substitution ou une insertion (donc faux). Les suppressions (caracteres
+    manquants) ne correspondent a aucune position de pred et ne sont pas marquees.
+    """
+    n, m = len(pred), len(gt)
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n + 1):
+        dp[i][0] = i
+    for j in range(m + 1):
+        dp[0][j] = j
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            cost = 0 if pred[i - 1] == gt[j - 1] else 1
+            dp[i][j] = min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost)
+
+    wrong = [False] * n
+    i, j = n, m
+    while i > 0 and j > 0:
+        cost = 0 if pred[i - 1] == gt[j - 1] else 1
+        if dp[i][j] == dp[i - 1][j - 1] + cost:
+            if cost == 1:
+                wrong[i - 1] = True          # substitution
+            i -= 1
+            j -= 1
+        elif dp[i][j] == dp[i - 1][j] + 1:
+            wrong[i - 1] = True              # insertion (caractere predit en trop)
+            i -= 1
+        else:
+            j -= 1                           # suppression (pas de slot dans pred)
+    while i > 0:
+        wrong[i - 1] = True
+        i -= 1
+    return wrong
+
+
 def levenshtein(s1, s2):
     """Edit distance between two strings."""
     if len(s1) < len(s2):
