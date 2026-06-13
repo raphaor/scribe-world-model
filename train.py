@@ -698,6 +698,27 @@ if __name__ == "__main__":
         if not args.alto_dirs:
             raise ValueError("All --alto-dirs were excluded; nothing left to train on.")
 
+    # --- Load checkpoint metadata BEFORE dataset construction ---
+    # Same logic as recognize.py: when fine-tuning from a checkpoint, its
+    # alphabet (char_to_idx) and num_classes must take precedence over the
+    # new dataset's. Without this, the collate encodes targets with the new
+    # dataset's alphabet while the model's CTC head uses the checkpoint's —
+    # the CTC head gets skipped (shape mismatch) and predictions are garbage.
+    ckpt = None
+    ckpt_ctc_classes = None
+    ckpt_char_to_idx = None
+    if args.checkpoint and os.path.exists(args.checkpoint):
+        ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+        ckpt_ctc_classes = ckpt.get("config", {}).get("num_classes")
+        ckpt_char_to_idx = ckpt.get("char_to_idx")
+        if ckpt_char_to_idx:
+            print(
+                f"Checkpoint alphabet: {len(ckpt_char_to_idx)} characters "
+                f"(num_classes={ckpt_ctc_classes})"
+            )
+        else:
+            print("WARNING: checkpoint has no char_to_idx; building alphabet from data")
+
     if args.data == "alto":
         ver = args.model_version
         spec = get_spec(ver)
@@ -708,9 +729,17 @@ if __name__ == "__main__":
         dataset = AltoLineDataset(
             args.alto_dirs, img_height=img_h, augment=not args.no_augment
         )
-        char_to_idx, idx_to_char = dataset.get_alphabet()
-        print(f"Alphabet: {len(char_to_idx)} characters")
-        num_classes = len(char_to_idx) + 1
+        # Checkpoint alphabet wins over dataset alphabet (consistent with
+        # recognize.py). Characters in the new data that are absent from the
+        # checkpoint alphabet will be silently dropped by the collate (with
+        # a warning) — expected behavior for transfer learning.
+        if ckpt_char_to_idx:
+            char_to_idx = ckpt_char_to_idx
+            idx_to_char = {v: k for k, v in char_to_idx.items()}
+        else:
+            char_to_idx, idx_to_char = dataset.get_alphabet()
+            print(f"Alphabet from data: {len(char_to_idx)} characters")
+        num_classes = ckpt_ctc_classes if ckpt_ctc_classes else len(char_to_idx) + 1
 
         # Prune CTC-unalignable lines before the split (opt-in). The alphabet
         # is built from the full set first, so a char that only appears on a
@@ -807,19 +836,11 @@ if __name__ == "__main__":
     else:
         raise ValueError("Only 'alto' data mode is supported")
 
-    # CTC head is needed in full and mixed modes, or if checkpoint had one
+    # CTC head is needed in full and mixed modes, or if checkpoint had one.
+    # num_classes already set correctly above (checkpoint takes precedence).
     need_ctc = args.mode in ("full", "mixed")
-    ckpt = None
-    ckpt_ctc_classes = None
 
-    if args.checkpoint and os.path.exists(args.checkpoint):
-        ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-        ckpt_ctc_classes = ckpt.get("config", {}).get("num_classes")
-        # Restore char_to_idx from checkpoint if available
-        ckpt_char_to_idx = ckpt.get("char_to_idx")
-        if ckpt_char_to_idx:
-            char_to_idx = ckpt_char_to_idx
-            idx_to_char = {v: k for k, v in char_to_idx.items()}
+    # ckpt and ckpt_ctc_classes already loaded early (before dataset).
 
     # Preserve CTC head from checkpoint even in adapt mode
     if need_ctc:
