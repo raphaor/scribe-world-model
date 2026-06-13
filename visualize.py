@@ -192,16 +192,43 @@ def _load_alto_file(args):
         print("No lines found")
         sys.exit(1)
 
-    dataset = _DirectDataset(all_samples, img_h)
-    print(f"Total: {len(dataset)} lines from {len(xml_files)} file(s)")
+    print(f"Total: {len(all_samples)} lines from {len(xml_files)} file(s)")
+
+    split = getattr(args, "split", "val")
 
     if keep_empty:
-        # Mode --no-gt : tout passer, pas de split
-        eval_ds = dataset
+        # Mode --no-gt : exclure le split d'entraînement des lignes AVEC GT.
+        # Les lignes sans GT n'ont jamais été vues à l'entraînement, donc
+        # toutes sont affichées. On splitte les lignes GT avec le même seed 42
+        # que _load_val_split / train.py pour cohérence.
+        gt_idx = [i for i, (_, t) in enumerate(all_samples) if t and t.strip()]
+        no_gt_idx = [i for i, (_, t) in enumerate(all_samples) if not t or not t.strip()]
+        n_gt = len(gt_idx)
+
+        if n_gt > 0:
+            train_size = int(0.8 * n_gt)
+            val_size = n_gt - train_size
+            _train_split, val_split = random_split(
+                range(n_gt), [train_size, val_size],
+                generator=torch.Generator().manual_seed(42),
+            )
+            val_gt_idx = [gt_idx[i] for i in val_split.indices]
+        else:
+            val_gt_idx = []
+
+        if split == "val":
+            shown_idx = sorted(val_gt_idx + no_gt_idx)
+        else:
+            shown_idx = sorted(gt_idx + no_gt_idx)
+        shown = [all_samples[i] for i in shown_idx]
+        eval_ds = _DirectDataset(shown, img_h)
+        print(f"  --no-gt: {len(no_gt_idx)} unannotated + "
+              f"{len(val_gt_idx) if split == 'val' else n_gt} {split} GT "
+              f"= {len(shown)} shown")
         collate = _collate_no_gt_fn
     else:
         # Même split seedé que _load_val_split (80/20, seed 42)
-        split = getattr(args, "split", "val")
+        dataset = _DirectDataset(all_samples, img_h)
         train_size = int(0.8 * len(dataset))
         val_size = len(dataset) - train_size
         train_ds, val_ds = random_split(
