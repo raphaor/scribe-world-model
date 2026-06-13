@@ -525,13 +525,15 @@ class _Viewer:
         start = self.page * self.per_page
         page_samples = self.samples[start : start + self.per_page]
 
-        mean_cer = sum(s["cer"] for s in page_samples) / max(len(page_samples), 1)
+        cer_vals = [s["cer"] for s in page_samples if s["cer"] is not None]
+        mean_cer = sum(cer_vals) / max(len(cer_vals), 1) if cer_vals else None
         mean_conf = sum(s["line_conf"] for s in page_samples) / max(len(page_samples), 1)
+        cer_txt = f"Page CER: {mean_cer:.1%}  |  " if mean_cer is not None else ""
         title = (
             f"Page {self.page + 1}/{self.total_pages}  |  "
             f"Samples {start + 1}\u2013{min(start + self.per_page, len(self.samples))}"
             f"/{len(self.samples)}  |  "
-            f"Page CER: {mean_cer:.1%}  |  Page conf: {mean_conf:.1%}  |  "
+            f"{cer_txt}Page conf: {mean_conf:.1%}  |  "
             f"confiance: rouge=faible \u2192 vert=haute"
         )
         self.fig.suptitle(title, fontsize=12, fontweight="bold")
