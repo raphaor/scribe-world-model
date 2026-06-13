@@ -245,32 +245,40 @@ def evaluate_cer(
     # When using multiprocessing beam search, collect all logits first,
     # then decode in one pool call (avoids recreating Pool per batch).
     if use_beam and num_workers > 1:
-        all_logits = []
-        all_lengths = []
-        all_raw_texts = []
+        from beam_decode import _init_worker, _worker_decode, _beam_search_single
+        import multiprocessing as mp
+
+        # Gather per-sample tasks: (seq_array, length, raw_text)
+        tasks = []
+        all_gts = []
         with torch.no_grad():
-            for bi, batch in enumerate(loader if max_samples is None else eval_loader):
+            for bi, batch in enumerate(eval_loader):
                 img_seqs, targets, input_lengths, target_lengths, raw_texts = batch
                 img_seqs = img_seqs.to(device, non_blocking=True)
                 with torch.amp.autocast("cuda", enabled=use_amp):
                     _, _, ctc_logits = model(
                         img_seqs, input_lengths=input_lengths.to(device)
                     )
-                all_logits.append(ctc_logits.cpu())
-                all_lengths.append(input_lengths.clone())
-                all_raw_texts.extend(raw_texts)
+                ctc_logits = ctc_logits.cpu().float().numpy()
+                for b in range(len(raw_texts)):
+                    L = int(input_lengths[b])
+                    tasks.append((ctc_logits[b, :L, :], raw_texts[b]))
 
-        import torch as _torch
-        all_logits_cat = _torch.cat(all_logits, dim=0)
-        all_lengths_cat = _torch.cat(all_lengths, dim=0)
+        print(f"  Decoding {len(tasks)} samples with {num_workers} workers...", flush=True)
 
-        decoded = ctc_beam_search_decode(
-            all_logits_cat, all_lengths_cat, idx_to_char,
-            lm=lm, beam_width=beam_width, lm_weight=lm_weight,
-            num_workers=num_workers,
-        )
-        all_preds = decoded
-        all_gts = all_raw_texts
+        # Setup worker globals
+        n_chars = tasks[0][0].shape[-1]
+        chars = [idx_to_char.get(i, "") for i in range(n_chars)]
+        n_procs = min(num_workers, len(tasks))
+        chunksize = max(1, len(tasks) // (n_procs * 4))
+
+        with mp.Pool(
+            n_procs,
+            initializer=_init_worker,
+            initargs=(lm, chars, beam_width, lm_weight, 15, 0),
+        ) as pool:
+            all_preds = pool.map(_worker_decode, tasks, chunksize=chunksize)
+        all_gts = [t[1] for t in tasks]
 
     else:
         num_batches = len(eval_loader)

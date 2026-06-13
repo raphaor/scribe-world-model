@@ -236,6 +236,15 @@ def _worker_single(args):
     )
 
 
+def _worker_decode(args):
+    """Decode one sample — takes (seq_array, raw_text), returns decoded string."""
+    seq, _text = args
+    bw, lmw, ptk, bid = _w_params
+    return _beam_search_single(
+        seq, _w_chars, _w_lm, bw, lmw, ptk, bid
+    )
+
+
 def _decode_parallel(
     log_probs_np, lengths, chars, lm,
     beam_width, lm_weight, prune_topk, blank_id, num_workers,
