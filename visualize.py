@@ -175,12 +175,16 @@ def _load_alto_file(args):
     return model, dataset, collate, idx_to_char, device, spec
 
 
-def _predict_all(model, eval_ds, collate, idx_to_char, device, spec):
+def _predict_all(model, eval_ds, collate, idx_to_char, device, spec,
+                 use_beam=False, lm=None, beam_width=20, lm_weight=0.3):
     """Forward pass sur tout le split, retourne (images, gt, pred, cer) par echantillon.
 
     Les images sont extraites directement du tensor du batch (apres collate),
     ce qui garantit l'alignement 1:1 avec les predictions meme si le collate
     a filtre des echantillons (OOV, CTC impossible).
+
+    Si use_beam=True, lance aussi un CTC prefix beam search (optionnellement
+    biaise par un n-gram LM) et stocke le resultat dans chaque sample.
     """
     loader = DataLoader(
         eval_ds,
@@ -192,6 +196,7 @@ def _predict_all(model, eval_ds, collate, idx_to_char, device, spec):
     width_stride = spec.cnn_width_stride
 
     samples = []
+    beam_texts = []  # populated per-batch when use_beam=True
 
     with torch.no_grad():
         for batch in loader:
@@ -207,6 +212,13 @@ def _predict_all(model, eval_ds, collate, idx_to_char, device, spec):
             decoded = ctc_greedy_decode_conf(
                 ctc_logits.cpu().float(), input_lengths_cpu, idx_to_char
             )
+
+            if use_beam:
+                from beam_decode import ctc_beam_search_decode
+                beam_texts = ctc_beam_search_decode(
+                    ctc_logits.cpu(), input_lengths_cpu, idx_to_char,
+                    lm=lm, beam_width=beam_width, lm_weight=lm_weight,
+                )
 
             img_seqs_cpu = img_seqs.cpu()
             for i, (dec, gt) in enumerate(zip(decoded, raw_texts)):
@@ -228,6 +240,11 @@ def _predict_all(model, eval_ds, collate, idx_to_char, device, spec):
                     "frame_conf": dec["frame_conf"],
                     "line_conf": dec["line_conf"],
                     "wrong": wrong,
+                    "beam": beam_texts[i] if use_beam else None,
+                    "beam_cer": (
+                        levenshtein(beam_texts[i], gt) / gt_len
+                        if use_beam else None
+                    ),
                 })
 
     torch.cuda.empty_cache()
@@ -266,14 +283,16 @@ def _conf_color(conf):
 class _Viewer:
     """Navigateur matplotlib page par page."""
 
-    def __init__(self, samples, per_page=_PER_PAGE):
+    def __init__(self, samples, per_page=_PER_PAGE, has_beam=False):
         self.samples = samples
         self.per_page = per_page
+        self.has_beam = has_beam
         self.page = 0
         self.total_pages = max(1, -(-len(samples) // per_page))
 
+        fig_h = per_page * 3.3 if has_beam else per_page * 2.9
         self.fig, self.axes = plt.subplots(
-            per_page, 1, figsize=(16, per_page * 2.9)
+            per_page, 1, figsize=(16, fig_h)
         )
         if per_page == 1:
             self.axes = [self.axes]
@@ -372,6 +391,12 @@ class _Viewer:
                     fontsize=_FONTSIZE, color=gt_color, fontfamily="monospace",
                     va="top", ha="left", clip_on=False)
             self._draw_pred_line(ax, -0.27, s, _FONTSIZE)
+
+            if s.get("beam") is not None:
+                beam_color = "#2e7d32" if s["beam_cer"] == 0.0 else "#c62828"
+                ax.text(0.0, -0.47, f"BEAM: {s['beam']}", transform=ax.transAxes,
+                        fontsize=_FONTSIZE, color=beam_color, fontfamily="monospace",
+                        va="top", ha="left", clip_on=False)
 
         self.fig.canvas.draw_idle()
 
@@ -484,7 +509,29 @@ if __name__ == "__main__":
         "--min-frames-per-char", type=float, default=0.0,
         help="Doit correspondre a la valeur utilisee a l'entrainement (default: 0.0)",
     )
+    parser.add_argument(
+        "--beam-search", action="store_true",
+        help="Activer le CTC beam search (en plus du greedy).",
+    )
+    parser.add_argument(
+        "--lm-path", default=None,
+        help="Chemin vers un n-gram LM (.pkl) pour biaiser le beam search.",
+    )
+    parser.add_argument(
+        "--beam-width", type=int, default=20,
+        help="Largeur du beam (default: 20).",
+    )
+    parser.add_argument(
+        "--lm-weight", type=float, default=0.3,
+        help="Poids du LM dans le score du beam (default: 0.3).",
+    )
     args = parser.parse_args()
+
+    lm = None
+    if args.lm_path:
+        from beam_decode import CharNgramLM
+        lm = CharNgramLM(args.lm_path)
+        print(f"Loaded n-gram LM (order {lm.order}) from {args.lm_path}")
 
     if args.alto_file:
         model, eval_ds, collate, idx_to_char, device, spec = _load_alto_file(args)
@@ -493,7 +540,11 @@ if __name__ == "__main__":
         model, eval_ds, collate, idx_to_char, device, spec = _load_val_split(args)
 
     print("Running predictions...")
-    samples = _predict_all(model, eval_ds, collate, idx_to_char, device, spec)
+    samples = _predict_all(
+        model, eval_ds, collate, idx_to_char, device, spec,
+        use_beam=args.beam_search, lm=lm,
+        beam_width=args.beam_width, lm_weight=args.lm_weight,
+    )
     print(f"Collected {len(samples)} predictions")
 
     samples = _select_samples(samples, args)
@@ -501,6 +552,9 @@ if __name__ == "__main__":
 
     overall_cer = sum(s["cer"] for s in samples) / max(len(samples), 1)
     print(f"Subset CER: {overall_cer:.1%}")
+    if args.beam_search:
+        beam_cer = sum(s["beam_cer"] for s in samples) / max(len(samples), 1)
+        print(f"Subset beam CER: {beam_cer:.1%} (greedy: {overall_cer:.1%})")
 
-    viewer = _Viewer(samples)
+    viewer = _Viewer(samples, has_beam=args.beam_search)
     viewer.show()
