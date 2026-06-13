@@ -389,7 +389,7 @@ def _predict_all(model, eval_ds, collate, idx_to_char, device, spec,
                 else:
                     gt_len = 1
                     cer = None
-                    wrong = []
+                    wrong = [False] * len(pred)
 
                 real_w = input_lengths_cpu[i].item() * width_stride
                 img_t = img_seqs_cpu[i, :, :real_w]
