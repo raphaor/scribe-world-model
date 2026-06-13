@@ -196,10 +196,23 @@ def _load_alto_file(args):
     print(f"Total: {len(dataset)} lines from {len(xml_files)} file(s)")
 
     if keep_empty:
+        # Mode --no-gt : tout passer, pas de split
+        eval_ds = dataset
         collate = _collate_no_gt_fn
     else:
+        # Même split seedé que _load_val_split (80/20, seed 42)
+        split = getattr(args, "split", "val")
+        train_size = int(0.8 * len(dataset))
+        val_size = len(dataset) - train_size
+        train_ds, val_ds = random_split(
+            dataset,
+            [train_size, val_size],
+            generator=torch.Generator().manual_seed(42),
+        )
+        eval_ds = val_ds if split == "val" else train_ds
+        print(f"Split: {split} ({len(eval_ds)} lines of {len(dataset)})")
         collate = _build_collate(spec, char_to_idx)
-    return model, dataset, collate, idx_to_char, device, spec
+    return model, eval_ds, collate, idx_to_char, device, spec
 
 
 def _predict_all(model, eval_ds, collate, idx_to_char, device, spec,
