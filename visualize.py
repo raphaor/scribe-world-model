@@ -63,6 +63,23 @@ class _DirectDataset(Dataset):
         img = 1.0 - img
         return img, text
 
+    def filter_unlearnable(self, char_to_idx, width_stride=8, min_frames_per_char=1.0):
+        """Identique à AltoLineDataset.filter_unlearnable."""
+        import unicodedata as _ud
+        kept = []
+        for arr, text in self.samples:
+            encoded_len = sum(
+                1 for c in _ud.normalize("NFD", text) if c in char_to_idx
+            )
+            if encoded_len == 0:
+                continue
+            frames = arr.shape[1] // width_stride
+            if frames >= min_frames_per_char * encoded_len:
+                kept.append((arr, text))
+        removed = len(self.samples) - len(kept)
+        self.samples = kept
+        return removed, len(kept)
+
 
 def _load_model(args, device):
     """Charge le checkpoint, construit le modele, retourne (model, char_to_idx, idx_to_char, spec, saved_config)."""
@@ -195,16 +212,28 @@ def _load_alto_file(args):
     print(f"Total: {len(all_samples)} lines from {len(xml_files)} file(s)")
 
     split = getattr(args, "split", "val")
+    mfc = getattr(args, "min_frames_per_char", 0.0)
+    width_stride = spec.cnn_width_stride
 
     if keep_empty:
         # Mode --no-gt : exclure le split d'entraînement des lignes AVEC GT.
         # Les lignes sans GT n'ont jamais été vues à l'entraînement, donc
         # toutes sont affichées. On splitte les lignes GT avec le même seed 42
         # que _load_val_split / train.py pour cohérence.
-        gt_idx = [i for i, (_, t) in enumerate(all_samples) if t and t.strip()]
-        no_gt_idx = [i for i, (_, t) in enumerate(all_samples) if not t or not t.strip()]
-        n_gt = len(gt_idx)
+        gt_samples = [(a, t) for a, t in all_samples if t and t.strip()]
+        no_gt_samples = [(a, t) for a, t in all_samples if not t or not t.strip()]
+        n_gt_total = len(gt_samples)
 
+        # Appliquer filter_unlearnable sur les lignes GT AVANT le split
+        # pour reproduire exactement la partition de train.py
+        if mfc > 0.0 and gt_samples:
+            gt_ds = _DirectDataset(gt_samples, img_h)
+            removed, kept = gt_ds.filter_unlearnable(
+                char_to_idx, width_stride=width_stride, min_frames_per_char=mfc)
+            gt_samples = gt_ds.samples
+            print(f"  Filtered {removed} unlearnable GT lines; {kept} GT remain")
+
+        n_gt = len(gt_samples)
         if n_gt > 0:
             train_size = int(0.8 * n_gt)
             val_size = n_gt - train_size
@@ -212,23 +241,32 @@ def _load_alto_file(args):
                 range(n_gt), [train_size, val_size],
                 generator=torch.Generator().manual_seed(42),
             )
-            val_gt_idx = [gt_idx[i] for i in val_split.indices]
+            if split == "val":
+                shown = [gt_samples[i] for i in val_split.indices] + no_gt_samples
+            else:
+                shown = gt_samples + no_gt_samples
         else:
-            val_gt_idx = []
+            shown = no_gt_samples
 
-        if split == "val":
-            shown_idx = sorted(val_gt_idx + no_gt_idx)
-        else:
-            shown_idx = sorted(gt_idx + no_gt_idx)
-        shown = [all_samples[i] for i in shown_idx]
         eval_ds = _DirectDataset(shown, img_h)
-        print(f"  --no-gt: {len(no_gt_idx)} unannotated + "
-              f"{len(val_gt_idx) if split == 'val' else n_gt} {split} GT "
+        if split == "val":
+            n_val_gt = len(val_split.indices) if n_gt > 0 else 0
+        else:
+            n_val_gt = n_gt
+        print(f"  --no-gt: {len(no_gt_samples)} unannotated + "
+              f"{n_val_gt} {split} GT "
               f"= {len(shown)} shown")
         collate = _collate_no_gt_fn
     else:
         # Même split seedé que _load_val_split (80/20, seed 42)
         dataset = _DirectDataset(all_samples, img_h)
+
+        # Appliquer filter_unlearnable AVANT le split (comme train.py)
+        if mfc > 0.0:
+            removed, kept = dataset.filter_unlearnable(
+                char_to_idx, width_stride=width_stride, min_frames_per_char=mfc)
+            print(f"  Filtered {removed} unlearnable lines; {kept} remain")
+
         train_size = int(0.8 * len(dataset))
         val_size = len(dataset) - train_size
         train_ds, val_ds = random_split(
