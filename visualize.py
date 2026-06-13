@@ -435,8 +435,10 @@ class _Viewer:
 
             if s.get("beam") is not None:
                 beam_color = "#2e7d32" if s["beam_cer"] == 0.0 else "#c62828"
-                ax.text(0.0, -0.47, f"BEAM: {s['beam']}", transform=ax.transAxes,
-                        fontsize=_FONTSIZE, color=beam_color, fontfamily="monospace",
+                ax.text(0.0, -0.47,
+                        f"BEAM: {s['beam']}   (CER {s['beam_cer']:.0%})",
+                        transform=ax.transAxes, fontsize=_FONTSIZE,
+                        color=beam_color, fontfamily="monospace",
                         va="top", ha="left", clip_on=False)
 
         self.fig.canvas.draw_idle()
