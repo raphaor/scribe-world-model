@@ -25,12 +25,21 @@ import hashlib
 import numpy as np
 import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import partial
 
 
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache_alto")
 
 
-def _parse_page(args):
+def _parse_page(args, return_meta=False):
+    """Parse une page ALTO en (samples, chars) ou (samples, chars, metas).
+
+    Args:
+        args: tuple (xml_path, img_height, max_width[, keep_empty]).
+        return_meta: si True, retourne aussi une liste de dicts
+            ``{"line_id": ..., "xml_path": ...}`` parallèle à ``samples``,
+            pour permettre le mapping des prédictions vers les éléments XML.
+    """
     if len(args) == 4:
         xml_path, img_height, max_width, keep_empty = args
     else:
@@ -38,14 +47,14 @@ def _parse_page(args):
         keep_empty = False
     jpg_path = xml_path.replace(".xml", ".jpg")
     if not os.path.exists(jpg_path):
-        return [], set()
+        return ([], set(), []) if return_meta else ([], set())
 
     try:
         page = XMLPage(xml_path, filetype="alto")
         seg = page.to_container()
         pil_img = Image.open(jpg_path)
     except Exception:
-        return [], set()
+        return ([], set(), []) if return_meta else ([], set())
 
     gen = extract_polygons(pil_img, seg)
     all_lines = []
@@ -58,6 +67,7 @@ def _parse_page(args):
             continue
 
     samples = []
+    metas = []
     chars = set()
     for line_img, line_obj in all_lines:
         text = ""
@@ -83,7 +93,14 @@ def _parse_page(args):
         arr = np.array(line_img.convert("L"), dtype=np.uint8)
         samples.append((arr, text))
         chars.update(text)
+        if return_meta:
+            metas.append({
+                "line_id": getattr(line_obj, "id", None),
+                "xml_path": xml_path,
+            })
 
+    if return_meta:
+        return samples, chars, metas
     return samples, chars
 
 
@@ -105,15 +122,19 @@ def _cache_key(alto_dirs, img_height, max_width):
 class AltoLineDataset(Dataset):
     def __init__(
         self, alto_dirs, img_height=48, max_width=2000, augment=False,
-        max_workers=4, keep_empty=False
+        max_workers=4, keep_empty=False, track_meta=False
     ):
         self.samples = []
         self.img_height = img_height
         self.augment = augment
         self.chars = set()
+        self.track_meta = track_meta
+        self.line_meta = None
 
         os.makedirs(CACHE_DIR, exist_ok=True)
         key = _cache_key(alto_dirs, img_height, max_width)
+        if track_meta:
+            key += "_meta"
         cache_path = os.path.join(CACHE_DIR, f"dataset_{key}.pkl")
 
         if not keep_empty and os.path.exists(cache_path):
@@ -122,6 +143,8 @@ class AltoLineDataset(Dataset):
                 cached = pickle.load(f)
             self.samples = cached["samples"]
             self.chars = cached["chars"]
+            if track_meta:
+                self.line_meta = cached.get("line_meta")
             print(f"Loaded {len(self.samples)} lines (from cache)")
             return
 
@@ -132,24 +155,25 @@ class AltoLineDataset(Dataset):
                     continue
                 xml_files.append(xml_path)
 
-        tasks = [(xml_path, img_height, max_width) for xml_path in xml_files]
-
-        # Parse in parallel but reassemble in deterministic task order.
-        # as_completed yields by completion time, so extending samples
-        # directly would make the list order — and hence the seeded
-        # random_split train/val partition — depend on thread timing.
-        # Index the results to keep the split a pure function of the data.
         tasks = [(xml_path, img_height, max_width, keep_empty) for xml_path in xml_files]
+        parse_fn = partial(_parse_page, return_meta=True) if track_meta else _parse_page
         results = [None] * len(tasks)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(_parse_page, t): i for i, t in enumerate(tasks)}
+            futures = {executor.submit(parse_fn, t): i for i, t in enumerate(tasks)}
             done = 0
             for future in as_completed(futures):
                 done += 1
                 results[futures[future]] = future.result()
                 sys.stdout.write(f"\r  Parsing pages: {done}/{len(tasks)}")
                 sys.stdout.flush()
-        for page_samples, page_chars in results:
+        if track_meta:
+            self.line_meta = []
+        for result in results:
+            if track_meta:
+                page_samples, page_chars, page_metas = result
+                self.line_meta.extend(page_metas)
+            else:
+                page_samples, page_chars = result
             self.samples.extend(page_samples)
             self.chars.update(page_chars)
 
@@ -157,8 +181,11 @@ class AltoLineDataset(Dataset):
         print(f"Loaded {len(self.samples)} lines from {len(alto_dirs)} dirs")
 
         if not keep_empty:
+            cache_data = {"samples": self.samples, "chars": self.chars}
+            if track_meta:
+                cache_data["line_meta"] = self.line_meta
             with open(cache_path, "wb") as f:
-                pickle.dump({"samples": self.samples, "chars": self.chars}, f)
+                pickle.dump(cache_data, f)
             print(f"Cache saved to {cache_path}")
 
     def get_alphabet(self):
