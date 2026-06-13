@@ -60,14 +60,14 @@ def _parse_page(args):
     samples = []
     chars = set()
     for line_img, line_obj in all_lines:
+        text = ""
         try:
-            text = line_obj.text
-        except (ValueError, RuntimeError):
-            continue
-        if not text or not text.strip():
+            text = line_obj.text or ""
+            if not text.strip() and not keep_empty:
+                continue
+        except (ValueError, RuntimeError, AttributeError, TypeError):
             if not keep_empty:
                 continue
-            text = ""
 
         w, h = line_img.size
         if w == 0 or h == 0:
