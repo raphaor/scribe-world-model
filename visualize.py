@@ -430,7 +430,8 @@ class _Viewer:
             ax.text(0.0, -0.07, f"GT:   {s['gt']}", transform=ax.transAxes,
                     fontsize=_FONTSIZE, color=gt_color, fontfamily="monospace",
                     va="top", ha="left", clip_on=False)
-            self._draw_pred_line(ax, -0.27, s, _FONTSIZE)
+            self._draw_pred_line(ax, -0.27, s, _FONTSIZE,
+                                 show_errors=not self.has_beam)
 
             if s.get("beam") is not None:
                 beam_color = "#2e7d32" if s["beam_cer"] == 0.0 else "#c62828"
@@ -440,9 +441,11 @@ class _Viewer:
 
         self.fig.canvas.draw_idle()
 
-    def _draw_pred_line(self, ax, y_ax, s, fontsize):
+    def _draw_pred_line(self, ax, y_ax, s, fontsize, show_errors=True):
         """Affiche la ligne PRED : chaque caractere colore selon sa confiance,
         les caracteres faux (vs GT) soulignes en rouge, et un score de ligne.
+        Si show_errors=False, le soulignement est desactive (utile quand le
+        beam search offre sa propre comparaison GT vs BEAM).
 
         Chaque lettre est avancee en POINTS depuis le bord gauche de l'axe via
         offset_copy(..., units='points', fig=...), qui recalcule l'offset au
@@ -476,7 +479,7 @@ class _Viewer:
             ax.text(0.0, y_ax, ch, transform=tr, color=_conf_color(conf),
                     fontfamily="monospace", fontsize=fontsize, va="top", ha="left",
                     clip_on=False)
-            if wr:
+            if show_errors and wr:
                 ln = Line2D([0.0, adv_frac], [y_ul, y_ul], transform=tr,
                             color="#d50000", lw=1.6, clip_on=False,
                             solid_capstyle="butt")
