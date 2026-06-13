@@ -202,7 +202,11 @@ def _show_fixed_samples(model, loader, device, idx_to_char, use_amp):
         print(f"        PRED: {_safe_print(pred)}")
 
 
-def evaluate_cer(model, loader, device, idx_to_char, max_samples=None, verbose=True):
+def evaluate_cer(
+    model, loader, device, idx_to_char,
+    max_samples=None, verbose=True,
+    use_beam=False, lm=None, beam_width=20, lm_weight=0.3,
+):
     """
     Run CTC evaluation on a DataLoader.
 
@@ -212,6 +216,9 @@ def evaluate_cer(model, loader, device, idx_to_char, max_samples=None, verbose=T
     iterates shortest-first, so loader order would make the CER a sample
     of the easiest (shortest) lines — optimistically biased and not
     representative. The seeded subset is also stable epoch-to-epoch.
+
+    If use_beam=True, CTC prefix beam search is used instead of greedy.
+    A loaded CharNgramLM can be passed as *lm* to bias the beam search.
     """
     model.eval()
     use_amp = device.type == "cuda"
@@ -228,10 +235,14 @@ def evaluate_cer(model, loader, device, idx_to_char, max_samples=None, verbose=T
     else:
         eval_loader = loader  # full pass — loader order is irrelevant
 
+    if use_beam:
+        from beam_decode import ctc_beam_search_decode
+
     all_preds = []
     all_gts = []
+    num_batches = len(eval_loader)
     with torch.no_grad():
-        for batch in eval_loader:
+        for bi, batch in enumerate(eval_loader):
             img_seqs, targets, input_lengths, target_lengths, raw_texts = batch
             img_seqs = img_seqs.to(device, non_blocking=True)
             input_lengths_cpu = input_lengths.clone()
@@ -241,9 +252,21 @@ def evaluate_cer(model, loader, device, idx_to_char, max_samples=None, verbose=T
                     img_seqs, input_lengths=input_lengths.to(device)
                 )
 
-            decoded = ctc_greedy_decode(
-                ctc_logits.cpu(), input_lengths_cpu, idx_to_char
-            )
+            if use_beam:
+                decoded = ctc_beam_search_decode(
+                    ctc_logits.cpu(),
+                    input_lengths_cpu,
+                    idx_to_char,
+                    lm=lm,
+                    beam_width=beam_width,
+                    lm_weight=lm_weight,
+                )
+                if num_batches > 5 and (bi % 5 == 0 or bi == num_batches - 1):
+                    print(f"  beam: batch {bi+1}/{num_batches}", flush=True)
+            else:
+                decoded = ctc_greedy_decode(
+                    ctc_logits.cpu(), input_lengths_cpu, idx_to_char
+                )
             all_preds.extend(decoded)
             all_gts.extend(raw_texts)
 
@@ -274,6 +297,10 @@ if __name__ == "__main__":
     parser.add_argument("--model-version", choices=known_versions(), default="v5")
     parser.add_argument("--alto-dirs", nargs="+", default=config.ALTO_DIRS)
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument(
+        "--max-samples", type=int, default=None,
+        help="Evaluate on a fixed seeded random subset (faster for beam search).",
+    )
     parser.add_argument("--split", choices=["all", "val", "train"], default="val",
                         help="Which split to evaluate (default: val)")
     parser.add_argument(
@@ -283,6 +310,28 @@ if __name__ == "__main__":
         help="Must match the value used at training time: prunes the same "
         "unlearnable lines before the split so the seeded train/val "
         "partition stays identical. 0.0 = disabled (default).",
+    )
+    parser.add_argument(
+        "--beam-search", action="store_true",
+        help="Use CTC beam search instead of greedy decoding.",
+    )
+    parser.add_argument(
+        "--lm-path", default=None,
+        help="Path to a trained char n-gram .pkl (from train_lm.py). "
+        "If provided with --beam-search, biases the beam search.",
+    )
+    parser.add_argument(
+        "--beam-width", type=int, default=20,
+        help="Beam width (default: 20).",
+    )
+    parser.add_argument(
+        "--lm-weight", type=float, default=0.3,
+        help="LM interpolation weight (default: 0.3). "
+        "0 = pure CTC beam search, 1 = LM-dominated.",
+    )
+    parser.add_argument(
+        "--compare", action="store_true",
+        help="Run both greedy AND beam search, print both CERs for comparison.",
     )
     args = parser.parse_args()
 
@@ -362,5 +411,50 @@ if __name__ == "__main__":
         pin_memory=device.type == "cuda",
     )
 
-    cer = evaluate_cer(model, loader, device, idx_to_char)
-    print(f"\nCER: {cer:.1%}")
+    # --- Load LM if requested ---
+    lm = None
+    if args.lm_path:
+        from beam_decode import CharNgramLM
+        lm = CharNgramLM(args.lm_path)
+        print(
+            f"Loaded char {lm.order}-gram LM from {args.lm_path} "
+            f"({lm.total_chars:,} tokens, {lm.vocab_size} chars)"
+        )
+
+    # --- Evaluate ---
+    if args.compare:
+        print("\n=== Greedy ===")
+        cer_greedy = evaluate_cer(
+            model, loader, device, idx_to_char, verbose=False,
+            max_samples=args.max_samples,
+        )
+        print(f"Greedy CER: {cer_greedy:.1%}")
+
+        print("\n=== Beam search ===")
+        cer_beam = evaluate_cer(
+            model, loader, device, idx_to_char, verbose=False,
+            max_samples=args.max_samples,
+            use_beam=True, lm=lm,
+            beam_width=args.beam_width, lm_weight=args.lm_weight,
+        )
+        delta = cer_greedy - cer_beam
+        pct = (delta / cer_greedy * 100) if cer_greedy > 0 else 0
+        print(f"Beam CER:   {cer_beam:.1%}")
+        print(f"\nDelta: {delta:+.1%} ({pct:+.1f}% relative)")
+    elif args.beam_search:
+        mode = f"beam (w={args.beam_width}, lm_w={args.lm_weight})" if lm \
+            else f"beam (w={args.beam_width}, no LM)"
+        print(f"\nDecoding: {mode}")
+        cer = evaluate_cer(
+            model, loader, device, idx_to_char,
+            max_samples=args.max_samples,
+            use_beam=True, lm=lm,
+            beam_width=args.beam_width, lm_weight=args.lm_weight,
+        )
+        print(f"\nCER: {cer:.1%}")
+    else:
+        cer = evaluate_cer(
+            model, loader, device, idx_to_char,
+            max_samples=args.max_samples,
+        )
+        print(f"\nCER: {cer:.1%}")
