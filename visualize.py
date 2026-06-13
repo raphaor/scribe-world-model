@@ -176,7 +176,8 @@ def _load_alto_file(args):
 
 
 def _predict_all(model, eval_ds, collate, idx_to_char, device, spec,
-                 use_beam=False, lm=None, beam_width=20, lm_weight=0.3):
+                 use_beam=False, lm=None, beam_width=20, lm_weight=0.3,
+                 workers=0):
     """Forward pass sur tout le split, retourne (images, gt, pred, cer) par echantillon.
 
     Les images sont extraites directement du tensor du batch (apres collate),
@@ -185,6 +186,8 @@ def _predict_all(model, eval_ds, collate, idx_to_char, device, spec,
 
     Si use_beam=True, lance aussi un CTC prefix beam search (optionnellement
     biaise par un n-gram LM) et stocke le resultat dans chaque sample.
+    Si workers>1, le beam search utilise un Pool multiprocessing (comme
+    recognize.py) — utile sur un gros CPU pour accelerer le decode.
     """
     loader = DataLoader(
         eval_ds,
@@ -196,7 +199,7 @@ def _predict_all(model, eval_ds, collate, idx_to_char, device, spec,
     width_stride = spec.cnn_width_stride
 
     samples = []
-    beam_texts = []  # populated per-batch when use_beam=True
+    beam_tasks = []  # (seq_np, raw_text) collected for pool decode
 
     with torch.no_grad():
         for batch in loader:
@@ -213,12 +216,21 @@ def _predict_all(model, eval_ds, collate, idx_to_char, device, spec,
                 ctc_logits.cpu().float(), input_lengths_cpu, idx_to_char
             )
 
+            # Beam decode: inline (single or small batch) or deferred to pool
+            beam_texts = None
             if use_beam:
-                from beam_decode import ctc_beam_search_decode
-                beam_texts = ctc_beam_search_decode(
-                    ctc_logits.cpu(), input_lengths_cpu, idx_to_char,
-                    lm=lm, beam_width=beam_width, lm_weight=lm_weight,
-                )
+                if workers > 1:
+                    # Collect logits for the pool — decode after the loop
+                    logits_np = ctc_logits.cpu().float().numpy()
+                    for b in range(len(raw_texts)):
+                        L = int(input_lengths_cpu[b])
+                        beam_tasks.append((logits_np[b, :L, :], raw_texts[b]))
+                else:
+                    from beam_decode import ctc_beam_search_decode
+                    beam_texts = ctc_beam_search_decode(
+                        ctc_logits.cpu(), input_lengths_cpu, idx_to_char,
+                        lm=lm, beam_width=beam_width, lm_weight=lm_weight,
+                    )
 
             img_seqs_cpu = img_seqs.cpu()
             for i, (dec, gt) in enumerate(zip(decoded, raw_texts)):
@@ -231,6 +243,13 @@ def _predict_all(model, eval_ds, collate, idx_to_char, device, spec,
                 img_t = img_seqs_cpu[i, :, :real_w]
                 img_arr = ((1.0 - img_t) * 255).numpy().astype("uint8")
 
+                if use_beam and beam_texts is not None:
+                    bt = beam_texts[i]
+                    beam_cer = levenshtein(bt, gt) / gt_len
+                else:
+                    bt = None
+                    beam_cer = None
+
                 samples.append({
                     "image": img_arr,
                     "gt": gt,
@@ -240,12 +259,33 @@ def _predict_all(model, eval_ds, collate, idx_to_char, device, spec,
                     "frame_conf": dec["frame_conf"],
                     "line_conf": dec["line_conf"],
                     "wrong": wrong,
-                    "beam": beam_texts[i] if use_beam else None,
-                    "beam_cer": (
-                        levenshtein(beam_texts[i], gt) / gt_len
-                        if use_beam else None
-                    ),
+                    "beam": bt,
+                    "beam_cer": beam_cer,
                 })
+
+    # Multiprocessing beam decode (all logits collected, decode in one pool)
+    if use_beam and workers > 1 and beam_tasks:
+        from beam_decode import _init_worker, _worker_decode
+        import multiprocessing as mp
+
+        n_chars = beam_tasks[0][0].shape[-1]
+        chars = [idx_to_char.get(i, "") for i in range(n_chars)]
+        n_procs = min(workers, len(beam_tasks))
+        chunksize = max(1, len(beam_tasks) // (n_procs * 4))
+
+        print(f"  Beam decoding {len(beam_tasks)} samples with {n_procs} workers...",
+              flush=True)
+        with mp.Pool(
+            n_procs,
+            initializer=_init_worker,
+            initargs=(lm, chars, beam_width, lm_weight, 15, 0),
+        ) as pool:
+            beam_results = pool.map(_worker_decode, beam_tasks, chunksize=chunksize)
+
+        # Assign beam results back to samples (order preserved)
+        for s, bt in zip(samples, beam_results):
+            s["beam"] = bt
+            s["beam_cer"] = levenshtein(bt, s["gt"]) / max(len(s["gt"]), 1)
 
     torch.cuda.empty_cache()
     return samples
@@ -525,6 +565,11 @@ if __name__ == "__main__":
         "--lm-weight", type=float, default=0.3,
         help="Poids du LM dans le score du beam (default: 0.3).",
     )
+    parser.add_argument(
+        "--workers", type=int, default=0,
+        help="Worker processes pour le beam search (0=sequentiel). "
+             "Au-dela de 1, utilise un Pool multiprocessing comme recognize.py.",
+    )
     args = parser.parse_args()
 
     lm = None
@@ -544,6 +589,7 @@ if __name__ == "__main__":
         model, eval_ds, collate, idx_to_char, device, spec,
         use_beam=args.beam_search, lm=lm,
         beam_width=args.beam_width, lm_weight=args.lm_weight,
+        workers=args.workers,
     )
     print(f"Collected {len(samples)} predictions")
 
