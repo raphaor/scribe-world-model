@@ -855,7 +855,7 @@ REGISTRY: dict[str, ModelSpec] = {
         collate_style="v5",
         save_path="hwm_v18.pt",
         force_no_amp=True,
-        force_encoder_lr_mult=1.0,
+        force_encoder_lr_mult=None,
         builder=_build_v18,
     ),
 }

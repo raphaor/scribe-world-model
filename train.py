@@ -237,39 +237,60 @@ def _set_encoder_frozen(model, frozen):
         "jepa_predictor",
         "proj_head",
         "context_transformer",
-        "lstm_layers",      # v15 (LectaurepClone)
-        "lstm_dropouts",    # v15 (LectaurepClone)
+        "cnn_to_jepa",
+        "target_proj",
+        "style_proj",
+        "lstm_layers",
+        "lstm_dropouts",
     ):
         sub = getattr(model, name, None)
-        if sub is not None:
+        if sub is not None and hasattr(sub, "parameters"):
             for p in sub.parameters():
                 p.requires_grad_(not frozen)
 
 
 def _build_param_groups(model, lr, encoder_lr_mult):
     """
-    Discriminative LR: the trunk (encoder + SSL modules) is typically
-    pretrained and moves at a fraction of the base LR. The CTC head is
-    fresh after a phase switch and uses the full LR.
+    Discriminative LR with three groups:
 
-    ``SSL modules`` covers the predictor (v5-v7), the MAE decoder (v8),
-    cross-attn predictor (v7), and the projection head (v6/v7). We
-    collect whichever attributes exist on the model.
+    - **trunk**: pretrained CNN encoder + BiLSTM. Gets ``lr * encoder_lr_mult``
+      (lower LR for fine-tuning).
+    - **jepa**: SSL / JEPA modules that are often from-scratch (predictor,
+      jepa_predictor, cnn_to_jepa, target_proj, mask_pixel, etc.). Gets the
+      full ``lr`` so new layers converge at full speed.
+    - **head**: CTC head. Gets the full ``lr``.
     """
     trunk_params = list(model.encoder.parameters())
+    for name in (
+        "lstm_layers",
+        "lstm_dropouts",
+    ):
+        sub = getattr(model, name, None)
+        if sub is not None:
+            trunk_params.extend(list(sub.parameters()))
+
+    jepa_params = []
     for name in (
         "predictor",
         "decoder",
         "jepa_predictor",
         "proj_head",
         "context_transformer",
-        "lstm_layers",      # v15 (LectaurepClone)
-        "lstm_dropouts",    # v15 (LectaurepClone)
+        "cnn_to_jepa",
+        "target_proj",
+        "style_proj",
     ):
         sub = getattr(model, name, None)
-        if sub is not None:
-            trunk_params.extend(list(sub.parameters()))
+        if sub is not None and hasattr(sub, "parameters"):
+            jepa_params.extend(list(sub.parameters()))
+    for pname in ("mask_pixel",):
+        p = getattr(model, pname, None)
+        if isinstance(p, torch.nn.Parameter):
+            jepa_params.append(p)
+
     groups = [{"params": trunk_params, "lr": lr * encoder_lr_mult, "name": "trunk"}]
+    if jepa_params:
+        groups.append({"params": jepa_params, "lr": lr, "name": "jepa"})
     if model.ctc_head is not None:
         groups.append(
             {"params": list(model.ctc_head.parameters()), "lr": lr, "name": "head"}
