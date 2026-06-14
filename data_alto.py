@@ -352,7 +352,7 @@ class UnannotatedLineDataset(Dataset):
                 if os.path.basename(p) != "METS.xml"
             )
 
-        tasks = [(xml_path, img_height, max_width) for xml_path in xml_files]
+        tasks = [(xml_path, img_height, max_width, True) for xml_path in xml_files]
 
         # Deterministic task-order reassembly (see AltoLineDataset).
         results = [None] * len(tasks)
