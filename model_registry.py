@@ -693,6 +693,9 @@ def _build_v18(args, num_classes):
         f"v18 config: use_pretext={use_pretext} lambda_jepa={lambda_jepa} "
         f"lambda_sigreg={lambda_sigreg_v18} lambda_ctc={config.LAMBDA_CTC_V18} "
         f"jepa_dim={config.JEPA_DIM_V18} (Linear 960->{config.JEPA_DIM_V18}, no LN) | "
+        f"jepa_predictor: {config.JEPA_PRED_NUM_LAYERS_V18}L Transformer("
+        f"{config.JEPA_PRED_NUM_HEADS_V18}h, ff={config.JEPA_PRED_DIM_FF_V18}, "
+        f"drop={config.JEPA_PRED_DROPOUT_V18}) | "
         f"lstm: {config.NUM_LSTM_V18}×BiLSTM({config.LSTM_HIDDEN_V18}) "
         f"drop_mid={config.LSTM_DROPOUT_MID_V18} "
         f"drop_last={config.LSTM_DROPOUT_LAST_V18} | "
@@ -724,6 +727,10 @@ def _build_v18(args, num_classes):
         supcon_temp=config.SUPCON_TEMP_V18,
         use_pretext=use_pretext,
         use_writer_contrastive=config.USE_WRITER_CONTRASTIVE_V18,
+        jepa_pred_num_layers=config.JEPA_PRED_NUM_LAYERS_V18,
+        jepa_pred_num_heads=config.JEPA_PRED_NUM_HEADS_V18,
+        jepa_pred_dim_ff=config.JEPA_PRED_DIM_FF_V18,
+        jepa_pred_dropout=config.JEPA_PRED_DROPOUT_V18,
     )
 
 

@@ -635,6 +635,15 @@ JEPA_MAX_SIZE_V18 = 20
 PROJ_DIM_V18 = 128
 PROJ_HIDDEN_V18 = 256
 
+# Transformer predictor asymetrique (remplace le MLP symetrique jepa_proj).
+# Le predicteur recoit la sequence complete de features masquees, remplace
+# les positions cibles par un mask token, et attend le contexte temporel
+# pour predire. La cible utilise target_proj (Linear separe).
+JEPA_PRED_NUM_LAYERS_V18 = 2
+JEPA_PRED_NUM_HEADS_V18 = 4
+JEPA_PRED_DIM_FF_V18 = 1536
+JEPA_PRED_DROPOUT_V18 = 0.1
+
 # SIGReg Epps-Pulley
 SIGREG_PROJECTIONS_V18 = 256
 SIGREG_KNOTS_V18 = 17

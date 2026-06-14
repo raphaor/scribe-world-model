@@ -20,7 +20,7 @@ from encoder import (
     ViTEncoder,
     HybridCNNViTEncoder,
 )
-from predictor import TransformerPredictor, JEPACrossAttnPredictor, MAEDecoder
+from predictor import TransformerPredictor, JEPACrossAttnPredictor, MAEDecoder, PositionalEncoding
 from loss import (
     HWMLoss,
     HybridLoss,
@@ -658,6 +658,54 @@ class HWMv17(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
+class JEPAPredictor(nn.Module):
+    """
+    Transformer predictor asymetrique pour I-JEPA (branche v18).
+
+    Remplace l'ancien jepa_proj (MLP symetrique partage entre prediction
+    et cible). Le predicteur recoit la sequence complete de features
+    derivees de l'image masquee, remplace les positions cibles par un
+    mask token apprenable, et attend a travers le contexte temporel pour
+    predire les representations cibles. La cible utilise une projection
+    separee (target_proj), ce qui rend la tache genuinely predictive.
+    """
+
+    def __init__(self, dim, num_layers, num_heads, dim_ff, dropout, proj_dim):
+        super().__init__()
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, dim))
+        nn.init.trunc_normal_(self.mask_token, std=0.02)
+        self.pos_encoder = PositionalEncoding(dim, max_len=4096, dropout=0.0)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=dim,
+            nhead=num_heads,
+            dim_feedforward=dim_ff,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.proj = nn.Linear(dim, proj_dim)
+
+    def forward(self, z_masked, frame_mask, padding_mask=None):
+        """
+        Args:
+            z_masked: (B, T, dim) features de l'image masquee (apres
+                CNN + cnn_to_jepa).
+            frame_mask: (B, T) bool, True aux positions cibles.
+            padding_mask: (B, T) bool optionnel, True aux positions de
+                padding (passe a src_key_padding_mask du Transformer).
+
+        Returns:
+            (N, proj_dim) predictions aux positions cibles uniquement.
+        """
+        mask_tok = self.mask_token.expand_as(z_masked)
+        z = torch.where(frame_mask.unsqueeze(-1), mask_tok, z_masked)
+        z = self.pos_encoder(z)
+        z = self.transformer(z, src_key_padding_mask=padding_mask)
+        z = z[frame_mask]
+        return self.proj(z)
+
+
 class HWMv18(nn.Module):
     """
     Handwriting World Model v18 — decoupled JEPA / CTC branches.
@@ -683,9 +731,11 @@ class HWMv18(nn.Module):
                   │
                   ├─► SIGReg(z_jepa_clean)   — anti-collapse on JEPA side
                   │
-                  └─► clean / masked: InfoNCE(
-                          jepa_proj(z_jepa_masked[mask]),
-                          jepa_proj(sg z_jepa_clean[mask]))
+                  └─► masked: JEPAPredictor(Transformer, asymetric)
+                          ─► z_pred
+                      clean:  target_proj(sg z_jepa_clean[mask])
+                          ─► z_target
+                      InfoNCE(z_pred, z_target)
 
     Notable choices
     ---------------
@@ -724,6 +774,10 @@ class HWMv18(nn.Module):
         supcon_temp=0.1,
         use_pretext=True,
         use_writer_contrastive=False,
+        jepa_pred_num_layers=2,
+        jepa_pred_num_heads=4,
+        jepa_pred_dim_ff=1536,
+        jepa_pred_dropout=0.1,
     ):
         super().__init__()
         self.img_height = img_height
@@ -766,12 +820,21 @@ class HWMv18(nn.Module):
             # here would prevent SIGReg's Gaussian target from being matchable.
             self.cnn_to_jepa = nn.Linear(self.cnn_out_dim, jepa_dim)
 
-            # JEPA projection head — input dim = jepa_dim (NOT BiLSTM out).
-            self.jepa_proj = nn.Sequential(
-                nn.Linear(jepa_dim, proj_hidden),
-                nn.GELU(),
-                nn.Linear(proj_hidden, proj_dim),
+            # Transformer predictor asymetrique: predit les representations
+            # masquees depuis le contexte temporel. Remplace l'ancien MLP
+            # symetrique jepa_proj qui rendait la tache triviale.
+            self.jepa_predictor = JEPAPredictor(
+                dim=jepa_dim,
+                num_layers=jepa_pred_num_layers,
+                num_heads=jepa_pred_num_heads,
+                dim_ff=jepa_pred_dim_ff,
+                dropout=jepa_pred_dropout,
+                proj_dim=proj_dim,
             )
+
+            # Projection cible separee (stop-grad): Linear simple, pas de
+            # module partage avec le predicteur.
+            self.target_proj = nn.Linear(jepa_dim, proj_dim)
 
         # Writer contrastive head (uniquement si active)
         if self.use_writer_contrastive:
@@ -951,8 +1014,9 @@ class HWMv18(nn.Module):
 
             if z_jepa_masked is not None and frame_mask is not None and z_jepa_clean is not None:
                 z_jepa_masked = z_jepa_masked.float()
-                z_pred = self.jepa_proj(z_jepa_masked[frame_mask])
-                z_target = self.jepa_proj(z_jepa_clean.detach()[frame_mask])
+                padding_mask = ~valid_mask_cnn if valid_mask_cnn is not None else None
+                z_pred = self.jepa_predictor(z_jepa_masked, frame_mask, padding_mask)
+                z_target = self.target_proj(z_jepa_clean.detach()[frame_mask])
 
             line_vec = None
             if self.use_writer_contrastive and writer_id is not None:
@@ -2910,7 +2974,7 @@ class HWMv12(nn.Module):
         ctc_hidden=192,
         ctc_num_lstm=1,
         proj_dim=128,
-        proj_hidden=192,
+        proj_hidden=256,
         jepa_num_targets=4,
         jepa_min_size=8,
         jepa_max_size=20,
