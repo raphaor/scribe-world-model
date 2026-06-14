@@ -264,7 +264,7 @@ def build():
                 "Version d'architecture du modèle."
             )
             ui.label("Split").classes("q-ml-md w-16")
-            ui.toggle_button(
+            ui.toggle(
                 {x: x for x in ["val", "train", "all"]},
                 value=form["split"],
                 on_change=on_change("split"),

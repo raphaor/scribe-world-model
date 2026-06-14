@@ -211,7 +211,7 @@ def build():
         # Mode
         with ui.row().classes("items-center q-mb-sm"):
             ui.label("Mode").classes("w-28")
-            ui.toggle_button(
+            ui.toggle(
                 {"annotate": "Annoter (sans GT)", "review": "Revoir (avec GT)"},
                 value=form["mode"],
                 on_change=on_change("mode"),
