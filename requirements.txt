@@ -7,3 +7,5 @@ numpy>=1.24.0
 pillow>=10.0.0
 scipy>=1.10.0          # data_alto._augment : deformation elastique (gaussian_filter, map_coordinates)
 kraken                 # data_alto : parsing ALTO XML + extraction des polygones de ligne (version non epinglee)
+nicegui>=3.0.0         # hwm_studio : interface web locale
+lxml>=4.9.0            # annotate.py : écriture des _gt.xml

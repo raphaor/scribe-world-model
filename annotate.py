@@ -47,8 +47,8 @@ except ImportError:
     sys.exit(1)
 
 
-PER_PAGE = 6
-_FONTSIZE = 8
+PER_PAGE = 4
+_FONTSIZE = 12
 
 
 # ─── Collate ────────────────────────────────────────────────────────────
@@ -460,7 +460,8 @@ class AnnotateViewer:
                         va="top", ha="left", clip_on=False)
                 y_off -= 0.12
 
-            ax.text(0.0, y_off, f"PRED: {pred}",
+            conf_txt = f"  (conf {s['line_conf']:.0%})" if s.get("char_confs") else ""
+            ax.text(0.0, y_off, f"PRED: {pred}{conf_txt}",
                     transform=ax.transAxes,
                     fontsize=_FONTSIZE, color="#37474f",
                     fontfamily="monospace",

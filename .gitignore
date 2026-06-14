@@ -41,3 +41,7 @@ Thumbs.db
 
 model/checkpoint_abort.ckpt
 output/lectaurep_dataset.arrow
+
+# HWM Studio (interface locale)
+hwm_studio_config.json
+.cache_alto/staging_gt_*
