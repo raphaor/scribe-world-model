@@ -655,5 +655,80 @@ SUPCON_TEMP_V18 = 0.1
 USE_WRITER_CONTRASTIVE_V18 = False
 
 
+# --- HWM-v19 : LeVJEPA (arXiv:2608.27395) transpose aux lignes manuscrites ---
+# Re-test de la regularisation JEPA+SIGReg abandonnee en v10-v18, avec la
+# recette LeVJEPA : 1 vue globale + V vues locales, invariance MSE symetrique
+# (pas de stop-gradient, pas de predicteur, pas d'EMA) + SIGReg Epps-Pulley
+# sur les embeddings [cls] du batch. lambda_sigreg = seul hyperparametre SSL.
+#
+# Chaine :
+#   image ligne (h=64, W variable)
+#     -> stem CNN Kraken 2 blocs (stride 4) -> carte (64, 16, W/4)
+#     -> patches CARRES p=16 -> T = W/64 tokens le long de x
+#     -> fenetres coulissantes de K=8 patches, stride 4 (chevauchement 50%)
+#     -> N=8 blocs transformer BLOCK-CAUSAUX (intra-fenetre bidirectionnel,
+#        inter-fenetres causal gauche->droite), RoPE le long de x
+#     -> [cls] apprenable (readout global) + LayerNorm sur les tokens
+#     -> BiLSTM(320)x2 -> CTC
+#
+# NB resolution : 1 token = 64 px (stem /4 x patch 16). La collate v5 filtre
+# les lignes non-alignables avec T = W//8 ; a cette resolution CTC voit
+# ~2xW/64 tokens valides par ligne (fenetres chevauchees) — utiliser
+# --min-frames-per-char avec le stride 64 du registry pour ecarter les
+# lignes trop courtes si besoin.
+
+IMG_HEIGHT_V19 = 64
+
+# Stem CNN : 2 blocs conv Kraken eprouves (v15-v18) -> stride 4, sortie 16
+# rangees de hauteur = PATCH_V19, d'ou des patches 16x16 carres.
+STEM_CHANNELS_V19 = 64
+PATCH_V19 = 16
+
+# Fenetres coulissantes (« frames ») : K patches consecutifs le long de x,
+# stride K/2 -> chevauchement 50% entre fenetres consecutives.
+WINDOW_PATCHES_V19 = 8      # K
+WINDOW_STRIDE_V19 = 4       # s = K/2
+
+# Encodeur transformer block-causal.
+EMBEDDING_DIM_V19 = 256     # d (192/256 selon le plan ; 256 par defaut)
+NUM_LAYERS_V19 = 8          # N (6-8 ; 8 par défaut)
+NUM_HEADS_V19 = 8           # 256/8 = 32 par tete
+FF_DIM_V19 = 1024           # 4x embedding_dim
+DROPOUT_V19 = 0.1
+MAX_PATCHES_V19 = 512       # borne RoPE (512 tokens = ~32768 px de ligne)
+
+# Projecteur h_phi (SSL uniquement, jete apres pre-entraînement) :
+# Linear(d->2048) -> BatchNorm -> GELU -> Linear(2048->K), K ~ 96-128.
+PROJ_HIDDEN_V19 = 2048
+PROJ_DIM_V19 = 128
+
+# Tete de decodage CTC : features par-token (sortie LayerNorm, PAS le [cls])
+# -> BiLSTM(320) x 2-3 -> CTC.
+LSTM_HIDDEN_V19 = 320
+NUM_LSTM_V19 = 2
+LSTM_DROPOUT_MID_V19 = 0.1
+LSTM_DROPOUT_LAST_V19 = 0.3
+
+# Poids de perte.
+LAMBDA_CTC_V19 = 1.0
+LAMBDA_INV_V19 = 1.0        # invariance MSE vue globale <- vues locales
+LAMBDA_SIGREG_V19 = 0.1     # SIGReg Epps-Pulley sur les [cls] (seul hp SSL)
+
+# Objectif SSL (phase adapt) : V vues locales = recadrage horizontal
+# + augmentation photometrique ; drop uniforme de 50% des tokens
+# (jamais le [cls], jamais le patch 0 pour garder une cle d'ancrage).
+NUM_LOCAL_VIEWS_V19 = 4
+TOKEN_DROP_V19 = 0.5
+LOCAL_CROP_MIN_V19 = 0.3    # fraction min de la largeur valide
+LOCAL_CROP_MAX_V19 = 0.6    # fraction max
+PHOTO_CONTRAST_V19 = 0.3    # +/- 30%
+PHOTO_BRIGHTNESS_V19 = 0.15 # +/- 0.15
+PHOTO_NOISE_STD_V19 = 0.05
+
+# SIGReg Epps-Pulley (identique a v12-v18).
+SIGREG_PROJECTIONS_V19 = 256
+SIGREG_KNOTS_V19 = 17
+
+
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
