@@ -792,7 +792,11 @@ def _build_v19(args, num_classes):
         lstm_dropout_mid=config.LSTM_DROPOUT_MID_V19,
         lstm_dropout_last=config.LSTM_DROPOUT_LAST_V19,
         num_local_views=config.NUM_LOCAL_VIEWS_V19,
-        token_drop=config.TOKEN_DROP_V19,
+        token_drop=(
+            args.token_drop
+            if getattr(args, "token_drop", None) is not None
+            else config.TOKEN_DROP_V19
+        ),
         local_crop_min=config.LOCAL_CROP_MIN_V19,
         local_crop_max=config.LOCAL_CROP_MAX_V19,
         photo_contrast=config.PHOTO_CONTRAST_V19,

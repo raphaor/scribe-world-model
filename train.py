@@ -681,6 +681,16 @@ if __name__ == "__main__":
         "prevent shortcuts.",
     )
     parser.add_argument(
+        "--token-drop",
+        type=float,
+        default=None,
+        help="v19 only: override the LeVJEPA SSL token-drop rate (defaults to "
+        "config.TOKEN_DROP_V19 = 0.5). Each view drops this fraction of its "
+        "patch tokens uniformly at random; the [cls] is never dropped. Tune "
+        "to balance invariance difficulty (higher drop = harder invariance, "
+        "approaching the video regime's 95%%).",
+    )
+    parser.add_argument(
         "--pred-loss",
         choices=["mse", "infonce"],
         default=None,

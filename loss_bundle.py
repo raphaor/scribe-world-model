@@ -234,7 +234,7 @@ class _V12Carrier(nn.Module):
 # =============================================================================
 # v19 bundle : LeVJEPA transpose aux lignes manuscrites.
 #   L = lambda_inv    * L_inv      (invariance MSE vue globale <- vues locales)
-#     + lambda_sigreg * SIGReg     (Epps-Pulley sur les z projetes du batch)
+#     + lambda_sigreg * SIGReg     (Epps-Pulley sur les [cls] du batch)
 #     + lambda_ctc    * CTC        (reconnaissance supervisee)
 # =============================================================================
 
@@ -260,9 +260,8 @@ def make_v19_bundle(
     Cles du contexte :
       - ``z_global``  : (B, K_proj) projection de la vue globale.
       - ``z_locals``  : liste de V tensors (B, K_proj).
-      - ``z_all``     : concat(en dim0) de z_global et des z_locals ->
-        ((V+1)*B, K_proj), entree du SIGReg (le MEME espace projete que
-        l'invariance).
+      - ``cls_emb``   : ((V+1)*B, D) embeddings [cls] BRUTS du batch
+        (toutes vues concatenees) — entree du SIGReg.
       - ``ctc_logits`` / ``targets`` / ``input_lengths`` (en TOKENS) /
         ``target_lengths`` : chemin supervise, saute sans labels.
     """
@@ -280,21 +279,10 @@ def make_v19_bundle(
         return inv, {}
 
     def _sigreg(ctx):
-        z_global = ctx.get("z_global")
-        z_locals = ctx.get("z_locals")
-        if z_global is None or not z_locals:
+        cls_emb = ctx.get("cls_emb")
+        if cls_emb is None or cls_emb.shape[0] < 2:
             return None
-        # SIGReg doit porter sur le MEME espace projete que l'invariance
-        # (z = h_phi([cls]) de toutes les vues concatenees) — c'est l'espace
-        # ou l'invariance peut s'effondrer, et proj_head lui donne une
-        # echelle plus favorable a l'Epps-Pulley. Fidele a LeVJEPA
-        # (invariance + SIGReg co-localises en espace K). Corrige le
-        # split-space (SIGReg sur [cls] bruts) qui rendait le regularisateur
-        # inerte (plateau v17 ~0.70) pendant que z s'effondrait vers ~0.
-        z_all = torch.cat([z_global] + z_locals, dim=0)  # (V+1)*B, K_proj
-        if z_all.shape[0] < 2:
-            return None
-        return carrier.sigreg(z_all), {}
+        return carrier.sigreg(cls_emb), {}
 
     def _ctc(ctx):
         ctc_logits = ctx.get("ctc_logits")
