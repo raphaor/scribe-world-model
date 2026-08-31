@@ -942,7 +942,8 @@ class LeVJEPAEncoderV19(nn.Module):
                 d'attention entierement masquee). Le [cls] n'est jamais
                 droppe.
         Returns:
-            cls_emb:   (B, D) embedding [cls] BRUT (pre-LayerNorm).
+            cls_emb:   (B, D) embedding [cls] NORMALISE (sortie LayerNorm,
+                       sur la sphere — c'est lui que proj_head projete).
             tokens:    (B, S-1, D) tokens normalises (sortie LayerNorm),
                        S-1 = F_max * K.
             token_valid: (B, S-1) bool, True = token reel (patch valide,
@@ -1053,8 +1054,12 @@ class LeVJEPAEncoderV19(nn.Module):
             for layer in self.layers:
                 tokens = layer(tokens, attn_bias, self.rope, positions)
 
-            cls_emb = tokens[:, 0]                               # (B, D) BRUT
-            tokens_norm = self.norm(tokens[:, 1:])               # (B, S_t, D)
+            # LayerNorm sur la SEQUENCE COMPLETE (incl. [cls]) : le [cls]
+            # aboutit sur la sphere — prémisse du papier LeVJEPA, le
+            # projecteur h_phi l'en sort ensuite vers R^K pour SIGReg.
+            toks_norm = self.norm(tokens)
+            cls_emb = toks_norm[:, 0]                               # (B, D) [cls] sur la sphere
+            tokens_norm = toks_norm[:, 1:]                          # (B, S_t, D)
 
         return cls_emb, tokens_norm, valid, {
             "num_frames": F_b,

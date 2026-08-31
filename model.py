@@ -1163,9 +1163,15 @@ class HWMv19(nn.Module):
 
         # --- Projecteur h_phi (SSL uniquement, jete apres pre-entraînement).
         if self.use_pretext:
+            # LayerNorm (pas BatchNorm1d) : LeVJEPA utilise la BN mais sur
+            # de gros batches video ; ici le batch effective est petit
+            # (5*vues x B) et la BN divise par la variance intra-batch —
+            # sous anti-collapse (inv qui pousse z vers l'egalite) cette
+            # variance -> 0 peut donner inf/nan. LayerNorm ne depend pas
+            # des stats du batch -> stable en adapt pur.
             self.proj_head = nn.Sequential(
                 nn.Linear(embedding_dim, proj_hidden),
-                nn.BatchNorm1d(proj_hidden),
+                nn.LayerNorm(proj_hidden),
                 nn.GELU(),
                 nn.Linear(proj_hidden, proj_dim),
             )

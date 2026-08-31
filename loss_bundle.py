@@ -260,8 +260,9 @@ def make_v19_bundle(
     Cles du contexte :
       - ``z_global``  : (B, K_proj) projection de la vue globale.
       - ``z_locals``  : liste de V tensors (B, K_proj).
-      - ``cls_emb``   : ((V+1)*B, D) embeddings [cls] BRUTS du batch
-        (toutes vues concatenees) — entree du SIGReg.
+      - ``z_all``     : concat(en dim0) de z_global et des z_locals ->
+        ((V+1)*B, K_proj), entree du SIGReg (le MEME espace K que
+        l'invariance — conforme LeVJEPA).
       - ``ctc_logits`` / ``targets`` / ``input_lengths`` (en TOKENS) /
         ``target_lengths`` : chemin supervise, saute sans labels.
     """
@@ -279,10 +280,19 @@ def make_v19_bundle(
         return inv, {}
 
     def _sigreg(ctx):
-        cls_emb = ctx.get("cls_emb")
-        if cls_emb is None or cls_emb.shape[0] < 2:
+        z_global = ctx.get("z_global")
+        z_locals = ctx.get("z_locals")
+        if z_global is None or not z_locals:
             return None
-        return carrier.sigreg(cls_emb), {}
+        # Conforme LeVJEPA : SIGReg porte sur le MEME espace projete que
+        # l'invariance (z = h_phi([cls]), concat toutes vues). C'est ce
+        # que le papier appelle la co-localisation en espace K, le
+        # mecanisme anti-collapse (SIGReg garde la distribution de z
+        # gaussienne -> l'invariance ne peut pas tout egaliser).
+        z_all = torch.cat([z_global] + z_locals, dim=0)  # (V+1)*B, K_proj
+        if z_all.shape[0] < 2:
+            return None
+        return carrier.sigreg(z_all), {}
 
     def _ctc(ctx):
         ctc_logits = ctx.get("ctc_logits")
