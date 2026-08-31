@@ -19,7 +19,7 @@ CONFIG_PATH = PROJECT_ROOT / "hwm_studio_config.json"
 
 DEFAULT_CONFIG = {
     "data_sources": {},          # {dir_path: {"label": str, "corpus": str, "custom": bool}}
-    "alto_scan_root": "D:/OCR_genealogie/Alto",
+    "alto_scan_root": "/media/rapha/B4FC7F32FC7EEE4C/OCR_genealogie/Alto",
     "default_gt_mode": "original",   # "original" | "gt"
     "recent_training": {},       # Derniers paramètres d'entraînement utilisés
 }

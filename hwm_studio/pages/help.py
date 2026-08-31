@@ -69,7 +69,7 @@ texte) et `.jpg` (scans des pages), appariés par nom de fichier. Le fichier
 
 ### Gérer le catalogue
 
-- **Auto-scan** : au démarrage, l'application scanne `D:/OCR_genealogie/Alto/`
+- **Auto-scan** : au démarrage, l'application scanne `/media/rapha/B4FC7F32FC7EEE4C/OCR_genealogie/Alto/`
   et propose les sous-dossiers contenant des `.xml`.
 - **Ajout manuel** : bouton **+ Ajouter** pour saisir un chemin personnalisé.
 - **Suppression** : icône corbeille sur chaque carte.
@@ -372,7 +372,7 @@ libérer le verrou), redémarrer l'application.
 
 - Vérifier que les chemins existent et sont accessibles.
 - Utiliser **+ Ajouter** pour ajouter manuellement un chemin.
-- Le scan auto ne couvre que `D:/OCR_genealogie/Alto/` par défaut.
+- Le scan auto ne couvre que `/media/rapha/B4FC7F32FC7EEE4C/OCR_genealogie/Alto/` par défaut.
 
 ### Le mode GT augmentée ne marche pas
 

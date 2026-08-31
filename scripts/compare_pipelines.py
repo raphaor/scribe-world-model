@@ -7,7 +7,7 @@ collapses to 98% CER while ketos achieves 9.8% on the same data.
 
 Usage:
   # With real ALTO data (on Windows):
-  python scripts/compare_pipelines.py --alto-dirs D:/OCR_genealogie/Alto/dir1 D:/OCR_genealogie/Alto/dir2
+  python scripts/compare_pipelines.py --alto-dirs /media/rapha/B4FC7F32FC7EEE4C/OCR_genealogie/Alto/dir1 /media/rapha/B4FC7F32FC7EEE4C/OCR_genealogie/Alto/dir2
 
   # Synthetic test (no data needed, for Pi testing):
   python scripts/compare_pipelines.py --synthetic

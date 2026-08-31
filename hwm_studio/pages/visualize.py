@@ -168,7 +168,7 @@ def build():
                 ui.label("Chemin").classes("w-28")
                 ui.input(
                     value=form.get("alto_file", ""),
-                    placeholder="page.xml ou D:/OCR/alto_dir",
+                    placeholder="page.xml ou /media/rapha/B4FC7F32FC7EEE4C/OCR_genealogie/Alto/<dir>",
                     on_change=on_change("alto_file"),
                 ).classes("w-72").tooltip(
                     "Fichier .xml ALTO unique ou répertoire de .xml. "

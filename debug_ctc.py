@@ -14,7 +14,7 @@ def main():
     # Load dataset
     ds = AltoLineDataset(
         alto_dirs=[
-            "D:/OCR_genealogie/Alto/lectaurep_bronod_notaire_paris_18e",
+            "/media/rapha/B4FC7F32FC7EEE4C/OCR_genealogie/Alto/lectaurep_bronod_notaire_paris_18e",
         ],
         img_height=120,
     )

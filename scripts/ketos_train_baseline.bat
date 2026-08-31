@@ -28,7 +28,7 @@ REM     ketos_train_baseline.bat
 REM
 REM   Or override from the command line:
 REM
-REM     set ALTO_DIRS=D:\OCR_genealogie\Alto\lectaurep_foo D:\OCR_genealogie\Alto\lectaurep_bar
+REM     set ALTO_DIRS=/media/rapha/B4FC7F32FC7EEE4C/OCR_genealogie\Alto\lectaurep_foo /media/rapha/B4FC7F32FC7EEE4C/OCR_genealogie\Alto\lectaurep_bar
 REM     set OUTPUT_DIR=D:\ketos_baseline
 REM     ketos_train_baseline.bat
 REM
@@ -37,7 +37,7 @@ REM ============================================================================
 REM --- Configuration (edit these or set them as env vars before running) -------
 
 if not defined ALTO_DIRS (
-    set ALTO_DIRS=D:\OCR_genealogie\Alto\lectaurep_bronod_notaire_paris_18e D:\OCR_genealogie\Alto\lectaurep_mariages_divorces_paris_19e D:\OCR_genealogie\Alto\lectaurep_repertoires_notaires_paris_1830-1939 D:\OCR_genealogie\Alto\timeuscorpus_prudhommes_paris_1858-1878
+    set ALTO_DIRS=/media/rapha/B4FC7F32FC7EEE4C/OCR_genealogie\Alto\lectaurep_bronod_notaire_paris_18e /media/rapha/B4FC7F32FC7EEE4C/OCR_genealogie\Alto\lectaurep_mariages_divorces_paris_19e /media/rapha/B4FC7F32FC7EEE4C/OCR_genealogie\Alto\lectaurep_repertoires_notaires_paris_1830-1939 /media/rapha/B4FC7F32FC7EEE4C/OCR_genealogie\Alto\timeuscorpus_prudhommes_paris_1858-1878
 )
 
 if not defined OUTPUT_DIR (

@@ -12,7 +12,7 @@ Usage:
 
     # Mode fichier : fichier .xml unique ou répertoire de .xml
     python visualize.py --model hwm_v17.pt --model-version v17 --alto-file page.xml
-    python visualize.py --model hwm_v17.pt --model-version v17 --alto-file D:/OCR/alto_dir
+    python visualize.py --model hwm_v17.pt --model-version v17 --alto-file /media/rapha/B4FC7F32FC7EEE4C/OCR_genealogie/Alto/<dir>
 """
 
 import sys

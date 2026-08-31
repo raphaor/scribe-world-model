@@ -14,7 +14,7 @@ contenant la GT initiale + les ajustements de la session.
 
 Usage:
     python annotate.py --model hwm_v17.pt --model-version v17 \\
-        --alto "D:/OCR/alto_dir" --beam-search
+        --alto "/media/rapha/B4FC7F32FC7EEE4C/OCR_genealogie/Alto/<dir>" --beam-search
 
     python annotate.py --model hwm_v17.pt --model-version v17 \\
         --alto page.xml --mode review
