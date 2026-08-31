@@ -19,6 +19,7 @@ from encoder import (
     KrakenEncoderV12,
     ViTEncoder,
     HybridCNNViTEncoder,
+    LeVJEPAEncoderV19,
 )
 from predictor import TransformerPredictor, JEPACrossAttnPredictor, MAEDecoder, PositionalEncoding
 from loss import (
@@ -32,7 +33,7 @@ from loss import (
 )
 from ctc_head import CTCHead, CTCHeadBiLSTM
 from jepa import sample_jepa_mask, sample_2d_block_mask
-from loss_bundle import make_v12_bundle
+from loss_bundle import make_v12_bundle, make_v19_bundle
 import config
 
 
@@ -1041,6 +1042,348 @@ class HWMv18(nn.Module):
 
     def adapt(self, img, input_lengths=None):
         """Self-supervised step: InfoNCE + SIGReg only (CTC term auto-skips)."""
+        return self.compute_loss(img, input_lengths=input_lengths)
+
+    def count_parameters(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+class HWMv19(nn.Module):
+    """
+    Handwriting World Model v19 — LeVJEPA transpose aux lignes manuscrites.
+
+    Re-test de la regularisation JEPA+SIGReg abandonnee apres v10-v18, en
+    suivant la recette du papier LeVJEPA (arXiv:2608.27395) : l'axe
+    temporel de la video devient l'axe x de la ligne manuscrite.
+
+    Architecture
+    ------------
+        ligne (B, 64, W)
+          -> LeVJEPAEncoderV19 : stem CNN Kraken /4 -> patches carres 16x16
+             (1 token = 64 px, T = W/64) -> fenetres coulissantes de K=8
+             patches, stride 4 (chevauchement 50%) -> 8 blocs transformer
+             BLOCK-CAUSAUX (intra-fenetre bidirectionnel, inter-fenetres
+             causal gauche->droite), RoPE le long de x, [cls] apprenant
+             (readout global : attend a tous, personne ne lui attend),
+             LayerNorm final sur la sequence de tokens.
+
+        CTC :   tokens normalises (PAS le [cls]) -> BiLSTM(320) x 2 -> CTC.
+                Le [cls] ne participe pas a la reconnaissance.
+
+        SSL :   projecteur h_phi = Linear(256->2048) -> BatchNorm -> GELU
+                -> Linear(2048->128) sur le [cls] BRUT (pre-LayerNorm :
+                la cible gaussienne du SIGReg ne peut pas matcher une
+                hypersphere — lecon v12 Option B / v17). Jete apres le
+                pre-entraînement.
+
+    Objectif SSL (phase adapt, lignes non labellisees)
+    --------------------------------------------------
+        1 vue globale (ligne complete) + V=4 vues locales (segments
+        horizontaux recadrés + augmentation photometrique), encodees avec
+        la MEME fenetration (K patches, stride K/2). Drop uniforme de 50%
+        des tokens sur toutes les vues (jamais le [cls], jamais le patch 0
+        — cle d'ancrage des lignes d'attention).
+
+            L_inv    = 1/(V+1) * somme_v ||z0 - zv||^2     (MSE)
+            L_sigreg = SIGReg Epps-Pulley([cls] du batch)
+
+        Pas de stop-gradient, pas de predicteur, pas d'EMA : les gradients
+        traversent les DEUX branches du MSE, et le minimum trivial (tous
+        les [cls] egaux) est contre-carre par SIGReg. lambda_sigreg est le
+        seul hyperparametre SSL.
+
+        L = lambda_ctc*CTC + lambda_inv*L_inv + lambda_sigreg*SIGReg
+
+    Deux temps (mecanique existante) :
+        python train.py --model-version v19 --mode adapt  --save-path hwm_v19_adapt.pt
+        python train.py --model-version v19 --mode full   --checkpoint hwm_v19_adapt.pt
+    """
+
+    def __init__(
+        self,
+        img_height=64,
+        stem_channels=64,
+        patch=16,
+        window_patches=8,
+        window_stride=4,
+        embedding_dim=256,
+        num_layers=8,
+        num_heads=8,
+        ff_dim=1024,
+        dropout=0.1,
+        num_classes=None,
+        lambda_ctc=1.0,
+        lambda_inv=1.0,
+        lambda_sigreg=0.1,
+        proj_hidden=2048,
+        proj_dim=128,
+        lstm_hidden=320,
+        num_lstm_layers=2,
+        lstm_dropout_mid=0.1,
+        lstm_dropout_last=0.3,
+        num_local_views=4,
+        token_drop=0.5,
+        local_crop_min=0.3,
+        local_crop_max=0.6,
+        photo_contrast=0.3,
+        photo_brightness=0.15,
+        photo_noise_std=0.05,
+        sigreg_projections=256,
+        sigreg_knots=17,
+        use_pretext=True,
+    ):
+        super().__init__()
+        self.img_height = img_height
+        self.embedding_dim = embedding_dim
+        self.use_pretext = use_pretext
+        self.num_local_views = num_local_views
+        self.token_drop = token_drop
+        self.local_crop_min = local_crop_min
+        self.local_crop_max = local_crop_max
+        self.photo_contrast = photo_contrast
+        self.photo_brightness = photo_brightness
+        self.photo_noise_std = photo_noise_std
+
+        # --- Encodeur (stem + patchification + transformer block-causal).
+        self.encoder = LeVJEPAEncoderV19(
+            img_height=img_height,
+            stem_channels=stem_channels,
+            patch=patch,
+            window_patches=window_patches,
+            window_stride=window_stride,
+            embedding_dim=embedding_dim,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            ff_dim=ff_dim,
+            dropout=dropout,
+            max_patches=config.MAX_PATCHES_V19,
+        )
+        # Stride horizontal image -> token (stem 4 x patch 16 = 64 px).
+        self.token_stride = self.encoder.token_stride
+
+        # --- Projecteur h_phi (SSL uniquement, jete apres pre-entraînement).
+        if self.use_pretext:
+            self.proj_head = nn.Sequential(
+                nn.Linear(embedding_dim, proj_hidden),
+                nn.BatchNorm1d(proj_hidden),
+                nn.GELU(),
+                nn.Linear(proj_hidden, proj_dim),
+            )
+
+        # --- Tete CTC : BiLSTM(320) x N sur les tokens (sans le [cls]).
+        self.lstm_layers = nn.ModuleList()
+        for i in range(num_lstm_layers):
+            input_dim = embedding_dim if i == 0 else lstm_hidden * 2
+            self.lstm_layers.append(
+                nn.LSTM(
+                    input_dim,
+                    lstm_hidden,
+                    num_layers=1,
+                    batch_first=True,
+                    bidirectional=True,
+                )
+            )
+        self.lstm_dropouts = nn.ModuleList()
+        for i in range(num_lstm_layers):
+            p = lstm_dropout_last if i == num_lstm_layers - 1 else lstm_dropout_mid
+            self.lstm_dropouts.append(nn.Dropout(p))
+
+        # None en --mode adapt from scratch (la tete est creee au
+        # --mode full d'apres le checkpoint, chargement tolerant aux formes).
+        self.ctc_head = CTCHead(lstm_hidden * 2, num_classes) if num_classes else None
+
+        # --- Bundle de pertes LeVJEPA (inv + SIGReg + CTC).
+        self.criterion = make_v19_bundle(
+            lambda_inv=lambda_inv,
+            lambda_sigreg=lambda_sigreg,
+            lambda_ctc=lambda_ctc,
+            sigreg_projections=sigreg_projections,
+            sigreg_knots=sigreg_knots,
+        )
+
+        self._init_lstm_weights()
+
+    def _init_lstm_weights(self):
+        """Init LSTM ketos : orthogonale + bias porte d'oubli a 1.0."""
+        for lstm in self.lstm_layers:
+            for p in lstm.parameters():
+                if p.data.dim() == 2:
+                    nn.init.orthogonal_(p.data)
+                else:
+                    nn.init.constant_(p.data, 0)
+                    nn.init.constant_(p.data[len(p) // 4:len(p) // 2], 1.0)
+
+    # ------------------------------------------------------------------
+    # Aides
+    # ------------------------------------------------------------------
+
+    def _patch_counts(self, input_lengths):
+        """input_lengths de la collate v5 (W//8) -> nombres de patches.
+
+        T = W//64 = (W//8)//8 exactement (le reste < 8 ne peut pas faire
+        basculer de borne de 64). L'encodeur re-contraint a [1, T_feat].
+        """
+        if input_lengths is None:
+            return None
+        return (input_lengths // 8).clamp(min=1)
+
+    def _bilstm(self, tokens, token_lengths):
+        """BiLSTM(320) x N : (B, S, D) -> (B, S, 2H), padding ignore."""
+        z = tokens
+        for lstm, do in zip(self.lstm_layers, self.lstm_dropouts):
+            if token_lengths is not None:
+                packed = pack_padded_sequence(
+                    z, token_lengths.cpu(),
+                    batch_first=True, enforce_sorted=False,
+                )
+                packed_out, _ = lstm(packed)
+                z, _ = pad_packed_sequence(packed_out, batch_first=True)
+            else:
+                z, _ = lstm(z)
+            z = do(z)
+        return z
+
+    def _photometric(self, img):
+        """Augmentation photometrique par echantillon (vues locales).
+
+        Contraste +/-, luminosite +/-, bruit gaussien ; images en [0, 1]
+        (fond blanc = 1), on borne la sortie a [0, 1].
+        """
+        B = img.shape[0]
+        dev = img.device
+        c = 1.0 + (torch.rand(B, 1, 1, device=dev) * 2 - 1) * self.photo_contrast
+        b = (torch.rand(B, 1, 1, device=dev) * 2 - 1) * self.photo_brightness
+        out = img * c + b
+        if self.photo_noise_std > 0:
+            out = out + torch.randn_like(out) * self.photo_noise_std
+        return out.clamp(0.0, 1.0)
+
+    def _local_views(self, img, patch_counts):
+        """V vues locales : segment horizontal recadre + photometrie.
+
+        Chaque vue est un recadrage aleatoire (fraction de la largeur
+        valide dans [local_crop_min, local_crop_max], au moins K/2 patches)
+        re-encode avec la MEME fenetration. Renvoie la liste des
+        (img_vue, patch_counts_vue).
+        """
+        B, H, W = img.shape
+        dev = img.device
+        views = []
+        for _ in range(self.num_local_views):
+            crops = []
+            counts = []
+            for b in range(B):
+                # Largeur reelle ~ T_b * 64 px (bornee par le tenseur).
+                w_true = min(
+                    int(patch_counts[b].item()) * self.token_stride, W
+                )
+                min_px = max(self.encoder.window_patches // 2, 1) * self.token_stride
+                w_crop = int(w_true * (
+                    self.local_crop_min
+                    + torch.rand(()).item() * (self.local_crop_max - self.local_crop_min)
+                ))
+                w_crop = max(min(w_crop, w_true), min(min_px, w_true))
+                x0 = int(torch.randint(0, w_true - w_crop + 1, (1,)).item())
+                crops.append(img[b : b + 1, :, x0 : x0 + w_crop])
+                counts.append(max(w_crop // self.token_stride, 1))
+            W_v = max(c.shape[2] for c in crops)
+            view = torch.zeros(B, H, W_v, device=dev, dtype=img.dtype)
+            for i, c in enumerate(crops):
+                view[i, :, : c.shape[2]] = c
+            counts = torch.tensor(counts, dtype=torch.long, device=dev)
+            views.append((self._photometric(view), counts))
+        return views
+
+    def _ssl_views(self, img, patch_counts):
+        """Passe SSL : vue globale + V vues locales, toutes token-droppees.
+
+        Returns:
+            z_global (B, K_proj), z_locals [V x (B, K_proj)],
+            cls_all ((V+1)*B, D) embeddings [cls] bruts pour SIGReg.
+        """
+        p = self.token_drop if self.training else 0.0
+
+        if patch_counts is None:
+            B, _, W = img.shape
+            patch_counts = torch.full(
+                (B,), max(W // self.token_stride, 1),
+                dtype=torch.long, device=img.device,
+            )
+
+        cls0, _, _, _ = self.encoder(img, patch_counts, token_drop=p)
+        z_global = self.proj_head(cls0)
+
+        z_locals = []
+        cls_locals = []
+        for img_v, counts_v in self._local_views(img, patch_counts):
+            cls_v, _, _, _ = self.encoder(img_v, counts_v, token_drop=p)
+            z_locals.append(self.proj_head(cls_v))
+            cls_locals.append(cls_v)
+
+        cls_all = torch.cat([cls0] + cls_locals, dim=0)
+        return z_global, z_locals, cls_all
+
+    # ------------------------------------------------------------------
+    # Contrat train.py / recognize.py
+    # ------------------------------------------------------------------
+
+    def forward(self, img, input_lengths=None):
+        """Inference : encodeur (sans drop) -> BiLSTM -> CTC.
+
+        Returns: (None, z_seq, ctc_logits) — contrat habituel.
+        """
+        patch_counts = self._patch_counts(input_lengths)
+        _, tokens, valid, _ = self.encoder(img, patch_counts)
+        token_lengths = valid.sum(dim=1).clamp(min=1)
+        z_seq = self._bilstm(tokens, token_lengths)
+        ctc_logits = self.ctc_head(z_seq) if self.ctc_head is not None else None
+        return None, z_seq, ctc_logits
+
+    def compute_loss(
+        self,
+        img,
+        targets=None,
+        input_lengths=None,
+        target_lengths=None,
+        writer_id=None,
+    ):
+        if input_lengths is not None:
+            input_lengths = input_lengths.to(img.device)
+
+        # 1. Passe propre (sans token-drop) : chemin CTC uniquement.
+        patch_counts = self._patch_counts(input_lengths)
+        _, tokens, valid, _ = self.encoder(img, patch_counts)
+        token_lengths = valid.sum(dim=1).clamp(min=1)
+        z_seq = self._bilstm(tokens, token_lengths)
+
+        # 2. Passe SSL : vue globale + vues locales avec drop 50%.
+        z_global = z_locals = cls_all = None
+        if self.use_pretext:
+            z_global, z_locals, cls_all = self._ssl_views(img, patch_counts)
+
+        # 3. Tetes + pertes en float32 (precision SIGReg / softmax CTC).
+        _f32 = (
+            torch.amp.autocast("cuda", enabled=False)
+            if img.is_cuda
+            else contextlib.nullcontext()
+        )
+        with _f32:
+            z_seq = z_seq.float()
+            ctc_logits = (
+                self.ctc_head(z_seq) if self.ctc_head is not None else None
+            )
+            return self.criterion(
+                z_global=z_global,
+                z_locals=z_locals,
+                cls_emb=cls_all,
+                ctc_logits=ctc_logits,
+                targets=targets,
+                input_lengths=token_lengths,
+                target_lengths=target_lengths,
+            )
+
+    def adapt(self, img, input_lengths=None):
+        """Pas self-supervise : inv + SIGReg uniquement (CTC saute seul)."""
         return self.compute_loss(img, input_lengths=input_lengths)
 
     def count_parameters(self):

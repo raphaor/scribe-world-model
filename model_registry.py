@@ -40,6 +40,7 @@ from model import (
     HWMv16,
     HWMv17,
     HWMv18,
+    HWMv19,
     LectaurepClone,
 )
 
@@ -734,6 +735,75 @@ def _build_v18(args, num_classes):
     )
 
 
+def _build_v19(args, num_classes):
+    # v19: LeVJEPA transpose aux lignes manuscrites. Invariance MSE
+    # globale <- locales + SIGReg Epps-Pulley sur les [cls]. Debrayable
+    # via --no-jepa / --lambda-pred 0 ; lambda_sigreg = seul hp SSL.
+    if args.no_jepa or (args.lambda_pred is not None and args.lambda_pred == 0):
+        lambda_inv = 0.0
+        use_pretext = False
+        lambda_sigreg_v19 = 0.0
+    else:
+        lambda_inv = (
+            args.lambda_pred if args.lambda_pred is not None else config.LAMBDA_INV_V19
+        )
+        use_pretext = lambda_inv > 0
+        lambda_sigreg_v19 = (
+            args.lambda_sigreg
+            if args.lambda_sigreg is not None
+            else config.LAMBDA_SIGREG_V19
+        )
+    print(
+        f"v19 LeVJEPA config: use_pretext={use_pretext} "
+        f"lambda_inv={lambda_inv} lambda_sigreg={lambda_sigreg_v19} "
+        f"lambda_ctc={config.LAMBDA_CTC_V19} | "
+        f"patch={config.PATCH_V19} (1 token = "
+        f"{4 * config.PATCH_V19}px) "
+        f"fenetres K={config.WINDOW_PATCHES_V19} "
+        f"s={config.WINDOW_STRIDE_V19} (50% chevauchement) | "
+        f"transformer block-causal {config.NUM_LAYERS_V19}x "
+        f"d={config.EMBEDDING_DIM_V19} ff={config.FF_DIM_V19} RoPE | "
+        f"ctc: {config.NUM_LSTM_V19}xBiLSTM({config.LSTM_HIDDEN_V19}) | "
+        f"ssl: V={config.NUM_LOCAL_VIEWS_V19} vues locales "
+        f"crop=[{config.LOCAL_CROP_MIN_V19},{config.LOCAL_CROP_MAX_V19}] "
+        f"drop={config.TOKEN_DROP_V19} "
+        f"proj={config.EMBEDDING_DIM_V19}->{config.PROJ_HIDDEN_V19}"
+        f"->{config.PROJ_DIM_V19}"
+    )
+    return HWMv19(
+        img_height=config.IMG_HEIGHT_V19,
+        stem_channels=config.STEM_CHANNELS_V19,
+        patch=config.PATCH_V19,
+        window_patches=config.WINDOW_PATCHES_V19,
+        window_stride=config.WINDOW_STRIDE_V19,
+        embedding_dim=config.EMBEDDING_DIM_V19,
+        num_layers=config.NUM_LAYERS_V19,
+        num_heads=config.NUM_HEADS_V19,
+        ff_dim=config.FF_DIM_V19,
+        dropout=config.DROPOUT_V19,
+        num_classes=num_classes,
+        lambda_ctc=config.LAMBDA_CTC_V19,
+        lambda_inv=lambda_inv,
+        lambda_sigreg=lambda_sigreg_v19,
+        proj_hidden=config.PROJ_HIDDEN_V19,
+        proj_dim=config.PROJ_DIM_V19,
+        lstm_hidden=config.LSTM_HIDDEN_V19,
+        num_lstm_layers=config.NUM_LSTM_V19,
+        lstm_dropout_mid=config.LSTM_DROPOUT_MID_V19,
+        lstm_dropout_last=config.LSTM_DROPOUT_LAST_V19,
+        num_local_views=config.NUM_LOCAL_VIEWS_V19,
+        token_drop=config.TOKEN_DROP_V19,
+        local_crop_min=config.LOCAL_CROP_MIN_V19,
+        local_crop_max=config.LOCAL_CROP_MAX_V19,
+        photo_contrast=config.PHOTO_CONTRAST_V19,
+        photo_brightness=config.PHOTO_BRIGHTNESS_V19,
+        photo_noise_std=config.PHOTO_NOISE_STD_V19,
+        sigreg_projections=config.SIGREG_PROJECTIONS_V19,
+        sigreg_knots=config.SIGREG_KNOTS_V19,
+        use_pretext=use_pretext,
+    )
+
+
 # =============================================================================
 # Registry. Insertion order = --model-version --help display order.
 # =============================================================================
@@ -857,6 +927,15 @@ REGISTRY: dict[str, ModelSpec] = {
         force_no_amp=True,
         force_encoder_lr_mult=None,
         builder=_build_v18,
+    ),
+    "v19": ModelSpec(
+        img_height=config.IMG_HEIGHT_V19,   # 64
+        collate_style="v5",
+        cnn_width_stride=64,                # 1 token = 64 px (stem /4 x patch 16)
+        save_path="hwm_v19.pt",
+        force_no_amp=True,
+        force_encoder_lr_mult=1.0,
+        builder=_build_v19,
     ),
 }
 
