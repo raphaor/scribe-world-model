@@ -1174,6 +1174,12 @@ class HWMv19(nn.Module):
                 nn.LayerNorm(proj_hidden),
                 nn.GELU(),
                 nn.Linear(proj_hidden, proj_dim),
+                # LayerNorm de SORTIE : met z a echelle unite (par echantillon,
+                # sans stats de batch) — SINON l'Epps-Pulley sature : si |z|
+                # est grand, h=z.U grand -> cos/sin oscillent -> ECF~0 -> loss
+                # figee (plateau ~0.4) et gradient ~nul (SIGReg inerte).
+                # Le papier a ce meme role via la BN du projecteur.
+                nn.LayerNorm(proj_dim),
             )
 
         # --- Tete CTC : BiLSTM(320) x N sur les tokens (sans le [cls]).
