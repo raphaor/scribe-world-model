@@ -229,3 +229,89 @@ class _V12Carrier(nn.Module):
         )
         self.supcon = SupConLoss(temperature=supcon_temp)
         self.ctc = nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
+
+
+# =============================================================================
+# v19 bundle : LeVJEPA transpose aux lignes manuscrites.
+#   L = lambda_inv    * L_inv      (invariance MSE vue globale <- vues locales)
+#     + lambda_sigreg * SIGReg     (Epps-Pulley sur les [cls] du batch)
+#     + lambda_ctc    * CTC        (reconnaissance supervisee)
+# =============================================================================
+
+
+def make_v19_bundle(
+    lambda_inv: float = 1.0,
+    lambda_sigreg: float = 0.1,
+    lambda_ctc: float = 1.0,
+    sigreg_projections: int = 256,
+    sigreg_knots: int = 17,
+) -> LossBundle:
+    """Bundle de pertes v19 (LeVJEPA, arXiv:2608.27395).
+
+    ``L_inv = 1/(V+1) * somme_v ||z0 - zv||^2`` : MSE entre la projection
+    h_phi([cls]) de la vue globale (z0) et celle de chaque vue locale
+    (zv). Gradients dans les DEUX branches — pas de stop-gradient, pas de
+    predicteur, pas d'EMA : le MSE a un minimum trivial (tous les [cls]
+    egaux), c'est SIGReg qui l'empeche en poussant la distribution des
+    [cls] du batch vers N(0, I) (cf. le papier LeWorldModel ; meme
+    regularisateur que v12-v18). lambda_sigreg est le SEUL hyperparametre
+    SSL.
+
+    Cles du contexte :
+      - ``z_global``  : (B, K_proj) projection de la vue globale.
+      - ``z_locals``  : liste de V tensors (B, K_proj).
+      - ``cls_emb``   : ((V+1)*B, D) embeddings [cls] BRUTS du batch
+        (toutes vues concatenees) — entree du SIGReg.
+      - ``ctc_logits`` / ``targets`` / ``input_lengths`` (en TOKENS) /
+        ``target_lengths`` : chemin supervise, saute sans labels.
+    """
+    carrier = _V19Carrier(sigreg_projections, sigreg_knots)
+
+    def _inv(ctx):
+        z_global = ctx.get("z_global")
+        z_locals = ctx.get("z_locals")
+        if z_global is None or not z_locals:
+            return None
+        # Chaque vue locale est tiree vers la vue globale ; le terme MSE
+        # laisse passer les gradients des deux cotes (symetrique).
+        per_view = [(z_global - zv).pow(2).mean() for zv in z_locals]
+        inv = sum(per_view) / (len(z_locals) + 1)
+        return inv, {}
+
+    def _sigreg(ctx):
+        cls_emb = ctx.get("cls_emb")
+        if cls_emb is None or cls_emb.shape[0] < 2:
+            return None
+        return carrier.sigreg(cls_emb), {}
+
+    def _ctc(ctx):
+        ctc_logits = ctx.get("ctc_logits")
+        targets = ctx.get("targets")
+        if ctc_logits is None or targets is None:
+            return None
+        ctc = carrier.ctc(
+            ctc_logits.permute(1, 0, 2),
+            targets,
+            ctx.get("input_lengths"),
+            ctx.get("target_lengths"),
+        )
+        return ctc, {}
+
+    bundle = LossBundle([
+        LossTerm("inv", lambda_inv, _inv),
+        LossTerm("sigreg", lambda_sigreg, _sigreg),
+        LossTerm("ctc", lambda_ctc, _ctc),
+    ])
+    bundle._carrier = carrier  # possession des parametres / buffers
+    return bundle
+
+
+class _V19Carrier(nn.Module):
+    """Modules de perte avec etat pour ``make_v19_bundle``."""
+
+    def __init__(self, sigreg_projections: int, sigreg_knots: int):
+        super().__init__()
+        self.sigreg = SIGRegEppsPulleyLoss(
+            num_projections=sigreg_projections, num_knots=sigreg_knots
+        )
+        self.ctc = nn.CTCLoss(blank=0, reduction="mean", zero_infinity=True)
