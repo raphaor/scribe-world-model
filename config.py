@@ -729,6 +729,73 @@ PHOTO_NOISE_STD_V19 = 0.05
 SIGREG_PROJECTIONS_V19 = 256
 SIGREG_KNOTS_V19 = 17
 
+# =============================================================================
+# v20 : la construction v19 (stem CNN + [cls] + SIGReg LeVJEPA) portee en
+# production — CNNs renforces, comparateur CLS-vs-all, LSTM leger en tete CTC.
+# =============================================================================
+IMG_HEIGHT_V20 = 64
+
+# Stem CNN RENFORCE : meme recette Kraken (kernels larges captant la structure
+# horizontale des traits), mais le bloc de sortie passe de 64 a 128 canaux —
+# c'est le « on reprend les cnn » : plus de capacite d'extraction locale, sans
+# casser la tokenisation (img_height//4 == patch).
+STEM_CHANNELS_V20 = 128
+PATCH_V20 = 16
+
+# Fenetres coulissantes (meme fenetration que v19) : K patches, stride K/2.
+WINDOW_PATCHES_V20 = 8
+WINDOW_STRIDE_V20 = 4
+
+# Encodeur transformer block-causal (construction v19).
+EMBEDDING_DIM_V20 = 256
+NUM_LAYERS_V20 = 8
+NUM_HEADS_V20 = 8
+FF_DIM_V20 = 1024
+DROPOUT_V20 = 0.1
+MAX_PATCHES_V20 = 512
+
+# Projecteur h_phi (SSL uniquement, jete apres pre-entrainement) : meme
+# forme que v19 (LayerNorm de sortie pour garder l'Epps-Pulley actif).
+PROJ_HIDDEN_V20 = 2048
+PROJ_DIM_V20 = 128
+
+# REPRESENTATION COMPAREE en SSL (le test central de v20) :
+#   'cls' : on compare les embeddings [cls] (comportement v19) ;
+#   'all' : on compare les features TOUT-TOKENS moyennees (sortie LayerNorm,
+#           la representation que la CTC consomme ensuite). SIGReg reste pose
+#           sur le batch des [cls] dans les deux cas (fidelite paper).
+COMPARE_MODE_V20 = "cls"
+
+# Tete de decodage CTC : LSTM LEGER (espoir : le transformer fait le boulot,
+# donc 1 couche suffit ; basculer a 2 si le CER le justifie).
+LSTM_HIDDEN_V20 = 320
+NUM_LSTM_V20 = 1
+LSTM_DROPOUT_MID_V20 = 0.1
+LSTM_DROPOUT_LAST_V20 = 0.3
+
+# Poids de perte.
+LAMBDA_CTC_V20 = 1.0
+LAMBDA_INV_V20 = 1.0        # invariance MSE vue globale <- vues locales
+LAMBDA_SIGREG_V20 = 0.1     # SIGReg Epps-Pulley sur les [cls] (seul hp SSL)
+
+# Objectif SSL (phase adapt) : V vues locales = recadrage horizontal +
+# augmentation photometrique ; drop uniforme des tokens, INDEPENDANT par vue
+# (chaque vue tire ses propres tokens a jeter — jamais le [cls], jamais le
+# patch 0, cle d'ancrage). Le taux (drop = difficulte de l'invariance) se
+# balaie via --token-drop (defaut 0.5 ; 95% = regime video, probablement trop
+# pour des lignes HTR, a tester).
+NUM_LOCAL_VIEWS_V20 = 4
+TOKEN_DROP_V20 = 0.5
+LOCAL_CROP_MIN_V20 = 0.3    # fraction min de la largeur valide
+LOCAL_CROP_MAX_V20 = 0.6    # fraction max
+PHOTO_CONTRAST_V20 = 0.3    # +/- 30%
+PHOTO_BRIGHTNESS_V20 = 0.15 # +/- 0.15
+PHOTO_NOISE_STD_V20 = 0.05
+
+# SIGReg Epps-Pulley (identique a v12-v19).
+SIGREG_PROJECTIONS_V20 = 256
+SIGREG_KNOTS_V20 = 17
+
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)

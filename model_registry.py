@@ -41,6 +41,7 @@ from model import (
     HWMv17,
     HWMv18,
     HWMv19,
+    HWMv20,
     LectaurepClone,
 )
 
@@ -808,6 +809,87 @@ def _build_v19(args, num_classes):
     )
 
 
+def _build_v20(args, num_classes):
+    # v20 : construction v19 (encodeur CNN renforce + [cls] + SIGReg) portee
+    # sur un comparateur choisi (cls vs all-tokens) et un LSTM leger.
+    # Debrayable via --no-jepa / --lambda-pred 0 ; lambda_sigreg = seul hp SSL.
+    if args.no_jepa or (args.lambda_pred is not None and args.lambda_pred == 0):
+        lambda_inv = 0.0
+        use_pretext = False
+        lambda_sigreg_v20 = 0.0
+    else:
+        lambda_inv = (
+            args.lambda_pred if args.lambda_pred is not None else config.LAMBDA_INV_V20
+        )
+        use_pretext = lambda_inv > 0
+        lambda_sigreg_v20 = (
+            args.lambda_sigreg
+            if args.lambda_sigreg is not None
+            else config.LAMBDA_SIGREG_V20
+        )
+    print(
+        f"v20 config: use_pretext={use_pretext} "
+        f"lambda_inv={lambda_inv} lambda_sigreg={lambda_sigreg_v20} "
+        f"lambda_ctc={config.LAMBDA_CTC_V20} | "
+        f"stem CNN renforce channels={config.STEM_CHANNELS_V20} | "
+        f"compare_mode={config.COMPARE_MODE_V20} "
+        f"(--compare-mode pour basculer cls/all) | "
+        f"patch={config.PATCH_V20} (1 token = "
+        f"{4 * config.PATCH_V20}px) "
+        f"fenetres K={config.WINDOW_PATCHES_V20} "
+        f"s={config.WINDOW_STRIDE_V20} | "
+        f"transformer block-causal {config.NUM_LAYERS_V20}x "
+        f"d={config.EMBEDDING_DIM_V20} ff={config.FF_DIM_V20} RoPE | "
+        f"ctc: {config.NUM_LSTM_V20}xBiLSTM({config.LSTM_HIDDEN_V20}) leger | "
+        f"ssl: V={config.NUM_LOCAL_VIEWS_V20} vues locales "
+        f"crop=[{config.LOCAL_CROP_MIN_V20},{config.LOCAL_CROP_MAX_V20}] "
+        f"drop={config.TOKEN_DROP_V20} (--token-drop) "
+        f"proj={config.EMBEDDING_DIM_V20}->{config.PROJ_HIDDEN_V20}"
+        f"->{config.PROJ_DIM_V20}"
+    )
+    return HWMv20(
+        img_height=config.IMG_HEIGHT_V20,
+        stem_channels=config.STEM_CHANNELS_V20,
+        patch=config.PATCH_V20,
+        window_patches=config.WINDOW_PATCHES_V20,
+        window_stride=config.WINDOW_STRIDE_V20,
+        embedding_dim=config.EMBEDDING_DIM_V20,
+        num_layers=config.NUM_LAYERS_V20,
+        num_heads=config.NUM_HEADS_V20,
+        ff_dim=config.FF_DIM_V20,
+        dropout=config.DROPOUT_V20,
+        num_classes=num_classes,
+        lambda_ctc=config.LAMBDA_CTC_V20,
+        lambda_inv=lambda_inv,
+        lambda_sigreg=lambda_sigreg_v20,
+        proj_hidden=config.PROJ_HIDDEN_V20,
+        proj_dim=config.PROJ_DIM_V20,
+        compare_mode=(
+            args.compare_mode
+            if getattr(args, "compare_mode", None) is not None
+            else config.COMPARE_MODE_V20
+        ),
+        lstm_hidden=config.LSTM_HIDDEN_V20,
+        num_lstm_layers=config.NUM_LSTM_V20,
+        lstm_dropout_mid=config.LSTM_DROPOUT_MID_V20,
+        lstm_dropout_last=config.LSTM_DROPOUT_LAST_V20,
+        num_local_views=config.NUM_LOCAL_VIEWS_V20,
+        token_drop=(
+            args.token_drop
+            if getattr(args, "token_drop", None) is not None
+            else config.TOKEN_DROP_V20
+        ),
+        local_crop_min=config.LOCAL_CROP_MIN_V20,
+        local_crop_max=config.LOCAL_CROP_MAX_V20,
+        photo_contrast=config.PHOTO_CONTRAST_V20,
+        photo_brightness=config.PHOTO_BRIGHTNESS_V20,
+        photo_noise_std=config.PHOTO_NOISE_STD_V20,
+        sigreg_projections=config.SIGREG_PROJECTIONS_V20,
+        sigreg_knots=config.SIGREG_KNOTS_V20,
+        use_pretext=use_pretext,
+    )
+
+
 # =============================================================================
 # Registry. Insertion order = --model-version --help display order.
 # =============================================================================
@@ -940,6 +1022,15 @@ REGISTRY: dict[str, ModelSpec] = {
         force_no_amp=True,
         force_encoder_lr_mult=1.0,
         builder=_build_v19,
+    ),
+    "v20": ModelSpec(
+        img_height=config.IMG_HEIGHT_V20,   # 64
+        collate_style="v5",
+        cnn_width_stride=64,                # 1 token = 64 px (stem /4 x patch 16)
+        save_path="hwm_v20.pt",
+        force_no_amp=True,
+        force_encoder_lr_mult=1.0,
+        builder=_build_v20,
     ),
 }
 

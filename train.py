@@ -684,11 +684,22 @@ if __name__ == "__main__":
         "--token-drop",
         type=float,
         default=None,
-        help="v19 only: override the LeVJEPA SSL token-drop rate (defaults to "
-        "config.TOKEN_DROP_V19 = 0.5). Each view drops this fraction of its "
-        "patch tokens uniformly at random; the [cls] is never dropped. Tune "
-        "to balance invariance difficulty (higher drop = harder invariance, "
-        "approaching the video regime's 95%%).",
+        help="Override the LeVJEPA SSL token-drop rate (defaults to the "
+        "per-model config constant, e.g. config.TOKEN_DROP_V19 = 0.5 for "
+        "v19/v20). Each view drops this fraction of its patch tokens "
+        "uniformly; the [cls] is never dropped. Tune to balance invariance "
+        "difficulty (higher drop = harder invariance, approaching the video "
+        "regime's 95%%).",
+    )
+    parser.add_argument(
+        "--compare-mode",
+        choices=["cls", "all"],
+        default=None,
+        help="(v20) Which representation the SSL invariance compares: "
+        "'cls' compares the [cls] embeddings (v19 behaviour) ; 'all' compares "
+        "the pooled all-token features (the representation CTC consumes), "
+        "SIGReg stays on the [cls] batch either way. Defaults to "
+        "config.COMPARE_MODE_V20.",
     )
     parser.add_argument(
         "--pred-loss",

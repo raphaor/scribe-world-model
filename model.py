@@ -1402,6 +1402,168 @@ class HWMv19(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
+class HWMv20(HWMv19):
+    """Handwriting World Model v20 — la construction v19 portee en production.
+
+    Reprend le fait que les CNNs des modeles precedents sont indispensables
+    (les kernels Kraken a structure horizontale): on garde le stem CNN et on
+    le RENFORCE (plus de canaux), puis on empile DESSUS la construction v19 —
+    le transformer block-causal avec token [cls] et le reseau dense h_phi qui
+    compare le [cls] sans collapse (SIGReg Epps-Pulley, fidelite paper).
+
+    Ce qui change par rapport a v19 :
+      - stem CNN renforce (STEM_CHANNELS_V20 = 128) ;
+      - representation comparee configurable : [cls] seul (v19) OU features
+        tout-tokens moyennees (`compare_mode='all'`) — le test central : est-ce
+        que le readout global suffit, ou faut-il la representation par position
+        dont la CTC a besoin ? SIGReg reste sur le batch des [cls] des deux
+        cotes (fidelite LeVJEPA) ;
+      - LSTM de tete leger (1 couche par defaut, espoir que le transformer
+        fasse le boulot ; 2 si le CER le justifie).
+    """
+
+    def __init__(
+        self,
+        img_height=64,
+        stem_channels=128,
+        patch=16,
+        window_patches=8,
+        window_stride=4,
+        embedding_dim=256,
+        num_layers=8,
+        num_heads=8,
+        ff_dim=1024,
+        dropout=0.1,
+        max_patches=None,
+        num_classes=None,
+        lambda_ctc=1.0,
+        lambda_inv=1.0,
+        lambda_sigreg=0.1,
+        proj_hidden=2048,
+        proj_dim=128,
+        compare_mode="cls",
+        lstm_hidden=320,
+        num_lstm_layers=1,
+        lstm_dropout_mid=0.1,
+        lstm_dropout_last=0.3,
+        num_local_views=4,
+        token_drop=0.5,
+        local_crop_min=0.3,
+        local_crop_max=0.6,
+        photo_contrast=0.3,
+        photo_brightness=0.15,
+        photo_noise_std=0.05,
+        sigreg_projections=256,
+        sigreg_knots=17,
+        use_pretext=True,
+    ):
+        if max_patches is None:
+            max_patches = config.MAX_PATCHES_V20
+        assert compare_mode in ("cls", "all"), f"compare_mode={compare_mode!r}"
+        super().__init__(
+            img_height=img_height,
+            stem_channels=stem_channels,
+            patch=patch,
+            window_patches=window_patches,
+            window_stride=window_stride,
+            embedding_dim=embedding_dim,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            ff_dim=ff_dim,
+            dropout=dropout,
+            num_classes=num_classes,
+            lambda_ctc=lambda_ctc,
+            lambda_inv=lambda_inv,
+            lambda_sigreg=lambda_sigreg,
+            proj_hidden=proj_hidden,
+            proj_dim=proj_dim,
+            lstm_hidden=lstm_hidden,
+            num_lstm_layers=num_lstm_layers,
+            lstm_dropout_mid=lstm_dropout_mid,
+            lstm_dropout_last=lstm_dropout_last,
+            num_local_views=num_local_views,
+            token_drop=token_drop,
+            local_crop_min=local_crop_min,
+            local_crop_max=local_crop_max,
+            photo_contrast=photo_contrast,
+            photo_brightness=photo_brightness,
+            photo_noise_std=photo_noise_std,
+            sigreg_projections=sigreg_projections,
+            sigreg_knots=sigreg_knots,
+            use_pretext=use_pretext,
+        )
+        # Reconstruit l'encodeur avec la bonne borne RoPE (le super().__init__
+        # ci-dessus a cote la borne v19 — la geometrie reste identique sinon).
+        self.encoder = LeVJEPAEncoderV19(
+            img_height=img_height,
+            stem_channels=stem_channels,
+            patch=patch,
+            window_patches=window_patches,
+            window_stride=window_stride,
+            embedding_dim=embedding_dim,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            ff_dim=ff_dim,
+            dropout=dropout,
+            max_patches=max_patches,
+        )
+        self.token_stride = self.encoder.token_stride
+        self.compare_mode = compare_mode
+        self._init_lstm_weights()
+
+    def _pool_tokens(self, tokens, valid):
+        """Features tout-tokens moyennees sur les positions valides.
+
+        tokens: (B, S_t, D) sortie LayerNorm ; valid: (B, S_t) bool.
+        Retour (B, D) — la representation que la CTC va consommer.
+        """
+        S = valid.sum(dim=1, keepdim=True).clamp(min=1).float()
+        return (tokens * valid.unsqueeze(-1).float()).sum(dim=1) / S
+
+    def _ssl_views(self, img, patch_counts, compare_mode=None):
+        """Passe SSL : vue globale + V vues locales, toutes token-droppees.
+
+        Le drop est INDEPENDANT par vue : chaque appel encodeur tire ses
+        propres tokens a jeter (jamais le [cls], jamais le patch 0).
+
+        compare_mode:
+          'cls' -> z = h_phi([cls])  (comportement v19) ;
+          'all' -> z = h_phi(pool(tokens)) — le test de v20.
+        Dans les deux cas SIGReg reçoit le batch des [cls] (unicode) :
+        cls_all = ((V+1)*B, D).
+        """
+        if compare_mode is None:
+            compare_mode = self.compare_mode
+        p = self.token_drop if self.training else 0.0
+
+        if patch_counts is None:
+            B, _, W = img.shape
+            patch_counts = torch.full(
+                (B,), max(W // self.token_stride, 1),
+                dtype=torch.long, device=img.device,
+            )
+
+        cls0, tokens0, valid0, _ = self.encoder(img, patch_counts, token_drop=p)
+        cls_all = [cls0]
+        z_global = (
+            self.proj_head(self._pool_tokens(tokens0, valid0))
+            if compare_mode == "all"
+            else self.proj_head(cls0)
+        )
+
+        z_locals = []
+        for img_v, counts_v in self._local_views(img, patch_counts):
+            cls_v, tokens_v, valid_v, _ = self.encoder(img_v, counts_v, token_drop=p)
+            cls_all.append(cls_v)
+            z_locals.append(
+                self.proj_head(self._pool_tokens(tokens_v, valid_v))
+                if compare_mode == "all"
+                else self.proj_head(cls_v)
+            )
+
+        return z_global, z_locals, torch.cat(cls_all, dim=0)
+
+
 class LectaurepClone(nn.Module):
     """
     Faithful reproduction of the lectaurep_base model architecture.
